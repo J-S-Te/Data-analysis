@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>数据看板与统计分析子系统 · 高保真原型</title>
+<style>
+:root{
+  --primary:#2563EB; --primary-light:#3B82F6; --primary-dark:#1D4ED8; --primary-bg:#EFF6FF;
+  --accent:#059669; --accent-bg:#ECFDF5;
+  --warning:#F59E0B; --warning-bg:#FEF3C7;
+  --danger:#DC2626; --danger-bg:#FEF2F2;
+  --purple:#8B5CF6; --purple-bg:#F5F3FF;
+  --bg:#F8FAFC; --card:#FFFFFF; --card-border:#E4ECFC;
+  --sidebar:#0F172A; --sidebar-active:#1E3A5F; --sidebar-hover:#1E293B;
+  --text:#0F172A; --text-secondary:#475569; --text-muted:#64748B; --text-placeholder:#94A3B8;
+  --radius-sm:6px; --radius:8px; --radius-md:10px; --radius-lg:12px; --radius-xl:16px;
+  --shadow-sm:0 1px 3px rgba(0,0,0,.06); --shadow-md:0 2px 6px rgba(0,0,0,.04); --shadow-lg:0 4px 20px rgba(0,0,0,.08);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'PingFang SC','Microsoft YaHei',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;color:var(--text);background:var(--bg);display:flex;min-height:100vh}
+/* ===== Sidebar ===== */
+.sidebar{width:224px;background:var(--sidebar);color:#E2E8F0;display:flex;flex-direction:column;position:fixed;height:100vh;left:0;top:0;z-index:20}
+.sb-logo{padding:20px 20px 14px;font-size:15px;font-weight:700;color:#fff;display:flex;align-items:center;gap:10px;border-bottom:1px solid rgba(255,255,255,.06)}
+.sb-logo .dot{width:10px;height:10px;border-radius:50%;background:var(--primary-light)}
+.sb-sub{font-size:11px;color:#64748B;padding:10px 20px 4px}
+.nav-item{display:flex;align-items:center;gap:11px;padding:11px 20px;color:#CBD5E1;cursor:pointer;font-size:13.5px;border-left:3px solid transparent;transition:.15s;user-select:none}
+.nav-item:hover{background:var(--sidebar-hover);color:#fff}
+.nav-item.active{background:var(--sidebar-active);color:#fff;border-left-color:var(--primary-light)}
+.nav-item .ico{width:18px;height:18px;flex:none;opacity:.9}
+.sb-foot{margin-top:auto;padding:14px 20px;font-size:11px;color:#475569;border-top:1px solid rgba(255,255,255,.06)}
+/* ===== Main ===== */
+.main{margin-left:224px;flex:1;display:flex;flex-direction:column;min-width:0}
+.topbar{height:60px;background:var(--card);border-bottom:1px solid var(--card-border);display:flex;align-items:center;padding:0 24px;gap:14px;position:sticky;top:0;z-index:10}
+.topbar .sys{font-weight:600;font-size:15px}
+.topbar .crumb{color:var(--text-muted);font-size:13px}
+.filters{margin-left:auto;display:flex;align-items:center;gap:10px}
+.filters label{font-size:12px;color:var(--text-muted)}
+.sel{height:34px;border:1px solid var(--card-border);border-radius:var(--radius);background:var(--bg);padding:0 10px;font-size:13px;color:var(--text);outline:none}
+.user{display:flex;align-items:center;gap:8px;margin-left:6px}
+.avatar{width:32px;height:32px;border-radius:50%;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600}
+.content{padding:24px;overflow:auto}
+.page{display:none;animation:fade .25s ease}
+.page.active{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.page-head{margin-bottom:18px}
+.page-head h1{font-size:20px;font-weight:700}
+.page-head p{color:var(--text-muted);font-size:13px;margin-top:4px}
+/* ===== Cards & grid ===== */
+.grid{display:grid;gap:16px}
+.stat-row{grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
+.cols-2{grid-template-columns:2fr 1fr}
+.cols-2b{grid-template-columns:1fr 1fr}
+.card{background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius-lg);box-shadow:var(--shadow-sm);padding:20px}
+.card-title{font-size:15px;font-weight:600;margin:0 0 14px;display:flex;align-items:center;justify-content:space-between}
+.card-title .hint{font-size:11px;color:var(--text-muted);font-weight:400}
+.stat-card{background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius-lg);box-shadow:var(--shadow-sm);padding:16px 18px;transition:.15s}
+.stat-card:hover{box-shadow:var(--shadow-md);transform:translateY(-2px)}
+.stat-card.clickable{cursor:pointer}
+.stat-label{font-size:12px;color:var(--text-muted)}
+.stat-value{font-size:27px;font-weight:700;margin-top:6px;color:var(--text)}
+.stat-suffix{font-size:14px;font-weight:500;color:var(--text-muted);margin-left:3px}
+.stat-trend{font-size:11px;font-weight:600;margin-top:6px}
+.trend-up{color:var(--accent)} .trend-down{color:var(--danger)} .trend-stable{color:var(--text-muted)}
+.stat-card.alert .stat-value{color:var(--danger)}
+/* ===== Badge ===== */
+.badge{display:inline-flex;align-items:center;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600;line-height:1.6}
+.badge.success{background:var(--accent-bg);color:var(--accent)}
+.badge.info{background:var(--primary-bg);color:var(--primary)}
+.badge.warning{background:var(--warning-bg);color:#D97706}
+.badge.danger{background:var(--danger-bg);color:var(--danger)}
+.badge.gray{background:#F1F5F9;color:var(--text-placeholder)}
+.badge.purple{background:var(--purple-bg);color:var(--purple)}
+/* ===== Table ===== */
+.tbl-wrap{background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius-lg);overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{background:#F8FAFC;color:var(--text-muted);font-weight:600;text-align:left;padding:11px 14px;border-bottom:1px solid var(--card-border)}
+td{padding:11px 14px;border-bottom:1px solid #F1F5F9;color:var(--text-secondary)}
+tr:hover td{background:#FBFCFE}
+tr.risk td{background:var(--danger-bg)}
+tr.risk:hover td{background:#FEE2E2}
+.tag{font-size:11px;color:var(--text-muted)}
+/* ===== Bars / progress ===== */
+.bar{height:10px;border-radius:6px;background:var(--primary-bg);overflow:hidden;min-width:60px}
+.bar > span{display:block;height:100%;background:var(--primary);border-radius:6px}
+.bar.warn > span{background:var(--warning)} .bar.danger > span{background:var(--danger)} .bar.green > span{background:var(--accent)} .bar.purple > span{background:var(--purple)}
+.hbar{display:flex;align-items:center;gap:10px;margin:9px 0;font-size:13px}
+.hbar .name{width:90px;color:var(--text-secondary);flex:none}
+.hbar .val{width:54px;text-align:right;color:var(--text-muted);flex:none}
+/* ===== Buttons ===== */
+.btn{height:34px;padding:0 14px;border-radius:var(--radius);border:1px solid var(--card-border);background:var(--bg);color:var(--text-secondary);font-size:13px;cursor:pointer}
+.btn.primary{background:var(--primary);color:#fff;border-color:var(--primary)}
+.btn.sm{height:28px;padding:0 10px;font-size:12px}
+.search{flex:1;max-width:360px;height:36px;border:1px solid var(--card-border);border-radius:var(--radius);background:#fff;padding:0 12px;font-size:13px;outline:none}
+.toolbar{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+.toolbar .spacer{margin-left:auto}
+.note{font-size:12px;color:var(--text-muted);background:var(--primary-bg);border:1px solid #DBEAFE;border-radius:var(--radius);padding:10px 12px;margin-top:12px}
+.note.warn{background:var(--warning-bg);border-color:#FDE68A}
+.empty{text-align:center;color:var(--text-placeholder);padding:40px 0;font-size:13px}
+.pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;background:var(--primary-bg);color:var(--primary);font-weight:600}
+/* dict */
+.dict-item{border:1px solid var(--card-border);border-radius:var(--radius-lg);padding:14px 16px;margin-bottom:12px;background:var(--card)}
+.dict-item h4{font-size:14px;margin-bottom:6px;display:flex;align-items:center;gap:8px}
+.dict-item .meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px 18px;font-size:12px;color:var(--text-secondary);margin-top:6px}
+.dict-item .meta b{color:var(--text-muted);font-weight:600;margin-right:4px}
+.dict-group{font-size:13px;font-weight:700;color:var(--text);margin:18px 0 8px;padding-left:8px;border-left:3px solid var(--primary)}
+.svg-wrap{width:100%}
+</style>
+</head>
+<body>
+
+<!-- ============ SIDEBAR ============ -->
+<aside class="sidebar">
+  <div class="sb-logo"><span class="dot"></span>数据看板子系统</div>
+  <div class="sb-sub">经营数据视图 · 一期</div>
+  <div class="nav-item active" data-page="overview">
+    <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>经营总览
+  </div>
+  <div class="nav-item" data-page="contract">
+    <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h11l5 5v11H4z"/><path d="M15 4v5h5"/></svg>合同看板
+  </div>
+  <div class="nav-item" data-page="project">
+    <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7l9-4 9 4-9 4z"/><path d="M3 12l9 4 9-4M3 17l9 4 9-4"/></svg>项目执行看板
+  </div>
+  <div class="nav-item" data-page="quality">
+    <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3 8-8"/><path d="M21 12v7H3V5h12"/></svg>报告与质量看板
+  </div>
+  <div class="nav-item" data-page="finance">
+    <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M9 9.5h4.5a2 2 0 010 4H9"/></svg>财务与经营看板
+  </div>
+  <div class="nav-item" data-page="dict">
+    <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h7v15H4zM13 5h7v15h-7z"/></svg>指标字典
+  </div>
+  <div class="nav-item" data-page="alert">
+    <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg>预警中心
+  </div>
+  <div class="sb-foot">复用基础平台 · Metabase 嵌入<br>角色：老板 / 总经理</div>
+</aside>
+
+<!-- ============ MAIN ============ -->
+<div class="main">
+  <div class="topbar">
+    <div class="sys">数据看板与统计分析</div>
+    <div class="crumb" id="crumb">/ 经营总览</div>
+    <div class="filters">
+      <label>时间</label><select class="sel" id="timeSel" title="默认：今年累计（截至昨日）"><option>今年累计（截至昨日）</option><option>2026年7月</option><option>2026年Q3</option><option>2026年</option><option>2025年</option><option>自定义区间</option></select>
+      <label>区域</label><select class="sel"><option>全部区域</option><option>华东</option><option>华南</option><option>华北</option><option>未知区域</option></select>
+      <label>角色</label><select class="sel" title="老板默认全量"><option>全量（老板视图）</option><option>本人及下属（销售总监）</option><option>管辖团队（技术总监）</option></select>
+      <label>状态</label><select class="sel"><option>全部</option><option>进行中</option><option>已逾期</option></select>
+    </div>
+    <div class="user"><div class="avatar">BO</div></div>
+  </div>
+
+  <div class="content">
+
+    <!-- ===== P-01 经营总览 ===== -->
+    <section class="page active" id="page-overview">
+      <div class="page-head"><h1>经营总览</h1><p>高管落地页 · 一眼看全局（KPI 卡可点击跳转对应看板）· 演示数据</p></div>
+      <div class="note" id="ovRange" style="margin-bottom:16px">数据范围：2026-01-01 ~ 2026-07-27（截至昨日）· 签约金额 / 回款率 / 完成项目数默认按今年累计，切换顶部时间筛选器可看具体年 / 季 / 月（第一行三卡均支持按时间段、区域统计）</div>
+      <div class="grid stat-row" style="grid-template-columns:repeat(3,1fr);margin-bottom:16px">
+        <div class="stat-card clickable" data-target="contract">
+          <div class="stat-label" id="ovSignLabel">签约金额（今年累计·截至昨日·含税万元）</div>
+          <div class="stat-value" id="ovSignValue">8,640<span class="stat-suffix">万</span></div>
+          <div class="stat-trend trend-up" id="ovSignTrend">▲ 15.6% 同比</div>
+        </div>
+        <div class="stat-card clickable" data-target="finance">
+          <div class="stat-label" id="ovCollLabel">回款率（今年累计）</div>
+          <div class="stat-value" id="ovCollValue">81.2<span class="stat-suffix">%</span></div>
+          <div class="stat-trend trend-down" id="ovCollTrend">▼ 1.2pt</div>
+        </div>
+        <div class="stat-card clickable" data-target="project">
+          <div class="stat-label" id="ovDoneLabel">完成项目数（今年累计）</div>
+          <div class="stat-value" id="ovDoneValue">318<span class="stat-suffix">个</span></div>
+          <div class="stat-trend trend-up" id="ovDoneTrend">▲ 22.4% 同比</div>
+        </div>
+      </div>
+
+      <div class="grid stat-row" style="grid-template-columns:repeat(3,1fr);margin-bottom:16px">
+        <div class="stat-card clickable" data-target="finance">
+          <div class="stat-label">应收账款（账龄 &gt;90天）</div>
+          <div class="stat-value">417<span class="stat-suffix">万</span></div>
+          <div class="stat-trend trend-down">▲ 关注</div>
+        </div>
+        <div class="stat-card clickable alert" data-target="alert">
+          <div class="stat-label">待处理预警</div>
+          <div class="stat-value">23<span class="stat-suffix">项</span></div>
+          <div class="stat-trend trend-down">● 5 项 P0 红标</div>
+        </div>
+        <div class="stat-card clickable" data-target="project">
+          <div class="stat-label">在执项目数</div>
+          <div class="stat-value">142<span class="stat-suffix">个</span></div>
+          <div class="stat-trend trend-stable">— 持平</div>
+        </div>
+      </div>
+
+      <div class="grid cols-2">
+        <div class="card">
+          <div class="card-title">签约金额趋势（万元·含税）<span class="hint" id="ovTrendHint">今年累计 · T+1</span></div>
+          <div class="svg-wrap">
+            <svg viewBox="0 0 520 200" width="100%" height="200">
+              <line x1="40" y1="170" x2="510" y2="170" stroke="#E4ECFC"/>
+              <line x1="40" y1="20" x2="40" y2="170" stroke="#E4ECFC"/>
+              <polyline fill="none" stroke="#2563EB" stroke-width="2.5" points="60,140 130,120 200,128 270,95 340,100 410,70 480,55"/>
+              <polyline fill="rgba(37,99,235,.08)" stroke="none" points="60,140 130,120 200,128 270,95 340,100 410,70 480,55 480,170 60,170"/>
+              <circle cx="480" cy="55" r="4" fill="#2563EB"/>
+              <text x="60" y="190" font-size="10" fill="#94A3B8">1月</text><text x="200" y="190" font-size="10" fill="#94A3B8">3月</text><text x="340" y="190" font-size="10" fill="#94A3B8">5月</text><text x="470" y="190" font-size="10" fill="#94A3B8">7月</text>
+            </svg>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">预警聚合<span class="hint">来源：预警中心</span></div>
+          <div class="hbar"><span class="name">合同到期</span><div class="bar danger" style="flex:1"><span style="width:60%"></span></div><span class="val">9</span></div>
+          <div class="hbar"><span class="name">回款逾期</span><div class="bar danger" style="flex:1"><span style="width:45%"></span></div><span class="val">7</span></div>
+          <div class="hbar"><span class="name">交付延期</span><div class="bar warn" style="flex:1"><span style="width:30%"></span></div><span class="val">5</span></div>
+          <div class="hbar"><span class="name">报告超期</span><div class="bar warn" style="flex:1"><span style="width:18%"></span></div><span class="val">2</span></div>
+          <div class="note">预警数据同源 T+1 夜间批快照，看板内高亮 + 预警中心汇总（P-08）。</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== P-02 合同看板 ===== -->
+    <section class="page" id="page-contract">
+      <div class="page-head"><h1>合同看板</h1><p>面向：老板 / 销售总监 / 财务经理 · 口径见指标字典 1.1–1.5 · 演示数据</p></div>
+      <div class="grid stat-row" style="margin-bottom:16px">
+        <div class="stat-card"><div class="stat-label">签约金额（本月）</div><div class="stat-value">1,286<span class="stat-suffix">万</span></div><div class="stat-trend trend-up">▲ 12.4%</div></div>
+        <div class="stat-card"><div class="stat-label">商机→合同转化率</div><div class="stat-value">34.2<span class="stat-suffix">%</span></div><div class="stat-trend trend-up">▲ 3.0pt</div></div>
+        <div class="stat-card"><div class="stat-label">平均折扣率</div><div class="stat-value">6.8<span class="stat-suffix">%</span></div><div class="stat-trend trend-stable">— 健康</div></div>
+        <div class="stat-card"><div class="stat-label">续签到期（60天内）</div><div class="stat-value">9<span class="stat-suffix">单</span></div><div class="stat-trend trend-down">● 预警</div></div>
+      </div>
+
+      <div class="grid cols-2" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-title">签约金额趋势<span class="hint">同比/环比 · 含税万元</span></div>
+          <svg viewBox="0 0 520 200" width="100%" height="200">
+            <line x1="40" y1="170" x2="510" y2="170" stroke="#E4ECFC"/><line x1="40" y1="20" x2="40" y2="170" stroke="#E4ECFC"/>
+            <polyline fill="rgba(37,99,235,.08)" stroke="#2563EB" stroke-width="2.5" points="60,150 130,130 200,135 270,100 340,108 410,80 480,65 480,170 60,170"/>
+            <text x="60" y="190" font-size="10" fill="#94A3B8">1月</text><text x="470" y="190" font-size="10" fill="#94A3B8">7月</text>
+          </svg>
+        </div>
+        <div class="card">
+          <div class="card-title">区域分布<span class="hint">金额 ↔ 数量可切换</span></div>
+          <div class="hbar"><span class="name">华东</span><div class="bar" style="flex:1"><span style="width:82%"></span></div><span class="val">486万</span></div>
+          <div class="hbar"><span class="name">华南</span><div class="bar" style="flex:1"><span style="width:55%"></span></div><span class="val">326万</span></div>
+          <div class="hbar"><span class="name">华北</span><div class="bar" style="flex:1"><span style="width:38%"></span></div><span class="val">224万</span></div>
+          <div class="hbar"><span class="name">未知</span><div class="bar gray" style="flex:1;background:#F1F5F9"><span style="width:18%;background:#94A3B8"></span></div><span class="val">96万</span></div>
+        </div>
+      </div>
+
+      <div class="grid cols-2b" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-title">商机→合同转化率漏斗</div>
+          <svg viewBox="0 0 480 180" width="100%" height="180">
+            <polygon points="60,20 420,20 360,60 120,60" fill="#EFF6FF" stroke="#2563EB"/>
+            <text x="240" y="46" font-size="12" fill="#1D4ED8" text-anchor="middle">线索 1,200</text>
+            <polygon points="120,72 360,72 310,108 170,108" fill="#DBEAFE" stroke="#3B82F6"/>
+            <text x="240" y="97" font-size="12" fill="#1D4ED8" text-anchor="middle">商机 520</text>
+            <polygon points="170,120 310,120 270,152 210,152" fill="#BFDBFE" stroke="#2563EB"/>
+            <text x="240" y="143" font-size="12" fill="#1E3A5F" text-anchor="middle">报价 290</text>
+            <polygon points="210,164 270,164 252,180 228,180" fill="#2563EB"/>
+            <text x="240" y="178" font-size="11" fill="#fff" text-anchor="middle">中标 178</text>
+          </svg>
+        </div>
+        <div class="card">
+          <div class="card-title">折扣分析（区间分布）</div>
+          <div class="hbar"><span class="name">0%</span><div class="bar green" style="flex:1"><span style="width:40%"></span></div><span class="val">52</span></div>
+          <div class="hbar"><span class="name">1-5%</span><div class="bar" style="flex:1"><span style="width:30%"></span></div><span class="val">39</span></div>
+          <div class="hbar"><span class="name">5-10%</span><div class="bar warn" style="flex:1"><span style="width:22%"></span></div><span class="val">28</span></div>
+          <div class="hbar"><span class="name">&gt;10%</span><div class="bar danger" style="flex:1"><span style="width:10%"></span></div><span class="val">13</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">合同列表（下钻明细 · 聚合级 · 不含脱敏字段）<span class="hint">点击图表下钻至此</span></div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>合同号</th><th>客户</th><th>区域</th><th>销售</th><th>金额(含税万)</th><th>状态</th><th>生效日</th></tr></thead>
+            <tbody>
+              <tr><td>HT-2026-0312</td><td>某业主单位A</td><td>华东</td><td>张明</td><td>186</td><td><span class="badge success">已生效</span></td><td>2026-07-02</td></tr>
+              <tr><td>HT-2026-0307</td><td>某三方机构B</td><td>华南</td><td>李华</td><td>142</td><td><span class="badge success">已生效</span></td><td>2026-07-05</td></tr>
+              <tr class="risk"><td>HT-2026-0288</td><td>某业主单位C</td><td>华北</td><td>王芳</td><td>98</td><td><span class="badge danger">60天内到期</span></td><td>2024-08-10</td></tr>
+              <tr><td>HT-2026-0275</td><td>某三方机构D</td><td>华东</td><td>张明</td><td>76</td><td><span class="badge success">已生效</span></td><td>2026-07-12</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="note">排除项（NG6）：不展示合同脱敏字段（如成本价）；草稿/审批中/作废不计。明细不提供导出（NG5）。</div>
+      </div>
+    </section>
+
+    <!-- ===== P-03 项目执行看板 ===== -->
+    <section class="page" id="page-project">
+      <div class="page-head"><h1>项目执行看板</h1><p>面向：技术总监 / 项目经理 · 口径见字典 2.1–2.6 · 演示数据</p></div>
+      <div class="grid stat-row" style="margin-bottom:16px">
+        <div class="stat-card"><div class="stat-label">项目周期 均值（签订→归档）</div><div class="stat-value">62<span class="stat-suffix">天</span></div><div class="stat-trend trend-stable">— 端到端</div></div>
+        <div class="stat-card"><div class="stat-label">项目周期 P50</div><div class="stat-value">54<span class="stat-suffix">天</span></div><div class="stat-trend trend-up">▼ 较上季</div></div>
+        <div class="stat-card"><div class="stat-label">项目周期 P90</div><div class="stat-value">88<span class="stat-suffix">天</span></div><div class="stat-trend trend-down">▲ 关注</div></div>
+        <div class="stat-card"><div class="stat-label">在执项目数</div><div class="stat-value">142<span class="stat-suffix">个</span></div><div class="stat-trend trend-stable">— 持平</div></div>
+      </div>
+      <div class="grid cols-2b" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-title">项目状态分布<span class="hint">T+1 快照</span></div>
+          <svg viewBox="0 0 220 180" width="100%" height="180">
+            <circle cx="90" cy="90" r="70" fill="none" stroke="#E4ECFC" stroke-width="22"/>
+            <circle cx="90" cy="90" r="70" fill="none" stroke="#2563EB" stroke-width="22" stroke-dasharray="200 440" transform="rotate(-90 90 90)"/>
+            <circle cx="90" cy="90" r="70" fill="none" stroke="#059669" stroke-width="22" stroke-dasharray="120 440" stroke-dashoffset="-200" transform="rotate(-90 90 90)"/>
+            <circle cx="90" cy="90" r="70" fill="none" stroke="#F59E0B" stroke-width="22" stroke-dasharray="80 440" stroke-dashoffset="-320" transform="rotate(-90 90 90)"/>
+            <circle cx="90" cy="90" r="70" fill="none" stroke="#94A3B8" stroke-width="22" stroke-dasharray="40 440" stroke-dashoffset="-400" transform="rotate(-90 90 90)"/>
+          </svg>
+          <div style="font-size:12px;color:var(--text-secondary);margin-top:6px">
+            <span class="badge info">执行中 42%</span> <span class="badge success">现场完成 25%</span> <span class="badge warning">报告编制 17%</span> <span class="badge gray">其他 16%</span>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">交付周期（天）· 维度：团队/项目经理</div>
+          <div class="hbar"><span class="name">平均</span><div class="bar" style="flex:1"><span style="width:55%"></span></div><span class="val">38天</span></div>
+          <div class="hbar"><span class="name">P50</span><div class="bar green" style="flex:1"><span style="width:48%"></span></div><span class="val">33天</span></div>
+          <div class="hbar"><span class="name">P90</span><div class="bar warn" style="flex:1"><span style="width:78%"></span></div><span class="val">54天</span></div>
+          <div class="note">锚点：实际开始日（缺失补计划开始日）；异常终止单列，不计入常规分布。</div>
+        </div>
+      </div>
+      <div class="grid cols-2b">
+        <div class="card">
+          <div class="card-title">返工率（报告退回+现场重测）</div>
+          <div class="hbar"><span class="name">团队A</span><div class="bar warn" style="flex:1"><span style="width:14%"></span></div><span class="val">14%</span></div>
+          <div class="hbar"><span class="name">团队B</span><div class="bar" style="flex:1"><span style="width:9%"></span></div><span class="val">9%</span></div>
+          <div class="hbar"><span class="name">团队C</span><div class="bar danger" style="flex:1"><span style="width:18%"></span></div><span class="val">18%</span></div>
+        </div>
+        <div class="card">
+          <div class="card-title">人员 / 设备利用率（本月）</div>
+          <div class="hbar"><span class="name">人员利用率</span><div class="bar green" style="flex:1"><span style="width:76%"></span></div><span class="val">76%</span></div>
+          <div class="hbar"><span class="name">设备利用率</span><div class="bar purple" style="flex:1"><span style="width:63%"></span></div><span class="val">63%</span></div>
+          <div class="note">"在路上/等待"不计入有效工时（字典 2.4）。</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== P-04 报告与质量看板 ===== -->
+    <section class="page" id="page-quality">
+      <div class="page-head"><h1>报告与质量看板</h1><p>面向：技术总监 / 客服·销售 · 口径见字典 3.1–3.4 · 演示数据</p></div>
+      <div class="grid stat-row" style="margin-bottom:16px">
+        <div class="stat-card"><div class="stat-label">报告周期 P50</div><div class="stat-value">6.2<span class="stat-suffix">天</span></div><div class="stat-trend trend-up">▼ 提速</div></div>
+        <div class="stat-card"><div class="stat-label">首次通过率</div><div class="stat-value">91.3<span class="stat-suffix">%</span></div><div class="stat-trend trend-up">▲ 2.1pt</div></div>
+        <div class="stat-card"><div class="stat-label">客户投诉（未关闭）</div><div class="stat-value">5<span class="stat-suffix">件</span></div><div class="stat-trend trend-stable">—</div></div>
+      </div>
+      <div class="grid cols-2">
+        <div class="card">
+          <div class="card-title">退回原因分布<span class="hint">按环节/标签</span></div>
+          <div class="hbar"><span class="name">数据不符</span><div class="bar danger" style="flex:1"><span style="width:42%"></span></div><span class="val">38</span></div>
+          <div class="hbar"><span class="name">格式问题</span><div class="bar" style="flex:1"><span style="width:30%"></span></div><span class="val">27</span></div>
+          <div class="hbar"><span class="name">合规瑕疵</span><div class="bar warn" style="flex:1"><span style="width:20%"></span></div><span class="val">18</span></div>
+          <div class="hbar"><span class="name">签名缺失</span><div class="bar" style="flex:1"><span style="width:12%"></span></div><span class="val">11</span></div>
+        </div>
+        <div class="card">
+          <div class="card-title">首次通过率（机审+人审）</div>
+          <svg viewBox="0 0 200 180" width="100%" height="180">
+            <circle cx="90" cy="90" r="70" fill="none" stroke="#E4ECFC" stroke-width="24"/>
+            <circle cx="90" cy="90" r="70" fill="none" stroke="#059669" stroke-width="24" stroke-dasharray="400 440" transform="rotate(-90 90 90)"/>
+            <text x="90" y="96" font-size="22" fill="#059669" text-anchor="middle" font-weight="700">91%</text>
+          </svg>
+          <div class="note">客户原因补充不计入失败；退回修改后再过算失败（字典 3.2）。</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== P-05 财务与经营看板 ===== -->
+    <section class="page" id="page-finance">
+      <div class="page-head"><h1>财务与经营看板</h1><p>面向：老板 / 财务经理 · 口径见字典 4.1–4.7 · 演示数据</p></div>
+      <div class="grid stat-row" style="margin-bottom:16px">
+        <div class="stat-card"><div class="stat-label">回款率（本月）</div><div class="stat-value">83.6<span class="stat-suffix">%</span></div><div class="stat-trend trend-down">▼ 1.8pt</div></div>
+        <div class="stat-card"><div class="stat-label">应收账龄&gt;90天</div><div class="stat-value">417<span class="stat-suffix">万</span></div><div class="stat-trend trend-down">▲ 关注</div></div>
+        <div class="stat-card"><div class="stat-label">收入（本月）</div><div class="stat-value">2,940<span class="stat-suffix">万</span></div><div class="stat-trend trend-up">▲ 9%</div></div>
+        <div class="stat-card"><div class="stat-label">部门成本（本月）</div><div class="stat-value">1,780<span class="stat-suffix">万</span></div><div class="stat-trend trend-stable">—</div></div>
+      </div>
+      <div class="grid cols-2" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-title">应收账款账龄分档<span class="hint">T+1 快照</span></div>
+          <div class="hbar"><span class="name">0-30天</span><div class="bar green" style="flex:1"><span style="width:50%"></span></div><span class="val">1,240万</span></div>
+          <div class="hbar"><span class="name">31-60天</span><div class="bar" style="flex:1"><span style="width:30%"></span></div><span class="val">742万</span></div>
+          <div class="hbar"><span class="name">61-90天</span><div class="bar warn" style="flex:1"><span style="width:20%"></span></div><span class="val">498万</span></div>
+          <div class="hbar"><span class="name">&gt;90天</span><div class="bar danger" style="flex:1"><span style="width:14%"></span></div><span class="val">417万</span></div>
+        </div>
+        <div class="card">
+          <div class="card-title">部门/个人产值<span class="hint">技术按产值·销售按收入</span></div>
+          <div class="hbar"><span class="name">技术部</span><div class="bar" style="flex:1"><span style="width:70%"></span></div><span class="val">1,820万</span></div>
+          <div class="hbar"><span class="name">销售部</span><div class="bar purple" style="flex:1"><span style="width:48%"></span></div><span class="val">1,120万</span></div>
+          <div class="note warn">⚠ 技术部门按项目子系统产值确认、销售部门按结算子系统收入确认，跨类型不混用（字典 4.4）。</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">开票未回款 TOP10<span class="hint">实时 T+1 快照 · 联动回款逾期预警</span></div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>客户</th><th>销售</th><th>开票日</th><th>未回款(万)</th><th>账龄</th><th>状态</th></tr></thead>
+            <tbody>
+              <tr class="risk"><td>某业主单位E</td><td>王芳</td><td>2025-09-12</td><td>156</td><td>&gt;90天</td><td><span class="badge danger">逾期·红标</span></td></tr>
+              <tr class="risk"><td>某三方机构F</td><td>李华</td><td>2025-11-03</td><td>128</td><td>&gt;90天</td><td><span class="badge danger">逾期·红标</span></td></tr>
+              <tr><td>某业主单位G</td><td>张明</td><td>2026-03-21</td><td>94</td><td>61-90天</td><td><span class="badge warning">关注</span></td></tr>
+              <tr><td>某三方机构H</td><td>王芳</td><td>2026-04-10</td><td>71</td><td>31-60天</td><td><span class="badge info">正常</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== P-07 指标字典（静态页） ===== -->
+    <section class="page" id="page-dict">
+      <div class="page-head"><h1>指标字典</h1><p>统一口径唯一依据（决策 E）· 全部指标已确认锁定 · 静态页 · 演示节选</p></div>
+      <div class="toolbar">
+        <input class="search" id="dictSearch" placeholder="检索指标名称 / 看板 / 关键词…">
+        <span class="pill">1.1 – 4.7 · 含 2.6 全量已确认</span>
+      </div>
+      <div id="dictList">
+        <div class="dict-group">合同看板</div>
+        <div class="dict-item" data-k="签约金额 合同 金额 生效">
+          <h4>1.1 签约金额 <span class="badge success">已确认</span></h4>
+          <div class="meta"><span><b>定义</b>已生效合同总额</span><span><b>源</b>合同+客户主数据</span><span><b>公式</b>Σ(状态=已生效)金额</span><span><b>周期</b>月/季/年</span><span><b>维度</b>月份/区域/分类/销售</span><span><b>排除</b>草稿/作废不计；不采成本价</span></div>
+        </div>
+        <div class="dict-item" data-k="转化率 商机 合同 漏斗">
+          <h4>1.4 转化率（商机→合同） <span class="badge success">已确认</span></h4>
+          <div class="meta"><span><b>定义</b>商机转正式合同比例</span><span><b>源</b>客户与商机子系统</span><span><b>公式</b>中标成合同数÷进入商机总数</span><span><b>周期</b>月/季</span><span><b>维度</b>销售/区域/来源</span><span><b>排除</b>纯询价不计分母</span></div>
+        </div>
+        <div class="dict-group">项目执行看板</div>
+        <div class="dict-item" data-k="交付周期 准时 团队 项目经理">
+          <h4>2.2 交付周期（统计与趋势） <span class="badge success">已确认</span></h4>
+          <div class="meta"><span><b>定义</b>实际开始→交付确认时长</span><span><b>源</b>项目+报告子系统</span><span><b>公式</b>确认日−实际开始日；均值/P50/P90</span><span><b>周期</b>月/季</span><span><b>维度</b>团队/项目经理/月</span><span><b>排除</b>起止日缺失不计；异常终止单列</span></div>
+        </div>
+        <div class="dict-item" data-k="项目周期 周期 签订 归档 端到端 2.6">
+          <h4>2.6 项目周期（签订→归档） <span class="badge success">新增·已确认</span></h4>
+          <div class="meta"><span><b>定义</b>合同签订日→报告归档日时长（端到端）</span><span><b>源</b>合同子系统(签订日)+报告子系统(归档日)</span><span><b>公式</b>归档日−签订日；均值/P50/P90</span><span><b>周期</b>月/季</span><span><b>维度</b>团队/项目经理/项目类型/月</span><span><b>排除</b>签订日或归档日缺失不计；异常终止单列</span></div>
+        </div>
+        <div class="dict-group">财务与经营看板</div>
+        <div class="dict-item" data-k="部门产值 技术 销售 收入">
+          <h4>4.4 部门产值 <span class="badge success">已确认</span></h4>
+          <div class="meta"><span><b>定义</b>按部门类型统计产出</span><span><b>源</b>技术→项目产值；销售→结算收入</span><span><b>公式</b>技术Σ产值；销售Σ收入（分类型）</span><span><b>周期</b>月/季</span><span><b>维度</b>部门(技术/销售)/团队/月</span><span><b>排除</b>跨类型不混用</span></div>
+        </div>
+        <div class="dict-item" data-k="项目成本 4.7 支出">
+          <h4>4.7 项目成本（新增） <span class="badge success">已确认</span></h4>
+          <div class="meta"><span><b>定义</b>单项目对应支出与成本</span><span><b>源</b>报销+项目子系统</span><span><b>公式</b>Σ关联报销+设备/人工分摊</span><span><b>周期</b>月/项目</span><span><b>维度</b>项目/团队/月</span><span><b>排除</b>公共费用不摊入单项目</span></div>
+        </div>
+      </div>
+      <div class="note">开发须严格按字典实现，禁止自行解读口径；新增/修改指标须走变更评审并更新版本号（字典 §5）。完整 1.1–4.7 及新增 2.6 见独立指标字典文件。</div>
+    </section>
+
+    <!-- ===== P-08 预警中心 ===== -->
+    <section class="page" id="page-alert">
+      <div class="page-head"><h1>预警中心</h1><p>规则预警汇总（决策 D：一期只做规则，不做 ML）· 主形态独立页 + 看板内高亮为辅 · 演示数据</p></div>
+      <div class="grid stat-row" style="margin-bottom:16px">
+        <div class="stat-card alert"><div class="stat-label">待处理预警</div><div class="stat-value">23<span class="stat-suffix">项</span></div><div class="stat-trend trend-down">● 需跟进</div></div>
+        <div class="stat-card alert"><div class="stat-label">P0 红标</div><div class="stat-value">5<span class="stat-suffix">项</span></div><div class="stat-trend trend-down">逾期/到期</div></div>
+        <div class="stat-card"><div class="stat-label">今日新增</div><div class="stat-value">3<span class="stat-suffix">项</span></div><div class="stat-trend trend-stable">—</div></div>
+        <div class="stat-card"><div class="stat-label">本月已闭环</div><div class="stat-value">41<span class="stat-suffix">项</span></div><div class="stat-trend trend-up">▲ 处置率</div></div>
+      </div>
+      <div class="toolbar">
+        <select class="sel"><option>全部类型</option><option>合同到期/续签</option><option>回款逾期</option><option>交付延期</option><option>报告超期</option><option>异常未闭环</option></select>
+        <select class="sel"><option>按严重度排序</option><option>仅看 P0 红标</option></select>
+        <span class="spacer"></span>
+        <span class="pill">数据同源 T+1 夜间批快照</span>
+      </div>
+      <div class="card" style="padding:0">
+        <div class="tbl-wrap" style="border:none">
+          <table>
+            <thead><tr><th>严重度</th><th>预警项</th><th>对象</th><th>触发规则</th><th>到期/状态</th><th>来源看板</th></tr></thead>
+            <tbody>
+              <tr class="risk"><td><span class="badge danger">P0</span></td><td>回款逾期</td><td>某业主单位E · 156万</td><td>应收逾期≥1天</td><td>&gt;90天</td><td>财务</td></tr>
+              <tr class="risk"><td><span class="badge danger">P0</span></td><td>回款逾期</td><td>某三方机构F · 128万</td><td>应收逾期≥1天</td><td>&gt;90天</td><td>财务</td></tr>
+              <tr class="risk"><td><span class="badge danger">P0</span></td><td>合同到期</td><td>HT-2026-0288</td><td>到期前60天</td><td>60天内</td><td>合同</td></tr>
+              <tr class="risk"><td><span class="badge danger">P0</span></td><td>交付延期</td><td>项目 X-2207</td><td>计划交付日临近未到现场完成</td><td>临期</td><td>项目</td></tr>
+              <tr class="risk"><td><span class="badge danger">P0</span></td><td>异常未闭环</td><td>异常单 Y-099</td><td>超N天未评审</td><td>超期</td><td>项目</td></tr>
+              <tr><td><span class="badge warning">P1</span></td><td>合同到期</td><td>HT-2026-0310 等6单</td><td>到期前30天</td><td>30天内</td><td>合同</td></tr>
+              <tr><td><span class="badge warning">P1</span></td><td>报告超期</td><td>报告 R-4412</td><td>编制停留超计划50%</td><td>超期</td><td>报告</td></tr>
+              <tr><td><span class="badge warning">P1</span></td><td>报告超期</td><td>报告 R-4408</td><td>编制停留超计划50%</td><td>超期</td><td>报告</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="note warn">⚠ 不邮件推送、不自动外发（NG5）；逾期/到期标记仅看板内与预警中心展示。预警规则阈值由系统管理员在基础平台侧配置（P-10）。</div>
+    </section>
+
+  </div>
+</div>
+
+<script>
+// 页面切换
+const navItems=document.querySelectorAll('.nav-item');
+const pages=document.querySelectorAll('.page');
+const crumb=document.getElementById('crumb');
+const titles={overview:'经营总览',contract:'合同看板',project:'项目执行看板',quality:'报告与质量看板',finance:'财务与经营看板',dict:'指标字典',alert:'预警中心'};
+function showPage(id){
+  pages.forEach(p=>p.classList.remove('active'));
+  document.getElementById('page-'+id).classList.add('active');
+  navItems.forEach(n=>n.classList.toggle('active',n.dataset.page===id));
+  crumb.textContent='/ '+titles[id];
+  document.querySelector('.content').scrollTop=0;
+}
+navItems.forEach(n=>n.addEventListener('click',()=>showPage(n.dataset.page)));
+// KPI 卡跳转
+document.querySelectorAll('.stat-card.clickable').forEach(c=>{
+  c.addEventListener('click',()=>showPage(c.dataset.target));
+});
+// 指标字典检索
+const ds=document.getElementById('dictSearch');
+ds.addEventListener('input',()=>{
+  const v=ds.value.trim().toLowerCase();
+  document.querySelectorAll('.dict-item').forEach(it=>{
+    it.style.display=(!v||it.dataset.k.toLowerCase().includes(v))?'':'none';
+  });
+});
+
+// 经营总览时间逻辑：签约金额/回款率 默认今年累计（截至昨日），查询后切具体年/季/月
+const timeData={
+  '今年累计（截至昨日）':{sign:'8,640',signTrend:'▲ 15.6% 同比',signCls:'trend-up',signLabel:'签约金额（今年累计·截至昨日·含税万元）',coll:'81.2',collTrend:'▼ 1.2pt',collCls:'trend-down',collLabel:'回款率（今年累计）',done:'318',doneTrend:'▲ 22.4% 同比',doneCls:'trend-up',doneLabel:'完成项目数（今年累计）',range:'数据范围：2026-01-01 ~ 2026-07-27（截至昨日）· 签约金额 / 回款率 / 完成项目数默认按今年累计，切换顶部时间筛选器可看具体年 / 季 / 月',trendHint:'今年累计 · T+1'},
+  '2026年7月':{sign:'1,286',signTrend:'▲ 12.4% 环比',signCls:'trend-up',signLabel:'签约金额（2026年7月·含税万元）',coll:'83.6',collTrend:'▼ 1.8pt',collCls:'trend-down',collLabel:'回款率（2026年7月）',done:'46',doneTrend:'▲ 8.5% 环比',doneCls:'trend-up',doneLabel:'完成项目数（2026年7月）',range:'数据范围：2026年7月（截至昨日 07-27）· 按月口径',trendHint:'2026年7月 · T+1'},
+  '2026年Q3':{sign:'3,420',signTrend:'▲ 6.1% 环比',signCls:'trend-up',signLabel:'签约金额（2026年Q3·含税万元）',coll:'82.4',collTrend:'▲ 0.5pt',collCls:'trend-up',collLabel:'回款率（2026年Q3）',done:'128',doneTrend:'▲ 5.2% 环比',doneCls:'trend-up',doneLabel:'完成项目数（2026年Q3）',range:'数据范围：2026年Q3（截至昨日 07-27）· 按季口径',trendHint:'2026年Q3 · T+1'},
+  '2026年':{sign:'12,860',signTrend:'▲ 18.2% 同比',signCls:'trend-up',signLabel:'签约金额（2026年·含税万元）',coll:'80.8',collTrend:'▼ 2.0pt',collCls:'trend-down',collLabel:'回款率（2026年）',done:'318',doneTrend:'▲ 18.0% 同比',doneCls:'trend-up',doneLabel:'完成项目数（2026年）',range:'数据范围：2026-01-01 ~ 2026-12-31（全年）· 按年口径',trendHint:'2026年 · T+1'},
+  '2025年':{sign:'10,890',signTrend:'— 去年同期',signCls:'trend-stable',signLabel:'签约金额（2025年·含税万元）',coll:'84.0',collTrend:'— 去年同期',collCls:'trend-stable',collLabel:'回款率（2025年）',done:'270',doneTrend:'— 去年同期',doneCls:'trend-stable',doneLabel:'完成项目数（2025年）',range:'数据范围：2025-01-01 ~ 2025-12-31（全年）· 去年对比',trendHint:'2025年 · T+1'},
+  '自定义区间':{sign:'—',signTrend:'请选择区间',signCls:'trend-stable',signLabel:'签约金额（自定义区间·含税万元）',coll:'—',collTrend:'请选择区间',collCls:'trend-stable',collLabel:'回款率（自定义区间）',done:'—',doneTrend:'请选择区间',doneCls:'trend-stable',doneLabel:'完成项目数（自定义区间）',range:'数据范围：自定义区间（请选择起止日期）· 演示',trendHint:'自定义区间 · T+1'}
+};
+const timeSel=document.getElementById('timeSel');
+function applyTime(){
+  const d=timeData[timeSel.value]; if(!d) return;
+  document.getElementById('ovSignValue').innerHTML=d.sign+'<span class="stat-suffix">万</span>';
+  const st=document.getElementById('ovSignTrend'); st.className='stat-trend '+d.signCls; st.textContent=d.signTrend;
+  document.getElementById('ovSignLabel').textContent=d.signLabel;
+  document.getElementById('ovCollValue').innerHTML=d.coll+'<span class="stat-suffix">%</span>';
+  const ct=document.getElementById('ovCollTrend'); ct.className='stat-trend '+d.collCls; ct.textContent=d.collTrend;
+  document.getElementById('ovCollLabel').textContent=d.collLabel;
+  document.getElementById('ovDoneValue').innerHTML=d.done+'<span class="stat-suffix">个</span>';
+  const dt=document.getElementById('ovDoneTrend'); dt.className='stat-trend '+d.doneCls; dt.textContent=d.doneTrend;
+  document.getElementById('ovDoneLabel').textContent=d.doneLabel;
+  document.getElementById('ovRange').textContent=d.range;
+  const th=document.getElementById('ovTrendHint'); if(th) th.textContent=d.trendHint;
+}
+timeSel.addEventListener('change',applyTime);
+applyTime();
+</script>
+</body>
+</html>
