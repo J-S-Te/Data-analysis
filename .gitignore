@@ -1,0 +1,14 @@
+# 敏感配置不入 Git（接入手册 §8：.env.local 权限 0600）
+.env.local
+.env.*.local
+*.local
+
+# Go 构建产物
+/bin/
+*.exe
+
+# 本地缓存（本机构建隔离目录）
+.gopath/
+.gocache/
+.docker-config/
+.buildx/
