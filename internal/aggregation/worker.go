@@ -16,6 +16,8 @@ type Pass struct {
 	SyncProjectDashboard  func(context.Context) error
 }
 
+// Configured 判定当前聚合链路是否至少有一个可执行同步入口。
+// 返回 true 表示主循环至少会执行一类任务，返回 false 时应跳过轮询以避免空跑。
 func (p Pass) Configured() bool {
 	return p.SyncSources != nil || p.SyncContractDashboard != nil || p.SyncProjectDashboard != nil
 }

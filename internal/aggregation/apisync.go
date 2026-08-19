@@ -59,6 +59,9 @@ type APISyncRunner struct {
 	tokenExpiresAt time.Time
 }
 
+// NewAPISyncRunner 基于聚合库连接与 APISyncOptions 构建 API 同步执行器。
+// db 为聚合库连接（未连接时会在持久化阶段触发错误），options 提供机器凭证与子系统仪表盘 URL；
+// 方法返回 *APISyncRunner，仅在参数入参错误时做最小修复（如 HTTPTimeout 补齐默认值）不做连接检测。
 func NewAPISyncRunner(db *gorm.DB, options APISyncOptions) *APISyncRunner {
 	if options.HTTPTimeout <= 0 {
 		options.HTTPTimeout = 10 * time.Second
@@ -66,7 +69,11 @@ func NewAPISyncRunner(db *gorm.DB, options APISyncOptions) *APISyncRunner {
 	return &APISyncRunner{db: db, options: options}
 }
 
-// machineToken 获取/缓存 Keycloak client_credentials 机器令牌。
+// machineToken 获取并缓存 Keycloak client_credentials 访问令牌。
+// 触发条件：
+// 1）当前 token 为空或剩余有效期不足 30 秒时发起刷新；
+// 2）HTTP 请求失败、状态码非 200 或返回体解析失败都会返回错误；
+// 3）成功时返回可复用的 token 并更新本地过期时间。
 func (r *APISyncRunner) machineToken(ctx context.Context) (string, error) {
 	if r.token != "" && time.Now().Before(r.tokenExpiresAt.Add(-30*time.Second)) {
 		return r.token, nil
@@ -104,6 +111,10 @@ func (r *APISyncRunner) SyncContractDashboard(ctx context.Context) error {
 	return r.syncContractDashboard(ctx, r.persistContractDashboard)
 }
 
+// syncContractDashboard 拉取合同系统 /internal/dashboard 并通过 sink 落库。
+// 预期返回：
+// - 只在合同接口、租户校验、快照写入都通过时返回 nil；
+// - 任一环节失败均返回错误，调用方可根据错误原因决定是否重试。
 func (r *APISyncRunner) syncContractDashboard(ctx context.Context, sink contractSnapshotSink) error {
 	if strings.TrimSpace(r.options.ContractInternalURL) == "" {
 		return errors.New("contract internal URL is not configured")
@@ -169,6 +180,7 @@ func (r *APISyncRunner) persistContractDashboard(ctx context.Context, snapshot c
 	if r.db == nil {
 		return errors.New("aggregation database is not configured")
 	}
+	// 数据库写入失败时返回错误给上层，由调用方统一进行同步重试与告警。
 	if err := r.db.Exec(`INSERT INTO api_contract_dashboard
 (tenant_id, snapshot_at, total_amount_minor, total_contracts, approval_contracts, active_contracts, expired_contracts, source)
 VALUES (?, ?, ?, ?, ?, ?, ?, 'contract-api')`,
@@ -180,6 +192,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 'contract-api')`,
 }
 
 // SyncProjectDashboard 调项目系统 internal/dashboard，写 api_project_dashboard 快照。
+// 返回错误的典型触发条件包括：项目内置接口未配置、租户 ID 未配置、机器令牌获取失败、
+// 内部接口非 200、JSON 反序列化失败，或数据库写入失败。
 func (r *APISyncRunner) SyncProjectDashboard(ctx context.Context) error {
 	if strings.TrimSpace(r.options.ProjectInternalURL) == "" {
 		return errors.New("project internal URL is not configured")
