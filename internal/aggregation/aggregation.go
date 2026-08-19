@@ -208,7 +208,7 @@ func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 	type sourceRow struct {
 		TenantID        string
 		ID              string
-		ContractNumber  string
+		ContractNumber  *string
 		Title           string
 		ContractType    string
 		ServiceType     string
