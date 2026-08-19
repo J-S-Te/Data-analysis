@@ -13,6 +13,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/apperror"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/auth"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/response"
 )
 
@@ -30,13 +31,16 @@ type SyncSource struct {
 func (SyncSource) TableName() string { return "sync_source" }
 
 type AlertRule struct {
-	ID            string  `gorm:"column:id;primaryKey" json:"id"`
-	RuleCode      string  `gorm:"column:rule_code" json:"rule_code"`
-	Name          string  `gorm:"column:name" json:"name"`
-	SourceFCT     string  `gorm:"column:source_fct" json:"source_fct"`
-	Severity      string  `gorm:"column:severity" json:"severity"`
-	Enabled       bool    `gorm:"column:enabled" json:"enabled"`
-	ThresholdJSON *string `gorm:"column:threshold_json" json:"threshold_json"`
+	ID            string    `gorm:"column:id;primaryKey" json:"id"`
+	RuleCode      string    `gorm:"column:rule_code" json:"rule_code"`
+	Name          string    `gorm:"column:name" json:"name"`
+	SourceFCT     string    `gorm:"column:source_fct" json:"source_fct"`
+	Severity      string    `gorm:"column:severity" json:"severity"`
+	Enabled       bool      `gorm:"column:enabled" json:"enabled"`
+	ThresholdJSON *string   `gorm:"column:threshold_json" json:"threshold_json"`
+	UpdatedBy     *string   `gorm:"column:updated_by" json:"updated_by"`
+	CreatedAt     time.Time `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt     time.Time `gorm:"column:updated_at" json:"updated_at"`
 }
 
 func (AlertRule) TableName() string { return "alert_rule" }
@@ -109,10 +113,30 @@ func (h *Handler) ListAlertRules(c *gin.Context) {
 
 // PutAlertRules 更新预警规则（骨架：整表替换；阈值与平台 cfg 同步 TODO；审计 TODO）。
 func (h *Handler) PutAlertRules(c *gin.Context) {
-	var rules []AlertRule
-	if err := c.ShouldBindJSON(&rules); err != nil {
+	var input []AlertRule
+	if err := c.ShouldBindJSON(&input); err != nil {
 		response.Error(c, apperror.New(http.StatusBadRequest, "RULE_PAYLOAD_INVALID", "invalid rule payload"))
 		return
+	}
+	now := time.Now().UTC()
+	actor := ""
+	if principal, ok := auth.FromContext(c.Request.Context()); ok {
+		actor = principal.UserID
+	}
+	rules := make([]AlertRule, 0, len(input))
+	for _, rule := range input {
+		if strings.TrimSpace(rule.RuleCode) == "" || strings.TrimSpace(rule.Name) == "" || strings.TrimSpace(rule.SourceFCT) == "" {
+			response.Error(c, apperror.New(http.StatusBadRequest, "RULE_PAYLOAD_INVALID", "rule_code, name and source_fct are required"))
+			return
+		}
+		if rule.ID == "" {
+			rule.ID = newID()
+		}
+		rule.CreatedAt, rule.UpdatedAt = now, now
+		if actor != "" {
+			rule.UpdatedBy = &actor
+		}
+		rules = append(rules, rule)
 	}
 	if err := h.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where("1 = 1").Delete(&AlertRule{}).Error; err != nil {
