@@ -41,13 +41,10 @@ jobs:
       - id: vars
         shell: bash
         env:
-          # 数据看板是后续新增的独立仓库，可能尚未同步组织级 Actions 变量。
-          # 变量存在时仍以变量为准；缺失时使用当前生产镜像仓库默认值，避免
-          # 在严格模式下因空变量直接退出。
-          ACR_PUSH_REGISTRY: ${{ vars.ACR_PUSH_REGISTRY || 'jszn666test-registry-vpc.cn-hangzhou.cr.aliyuncs.com' }}
-          ACR_PULL_REGISTRY: ${{ vars.ACR_PULL_REGISTRY || 'jszn666test-registry-vpc.cn-hangzhou.cr.aliyuncs.com' }}
-          ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE || 'full_lifecycle_management' }}
-          ACR_REPOSITORY: ${{ vars.ACR_REPOSITORY || 'data_analysis' }}
+          ACR_PUSH_REGISTRY: ${{ vars.ACR_PUSH_REGISTRY }}
+          ACR_PULL_REGISTRY: ${{ vars.ACR_PULL_REGISTRY }}
+          ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE }}
+          ACR_REPOSITORY: ${{ vars.ACR_REPOSITORY }}
         run: |
           set -Eeuo pipefail
           : "${ACR_PUSH_REGISTRY:?missing ACR_PUSH_REGISTRY}"
@@ -59,7 +56,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
-          registry: ${{ vars.ACR_PUSH_REGISTRY || 'jszn666test-registry-vpc.cn-hangzhou.cr.aliyuncs.com' }}
+          registry: ${{ vars.ACR_PUSH_REGISTRY }}
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
       - id: dashboard_api
@@ -119,11 +116,8 @@ jobs:
           echo "alert_worker_image_ref=${{ steps.vars.outputs.pull_image }}@${{ steps.alert_worker.outputs.digest }}" >> "$GITHUB_OUTPUT"
           echo "production_migrate_image_ref=${{ steps.vars.outputs.pull_image }}@${{ steps.production_migrate.outputs.digest }}" >> "$GITHUB_OUTPUT"
 
-  # The production platform does not yet ship a data_analysis deployment
-  # profile. Keep this path opt-in until deploy-data-analysis.sh and the
-  # corresponding production Compose/runtime templates are installed.
   deploy:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DASHBOARD_DEPLOY_ENABLED == 'true'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: image
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -157,7 +151,7 @@ jobs:
           chmod 600 "$HOME/.ssh/id_ed25519"
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           printf -v remote_command \
-            'deploy_script=%q; deploy_path=%q; command -v bash >/dev/null || { echo "remote bash is unavailable" >&2; exit 127; }; test -d "$deploy_path" || { echo "deployment directory is unavailable: $deploy_path" >&2; exit 1; }; test -x "$deploy_script" || { echo "data-analysis deployment script is missing or not executable: $deploy_script" >&2; exit 126; }; cd "$deploy_path" && exec bash "$deploy_script" %q %q %q %q' \
+            'deploy_script=%q; deploy_path=%q; command -v bash >/dev/null || { echo "remote bash is unavailable" >&2; exit 127; }; test -d "$deploy_path" || { echo "deployment directory is unavailable: $deploy_path" >&2; exit 1; }; test -x "$deploy_script" || { echo "data-analysis deployment script is missing or not executable: $deploy_script" >&2; echo "install the production deployment baseline before retrying" >&2; exit 126; }; cd "$deploy_path" && exec bash "$deploy_script" %q %q %q %q' \
             "$DEPLOY_SCRIPT" "$DEPLOY_PATH" "$DASHBOARD_API_IMAGE_REF" "$AGGREGATION_WORKER_IMAGE_REF" "$ALERT_WORKER_IMAGE_REF" "$PRODUCTION_MIGRATE_IMAGE_REF"
           ssh \
             -o BatchMode=yes \
