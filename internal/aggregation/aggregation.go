@@ -21,7 +21,7 @@ const (
 	statusFailed  = "FAILED"
 )
 
-// Runner 聚合任务执行器。
+// Runner 是聚合任务执行器，封装聚合库连接与源系统同步配置。
 type Runner struct {
 	aggDB   *gorm.DB
 	sources map[string]string // subsystem_code -> 只读 DSN
@@ -29,6 +29,9 @@ type Runner struct {
 	effectiveStatuses []string
 }
 
+// NewRunner 使用聚合库 DSN 和源系统配置初始化 Runner。
+// aggDSN 为聚合数据库连接串；sources 映射 subsystem_code 到只读源 DSN；
+// 成功时返回可复用的 *Runner，建立连接失败时返回错误并终止后续同步。
 func NewRunner(aggDSN string, sources map[string]string) (*Runner, error) {
 	db, err := gorm.Open(mysql.Open(aggDSN), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
@@ -53,6 +56,7 @@ type SyncSource struct {
 	UpdatedAt      time.Time  `gorm:"column:updated_at"`
 }
 
+// TableName 返回 sync_source 表名，供 GORM 映射与 SQL 查询使用。
 func (SyncSource) TableName() string { return "sync_source" }
 
 // SyncJob 是管理员提交的单次同步请求，由 aggregation-worker 异步领取。
@@ -67,6 +71,7 @@ type SyncJob struct {
 	ErrorMessage  *string    `gorm:"column:error_message"`
 }
 
+// TableName 返回 sync_job 表名，供 GORM 映射与同步任务状态更新使用。
 func (SyncJob) TableName() string { return "sync_job" }
 
 // EnsureSyncSources 幂等登记已配置 DSN 的同步源。
@@ -91,6 +96,7 @@ func (r *Runner) EnsureSyncSources(ctx context.Context) error {
 }
 
 // RunOnce 执行一轮完整同步 + 预计算（PoC V5 主线）。
+// ctx 用于透传取消信号；返回 errors.Join 聚合错误，多源失败时不短路；全部成功返回 nil。
 func (r *Runner) RunOnce(ctx context.Context) error {
 	start := time.Now().UTC()
 	var runErrors []error
@@ -126,6 +132,7 @@ func (r *Runner) RunOnce(ctx context.Context) error {
 
 // RunQueued 领取并执行管理员提交的手工同步请求。
 // 通过条件更新抢占任务，多个 Worker 实例不会重复执行同一任务。
+// ctx 用于控制数据库查询与调度循环；返回值仅在查询/更新失败时为非 nil，其余执行失败会进入作业行级失败快照并继续处理后续行。
 func (r *Runner) RunQueued(ctx context.Context) error {
 	var jobs []SyncJob
 	if err := r.aggDB.WithContext(ctx).Where("status = ?", "QUEUED").Order("requested_at ASC").Limit(10).Find(&jobs).Error; err != nil {
