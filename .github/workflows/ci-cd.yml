@@ -41,10 +41,12 @@ jobs:
       - id: vars
         shell: bash
         env:
-          ACR_PUSH_REGISTRY: ${{ vars.ACR_PUSH_REGISTRY }}
-          ACR_PULL_REGISTRY: ${{ vars.ACR_PULL_REGISTRY }}
-          ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE }}
-          ACR_REPOSITORY: ${{ vars.ACR_REPOSITORY }}
+          # 非敏感的镜像坐标允许通过仓库 Variables 覆盖；未配置时使用数字看板
+          # 的固定默认值，避免空变量让镜像 Job 在构建前直接失败。
+          ACR_PUSH_REGISTRY: ${{ vars.ACR_PUSH_REGISTRY || 'jszn666test-registry.cn-hangzhou.cr.aliyuncs.com' }}
+          ACR_PULL_REGISTRY: ${{ vars.ACR_PULL_REGISTRY || 'jszn666test-registry-vpc.cn-hangzhou.cr.aliyuncs.com' }}
+          ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE || 'full_lifecycle_management' }}
+          ACR_REPOSITORY: ${{ vars.ACR_REPOSITORY || 'data_analysis' }}
         run: |
           set -Eeuo pipefail
           : "${ACR_PUSH_REGISTRY:?missing ACR_PUSH_REGISTRY}"
@@ -56,7 +58,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
-          registry: ${{ vars.ACR_PUSH_REGISTRY }}
+          registry: ${{ vars.ACR_PUSH_REGISTRY || 'jszn666test-registry.cn-hangzhou.cr.aliyuncs.com' }}
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
       - id: dashboard_api
