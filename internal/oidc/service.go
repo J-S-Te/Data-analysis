@@ -29,6 +29,8 @@ type Options struct {
 	ClientSecret      string
 	RedirectURL       string
 	TenantID          string
+	ApplicationCode   string
+	EnvironmentCode   string
 	PathPrefix        string
 	SessionTTL        time.Duration
 	CodecKey          []byte // 32 字节
@@ -47,6 +49,9 @@ type Service struct {
 	issuer                  string
 	redirect                string
 	tenantID                string
+	clientID                string
+	applicationCode         string
+	environmentCode         string
 	pathPrefix              string
 	sessionTTL              time.Duration
 	codec                   *secretCodec
@@ -102,6 +107,9 @@ func NewService(ctx context.Context, db *gorm.DB, options Options) (*Service, er
 		issuer:                  options.Issuer,
 		redirect:                redirect,
 		tenantID:                options.TenantID,
+		clientID:                options.ClientID,
+		applicationCode:         options.ApplicationCode,
+		environmentCode:         options.EnvironmentCode,
 		pathPrefix:              options.PathPrefix,
 		sessionTTL:              sessionTTL,
 		codec:                   codec,
@@ -119,6 +127,7 @@ type idTokenClaims struct {
 	Name              string `json:"name"`
 	PreferredUsername string `json:"preferred_username"`
 	TenantID          string `json:"tenant_id"`
+	Nonce             string `json:"nonce"`
 	TokenUse          string `json:"token_use"`
 }
 
@@ -127,6 +136,7 @@ type AuthorizationContext struct {
 	Subject               string   `json:"sub"`
 	IdentityID            string   `json:"identity_id"`
 	TenantID              string   `json:"tenant_id"`
+	ClientID              string   `json:"client_id"`
 	ApplicationCode       string   `json:"application_code"`
 	EnvironmentCode       string   `json:"environment_code"`
 	Roles                 []string `json:"roles"`
@@ -159,16 +169,8 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 	if err := verified.Claims(&claims); err != nil {
 		return "", Session{}, err
 	}
-	if claims.TokenUse != "" && claims.TokenUse != "id_token" {
-		return "", Session{}, errors.New("token_use must be id_token")
-	}
-	if expectedNonce != "" && claims.Sub == "" {
-		return "", Session{}, errors.New("nonce claim missing")
-	}
-	// 拒绝未知角色/权限由目录哈希与本地 manifest 校验完成（启动时 ValidateClaimsRoleConfigHash）；
-	// 这里至少拒绝跨租户会话。
-	if s.tenantID != "" && claims.TenantID != "" && claims.TenantID != s.tenantID {
-		return "", Session{}, errors.New("tenant mismatch")
+	if err := validateIDTokenClaims(claims, expectedNonce, s.tenantID, transaction.TenantID); err != nil {
+		return "", Session{}, err
 	}
 	accessTokenCipher, err := s.codec.encrypt(rawToken.AccessToken)
 	if err != nil {
@@ -179,6 +181,9 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 	if err != nil {
 		slog.Warn("resolve authorization context failed", "error", err.Error(), "url", s.authorizationContextURL)
 		return "", Session{}, fmt.Errorf("resolve authorization context: %w", err)
+	}
+	if err := validateAuthorizationBinding(authz, claims.Sub, claims.TenantID, s.clientID, s.applicationCode, s.environmentCode); err != nil {
+		return "", Session{}, err
 	}
 	rolesJSON, _ := json.Marshal(authz.Roles)
 	permissionsJSON, _ := json.Marshal(authz.Permissions)
@@ -262,23 +267,32 @@ func (s *Service) Authenticate(ctx context.Context, cookieValue string) (auth.Pr
 	}
 	if time.Since(session.AuthorizationCheckedAt) > s.checkEvery {
 		// 定期调平台授权上下文在线复核：角色/权限变更后旧会话自动刷新（接入手册 §3.3）。
-		// 复核失败时 fail-open 保留旧权限并记录（不销毁会话），避免授权服务抖动导致误登出。
+		// 复核失败必须 fail-closed，否则已撤销的权限会在旧会话中继续生效。
 		now := time.Now().UTC()
-		if accessToken, decryptErr := s.codec.decrypt(session.AccessTokenCipher); decryptErr == nil {
-			if authz, resolveErr := s.resolveAuthorizationContext(ctx, accessToken); resolveErr == nil {
-				rolesJSON, _ := json.Marshal(authz.Roles)
-				permissionsJSON, _ := json.Marshal(authz.Permissions)
-				_ = s.db.Model(&Session{}).Where("session_id_hash = ?", session.SessionIDHash).
-					Updates(map[string]interface{}{
-						"roles_json": string(rolesJSON), "permissions_json": string(permissionsJSON),
-						"authz_revision":           authz.AuthorizationRevision,
-						"authorization_checked_at": now, "last_seen_at": now,
-					}).Error
-				session.RolesJSON = string(rolesJSON)
-				session.PermissionsJSON = string(permissionsJSON)
-				session.AuthzRevision = authz.AuthorizationRevision
-			}
+		accessToken, decryptErr := s.codec.decrypt(session.AccessTokenCipher)
+		if decryptErr != nil {
+			return auth.Principal{}, errors.New("session access token is invalid")
 		}
+		authz, resolveErr := s.resolveAuthorizationContext(ctx, accessToken)
+		if resolveErr != nil {
+			return auth.Principal{}, fmt.Errorf("refresh authorization context: %w", resolveErr)
+		}
+		if bindErr := validateAuthorizationBinding(authz, session.PlatformUserID, session.TenantID, s.clientID, s.applicationCode, s.environmentCode); bindErr != nil {
+			return auth.Principal{}, bindErr
+		}
+		rolesJSON, _ := json.Marshal(authz.Roles)
+		permissionsJSON, _ := json.Marshal(authz.Permissions)
+		if updateErr := s.db.Model(&Session{}).Where("session_id_hash = ?", session.SessionIDHash).
+			Updates(map[string]interface{}{
+				"roles_json": string(rolesJSON), "permissions_json": string(permissionsJSON),
+				"authz_revision":           authz.AuthorizationRevision,
+				"authorization_checked_at": now, "last_seen_at": now,
+			}).Error; updateErr != nil {
+			return auth.Principal{}, fmt.Errorf("persist refreshed authorization: %w", updateErr)
+		}
+		session.RolesJSON = string(rolesJSON)
+		session.PermissionsJSON = string(permissionsJSON)
+		session.AuthzRevision = authz.AuthorizationRevision
 		session.AuthorizationCheckedAt = now
 		session.LastSeenAt = now
 	}
@@ -336,10 +350,50 @@ func (s *Service) ConsumeLoginTransaction(ctx context.Context, state string) (Lo
 	if time.Now().UTC().After(transaction.ExpiresAt) {
 		return LoginTransaction{}, errors.New("login transaction expired")
 	}
-	if err := s.db.Delete(&transaction).Error; err != nil {
-		return LoginTransaction{}, err
+	deleted := s.db.Where("state_hash = ?", transaction.StateHash).Delete(&LoginTransaction{})
+	if deleted.Error != nil {
+		return LoginTransaction{}, deleted.Error
+	}
+	if deleted.RowsAffected != 1 {
+		// 并发回调只能有一个请求删除成功，其余按 state 重放处理。
+		return LoginTransaction{}, errors.New("login transaction already consumed")
 	}
 	return transaction, nil
+}
+
+func validateIDTokenClaims(claims idTokenClaims, expectedNonce, configuredTenant, transactionTenant string) error {
+	if strings.TrimSpace(claims.Sub) == "" || claims.Sub != strings.TrimSpace(claims.Sub) {
+		return errors.New("ID token subject is missing")
+	}
+	if expectedNonce == "" || claims.Nonce != expectedNonce {
+		return errors.New("nonce does not match")
+	}
+	if claims.TokenUse != "id_token" {
+		return errors.New("token_use must be id_token")
+	}
+	if claims.TenantID == "" || claims.TenantID != strings.TrimSpace(claims.TenantID) {
+		return errors.New("ID token tenant is missing")
+	}
+	if configuredTenant != "" && claims.TenantID != configuredTenant {
+		return errors.New("configured tenant does not match ID token")
+	}
+	if transactionTenant != "" && claims.TenantID != transactionTenant {
+		return errors.New("login transaction tenant does not match ID token")
+	}
+	return nil
+}
+
+func validateAuthorizationBinding(value AuthorizationContext, subject, tenant, clientID, applicationCode, environmentCode string) error {
+	if value.Subject != subject || value.TenantID != tenant {
+		return errors.New("OIDC and authorization identities differ")
+	}
+	if strings.TrimSpace(value.IdentityID) == "" {
+		return errors.New("authorization context identity is missing")
+	}
+	if value.ClientID != clientID || value.ApplicationCode != applicationCode || value.EnvironmentCode != environmentCode {
+		return errors.New("authorization context client, application or environment binding mismatch")
+	}
+	return nil
 }
 
 func (s *Service) DecryptNonce(cipher []byte) (string, error)    { return s.codec.decrypt(cipher) }
