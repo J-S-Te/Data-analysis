@@ -18,6 +18,7 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/dictionary"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/oidc"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/platformaudit"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/response"
 )
 
@@ -91,6 +92,7 @@ func New(config Config) (*App, error) {
 	base.GET("/auth/logout", authHandler.Logout)
 
 	api := base.Group("/api/v1", middleware.SessionAuth(authService, "data_analysis_session"))
+	api.Use(middleware.AuditWrites(platformaudit.NewReporter(config.PlatformBaseURL, config.AuditClientID, config.AuditClientSecret, config.AuditApplicationCode, config.AuditEnvironmentCode), slog.Default()))
 	api.GET("/auth/me", authHandler.AuthMe)
 
 	// 嵌入桥（设计方案 §9）
