@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -106,10 +107,14 @@ func (b *Bridge) Proxy(c *gin.Context, token string) {
 		response.Error(c, apperror.New(http.StatusNotFound, "EMBED_DASHBOARD_UNKNOWN", "unknown dashboard"))
 		return
 	}
-	// 解析范围参数（骨架：TENANT 全量；后续按 scope_json 注入 sales_org/team_ids）
+	// 范围参数必须同时绑定令牌记录的租户，防止损坏或伪造的 scope_json
+	// 绕过应用层的行级数据隔离。
 	var scope map[string]interface{}
-	_ = json.Unmarshal([]byte(record.ScopeJSON), &scope)
-	signedURL, err := b.signedEmbedURL(dashboardID, nil, now.Add(b.tokenTTL))
+	if err := json.Unmarshal([]byte(record.ScopeJSON), &scope); err != nil || strings.TrimSpace(record.TenantID) == "" || scope["tenant_id"] != record.TenantID {
+		response.Error(c, apperror.New(http.StatusForbidden, "EMBED_SCOPE_INVALID", "invalid embed scope"))
+		return
+	}
+	signedURL, err := b.signedEmbedURL(dashboardID, scope, now.Add(b.tokenTTL))
 	if err != nil {
 		response.Error(c, apperror.New(http.StatusInternalServerError, "EMBED_SIGN_FAILED", "failed to sign embed url"))
 		return
@@ -128,6 +133,11 @@ func (b *Bridge) ProxyResource(c *gin.Context, token, resource string) {
 		response.Error(c, apperror.ErrForbidden)
 		return
 	}
+	resourcePath, ok := allowedMetabaseResource(resource)
+	if !ok {
+		response.Error(c, apperror.ErrForbidden)
+		return
+	}
 	metabaseTarget, err := url.Parse(b.options.MetabaseInternalURL)
 	if err != nil {
 		response.Error(c, apperror.New(http.StatusInternalServerError, "EMBED_METABASE_INVALID", "invalid metabase url"))
@@ -135,19 +145,17 @@ func (b *Bridge) ProxyResource(c *gin.Context, token, resource string) {
 	}
 	proxy := httputil.NewSingleHostReverseProxy(metabaseTarget)
 	originalDirector := proxy.Director
-	isDocument := strings.HasPrefix(strings.TrimLeft(resource, "/"), "embed/dashboard/")
-	if isDocument {
-		proxy.ModifyResponse = b.modifyEmbedResponse(token)
-	}
+	isDocument := strings.HasPrefix(resourcePath, "/embed/dashboard/")
+	proxy.ModifyResponse = b.modifyProxyResponse(token, isDocument)
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
+		stripSensitiveProxyHeaders(req.Header)
 		// Never ask the upstream for compressed bodies: ModifyResponse rewrites
 		// the embed document and needs plain text. Browsers send
 		// Accept-Encoding: gzip, which would otherwise break the rewrite.
 		req.Header.Set("Accept-Encoding", "identity")
 		// Metabase serves static assets and API endpoints from its internal root;
 		// the configured base path only applies to the initial embed document.
-		resourcePath := "/" + strings.TrimLeft(resource, "/")
 		if isDocument {
 			resourcePath = strings.TrimRight(b.options.MetabaseBasePath, "/") + resourcePath
 		}
@@ -158,15 +166,18 @@ func (b *Bridge) ProxyResource(c *gin.Context, token, resource string) {
 	proxy.ServeHTTP(c.Writer, c.Request)
 }
 
-func (b *Bridge) modifyEmbedResponse(token string) func(*http.Response) error {
+func (b *Bridge) modifyProxyResponse(token string, rewriteDocument bool) func(*http.Response) error {
 	return func(resp *http.Response) error {
+		// 令牌存在于 iframe URL 中，禁止 Referer 外带并避免代理响应被共享缓存。
+		resp.Header.Set("Referrer-Policy", "no-referrer")
+		resp.Header.Set("Cache-Control", "no-store")
 		// The response is already behind the permission-checked, short-lived
 		// embed proxy, so remove only the headers that reject iframe embedding.
 		resp.Header.Del("X-Frame-Options")
 		if csp := resp.Header.Get("Content-Security-Policy"); csp != "" {
 			resp.Header.Set("Content-Security-Policy", withoutFrameAncestors(csp))
 		}
-		if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") {
+		if !rewriteDocument || !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") {
 			return nil
 		}
 		body, readErr := io.ReadAll(resp.Body)
@@ -197,12 +208,51 @@ func (b *Bridge) embedRecord(c *gin.Context, token string, consume bool) (oidc.E
 		if record.ConsumedAt != nil {
 			return oidc.EmbedToken{}, false
 		}
-		if err := b.db.Model(&oidc.EmbedToken{}).Where("token_hash = ? AND consumed_at IS NULL", record.TokenHash).
-			Update("consumed_at", time.Now().UTC()).Error; err != nil {
+		now := time.Now().UTC()
+		if result := b.db.Model(&oidc.EmbedToken{}).
+			Where("token_hash = ? AND consumed_at IS NULL AND expires_at > ?", record.TokenHash, now).
+			Update("consumed_at", now); result.Error != nil || result.RowsAffected != 1 {
 			return oidc.EmbedToken{}, false
 		}
 	}
 	return record, true
+}
+
+// allowedMetabaseResource 校验嵌入页面的后续资源请求。
+// 只允许签名看板文档、嵌入查询 API 和 Metabase 前端静态资源；包含路径
+// 穿越或非嵌入管理 API 的请求一律拒绝。
+func allowedMetabaseResource(resource string) (string, bool) {
+	trimmed := strings.TrimLeft(resource, "/")
+	decoded, err := url.PathUnescape(trimmed)
+	if err != nil || decoded == "" || strings.ContainsAny(decoded, "\\\x00") {
+		return "", false
+	}
+	cleaned := strings.TrimPrefix(path.Clean("/"+decoded), "/")
+	if cleaned != decoded {
+		return "", false
+	}
+	allowed := strings.HasPrefix(cleaned, "embed/dashboard/") ||
+		strings.HasPrefix(cleaned, "api/embed/dashboard/") ||
+		strings.HasPrefix(cleaned, "api/embed/card/") ||
+		strings.HasPrefix(cleaned, "app/") ||
+		cleaned == "favicon.ico" || strings.HasPrefix(cleaned, "favicon-") || cleaned == "manifest.json"
+	if !allowed {
+		return "", false
+	}
+	return "/" + cleaned, true
+}
+
+// stripSensitiveProxyHeaders 删除平台会话、用户令牌和可伪造的身份头，
+// 避免 Metabase 收到与嵌入请求无关的上游凭据。
+func stripSensitiveProxyHeaders(header http.Header) {
+	for _, name := range []string{
+		"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Auth-Token",
+		"X-Tenant-Id", "X-Da-Tenant-Id", "X-User-Id", "X-Identity-Id",
+		"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto",
+		"X-Forwarded-User", "X-Remote-User",
+	} {
+		header.Del(name)
+	}
 }
 
 func (b *Bridge) resourcePrefix(token string) string {

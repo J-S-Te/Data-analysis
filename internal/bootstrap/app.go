@@ -46,6 +46,8 @@ func New(config Config) (*App, error) {
 		ClientSecret:            config.OIDCClientSecret,
 		RedirectURL:             config.OIDCRedirectURI,
 		TenantID:                config.OIDCTenantID,
+		ApplicationCode:         config.AuditApplicationCode,
+		EnvironmentCode:         config.AuditEnvironmentCode,
 		PathPrefix:              config.PathPrefix,
 		SessionTTL:              15 * timeMinute,
 		CodecKey:                config.CodecKey,
