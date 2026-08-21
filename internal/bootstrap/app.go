@@ -97,8 +97,11 @@ func New(config Config) (*App, error) {
 
 	// 嵌入桥（设计方案 §9）
 	api.GET("/embed/:dashboard", func(c *gin.Context) { bridge.Issue(c, c.Param("dashboard")) })
-	base.GET("/api/v1/embed-proxy/:token", func(c *gin.Context) { bridge.Proxy(c, c.Param("token")) })
-	base.GET("/api/v1/embed-proxy/:token/*resource", func(c *gin.Context) {
+	// embed-proxy 以 URL 内的一次性令牌为唯一凭证，允许 sandbox（无 allow-same-origin）
+	// iframe 的跨源读取；CORS 仅放宽到该前缀，会话接口不受影响。
+	embedProxy := base.Group("/api/v1/embed-proxy", middleware.EmbedProxyCORS())
+	embedProxy.GET("/:token", func(c *gin.Context) { bridge.Proxy(c, c.Param("token")) })
+	embedProxy.GET("/:token/*resource", func(c *gin.Context) {
 		bridge.ProxyResource(c, c.Param("token"), c.Param("resource"))
 	})
 

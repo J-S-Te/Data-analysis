@@ -49,7 +49,8 @@ func New(db *gorm.DB, options Options) (*Bridge, error) {
 	}
 	ttl := options.TokenTTL
 	if ttl <= 0 {
-		ttl = 5 * time.Minute
+		// 一次性嵌入令牌的默认有效期：缩短以压缩签名 URL 泄露后的重放窗口。
+		ttl = 2 * time.Minute
 	}
 	return &Bridge{options: options, db: db, tokenTTL: ttl, dashboardIDs: options.DashboardIDs}, nil
 }
@@ -122,6 +123,11 @@ func (b *Bridge) Proxy(c *gin.Context, token string) {
 	// Put the signed Metabase route into the iframe URL. Metabase's SPA uses
 	// the browser pathname to decide which dashboard to render; serving the
 	// document at only /embed-proxy/{token} would always open the home page.
+	// The Location carries the signed embed URL: prevent it from being retained
+	// in browser history, intermediate caches or the Referer of later requests,
+	// otherwise the TTL-bounded replay window of H-2 widens.
+	c.Header("Cache-Control", "no-store")
+	c.Header("Referrer-Policy", "no-referrer")
 	c.Redirect(http.StatusFound, b.resourcePrefix(token)+"embed/dashboard/"+signedURL.token+"?bordered=false&titled=false")
 }
 
