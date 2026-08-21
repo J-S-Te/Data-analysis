@@ -19,6 +19,7 @@ import (
 type Event struct {
 	ActorID, ActorName, Action, ResourceType, ResourceID string
 	RequestID, CorrelationID, Result, ReasonCode         string
+	UserLoginIP                                          string
 }
 
 type Reporter interface {
@@ -75,6 +76,9 @@ func (c *client) Report(ctx context.Context, event Event) error {
 	}
 	if event.ReasonCode != "" {
 		payload["reason_code"] = event.ReasonCode
+	}
+	if event.UserLoginIP != "" {
+		payload["user_login_ip"] = event.UserLoginIP
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
