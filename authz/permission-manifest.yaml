@@ -1,0 +1,221 @@
+api_version: authz.data-analysis/v1
+kind: PermissionManifest
+
+metadata:
+  application_code: data_analysis
+  name: 数据看板与统计分析
+  version: 1
+  owner: data_analysis
+  description: 看板查看、预警、字典与管理权限；行级数据范围由 dashboard-api 服务层强制实现
+
+semantics:
+  default_decision: DENY
+  permission_match: EXACT
+  tenant_isolation: REQUIRED
+  superuser_wildcard: UNSUPPORTED
+  notes:
+    - 权限码必须精确匹配；后端所有看板/预警/字典接口按本清单鉴权。
+    - 角色聚合权限；最终授权必须同时满足权限、数据范围和业务状态约束。
+    - Metabase 不参与鉴权：行级范围由嵌入桥注入参数，Metabase 组权限仅收敛到"只读聚合视图 + 禁下载"。
+    - 预警规则配置（alert.manage）写入平台 cfg 命名空间，配置变更必须审计。
+
+permissions:
+  - code: dashboard.overview.view
+    name: 查看经营总览
+    resource: dashboard_overview
+    action: view
+    risk_level: LOW
+    enforced_by:
+      - GET /data_analysis/api/v1/embed/overview
+    constraints:
+      - 仅返回当前租户数据
+      - 范围按角色数据范围收敛
+
+  - code: dashboard.contract.view
+    name: 查看合同看板
+    resource: dashboard_contract
+    action: view
+    risk_level: LOW
+    enforced_by:
+      - GET /data_analysis/api/v1/embed/contract
+    constraints:
+      - 仅返回当前租户数据
+      - 范围按角色数据范围收敛
+
+  - code: dashboard.project.view
+    name: 查看项目执行看板
+    resource: dashboard_project
+    action: view
+    risk_level: LOW
+    enforced_by:
+      - GET /data_analysis/api/v1/embed/project
+    constraints:
+      - 仅返回当前租户数据
+      - 范围按角色数据范围收敛
+
+  - code: dashboard.report.view
+    name: 查看报告与质量看板
+    resource: dashboard_report
+    action: view
+    risk_level: LOW
+    enforced_by:
+      - GET /data_analysis/api/v1/embed/report
+    constraints:
+      - 仅返回当前租户数据
+      - 范围按角色数据范围收敛
+
+  - code: dashboard.finance.view
+    name: 查看财务与经营看板
+    resource: dashboard_finance
+    action: view
+    risk_level: MEDIUM
+    enforced_by:
+      - GET /data_analysis/api/v1/embed/finance
+    constraints:
+      - 产值/成本数据仅对财务视角角色开放
+      - 仅返回当前租户数据
+
+  - code: alert.view
+    name: 查看预警中心
+    resource: alert
+    action: read
+    risk_level: LOW
+    enforced_by:
+      - GET /data_analysis/api/v1/alerts
+    constraints:
+      - 预警列表按角色数据范围过滤
+
+  - code: alert.manage
+    name: 配置预警规则
+    resource: alert_rule
+    action: manage
+    risk_level: HIGH
+    enforced_by:
+      - GET /data_analysis/api/v1/alert-rules
+      - PUT /data_analysis/api/v1/alert-rules
+    constraints:
+      - 规则阈值写入平台 cfg 命名空间 data_analysis.alert_rules
+      - 配置变更必须审计
+
+  - code: dictionary.view
+    name: 查阅指标字典
+    resource: metric_dictionary
+    action: read
+    risk_level: LOW
+    enforced_by:
+      - GET /data_analysis/api/v1/dictionary
+    constraints:
+      - 字典为版本化只读口径，禁止修改
+
+  - code: aggregation.manage
+    name: 管理数据源与同步
+    resource: aggregation
+    action: manage
+    risk_level: HIGH
+    enforced_by:
+      - GET /data_analysis/api/v1/admin/sources
+      - POST /data_analysis/api/v1/admin/sources/{id}/trigger
+    constraints:
+      - 仅系统管理员
+      - 触发同步必须审计
+
+roles:
+  - code: boss
+    name: 老板/总经理
+    permissions:
+      - dashboard.overview.view
+      - dashboard.contract.view
+      - dashboard.project.view
+      - dashboard.report.view
+      - dashboard.finance.view
+      - alert.view
+      - dictionary.view
+
+  - code: sales_director
+    name: 销售总监
+    permissions:
+      - dashboard.overview.view
+      - dashboard.contract.view
+      - dashboard.finance.view
+      - alert.view
+      - dictionary.view
+
+  - code: tech_director
+    name: 技术总监
+    permissions:
+      - dashboard.overview.view
+      - dashboard.project.view
+      - dashboard.report.view
+      - alert.view
+      - dictionary.view
+
+  - code: finance_manager
+    name: 财务经理
+    permissions:
+      - dashboard.overview.view
+      - dashboard.contract.view
+      - dashboard.finance.view
+      - alert.view
+      - dictionary.view
+
+  - code: dashboard_admin
+    name: 看板系统管理员
+    permissions:
+      - dashboard.overview.view
+      - dictionary.view
+      - alert.manage
+      - aggregation.manage
+
+data_scopes:
+  - code: TENANT
+    name: 全量数据
+    applies_when:
+      role: [boss, finance_manager, dashboard_admin]
+    predicate: subject.scope == "tenant"
+
+  - code: ORG_SUBTREE
+    name: 本人及下属组织
+    applies_when:
+      role: [sales_director]
+    predicate: subject.org_unit_id IN (self + descendants)，组织层级来自平台 owner-directory（OQ-D1 已调研：接口存在但无组织树，实现方式待 OQ-D6）
+
+  - code: TEAM
+    name: 管辖团队
+    applies_when:
+      role: [tech_director]
+    predicate: subject.team_ids == 任职管辖团队集合
+
+subject_claims:
+  required:
+    - sub
+    - tenant_id
+    - roles
+    - permissions
+    - role_config_hash
+    - authz_revision
+
+external_scopes:
+  - code: audit.ingest
+    principal_type: SERVICE
+    purpose: 看板系统上报访问与配置审计
+    assignment: 独立的机器 OAuth Client
+
+  - code: authorization.catalog.sync
+    principal_type: SERVICE
+    purpose: 发布授权目录到基础平台镜像
+    assignment: 独立的 catalog-publisher OAuth Client
+
+compatibility:
+  platform_catalog_must_include:
+    - dashboard.overview.view
+    - dashboard.contract.view
+    - dashboard.project.view
+    - dashboard.report.view
+    - dashboard.finance.view
+    - alert.view
+    - alert.manage
+    - dictionary.view
+    - aggregation.manage
+  known_gaps:
+    - 平台不承载业务行级范围；数据范围由 dashboard-api 基于平台组织数据自研实现（四层防线，见设计方案 §4.3）
+    - OSS Metabase 无 SSO/无沙箱；依赖嵌入桥统一鉴权（签名嵌入 + 代理收敛 + 参数注入）

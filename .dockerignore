@@ -1,0 +1,9 @@
+.git
+.gitignore
+.env
+.env.*
+bin/
+.gopath/
+.docker-config/
+.buildx/
+coverage.out
