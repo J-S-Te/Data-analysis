@@ -2,7 +2,9 @@ package middleware
 
 import (
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 
@@ -26,11 +28,45 @@ func AuditWrites(reporter platformaudit.Reporter, logger *slog.Logger) gin.Handl
 			result = "FAILURE"
 		}
 		resourceType, resourceID := auditResource(c)
-		event := platformaudit.Event{ActorID: principal.UserID, ActorName: principal.DisplayName, Action: "DATA_ANALYSIS:" + c.Request.Method + ":" + strings.ReplaceAll(strings.Trim(c.FullPath(), "/"), "/", "."), ResourceType: resourceType, ResourceID: resourceID, RequestID: c.GetString("request_id"), CorrelationID: c.GetString("request_id"), Result: result, ReasonCode: strconv.Itoa(c.Writer.Status())}
+		event := platformaudit.Event{ActorID: principal.UserID, ActorName: principal.DisplayName, Action: "DATA_ANALYSIS:" + c.Request.Method + ":" + strings.ReplaceAll(strings.Trim(c.FullPath(), "/"), "/", "."), ResourceType: resourceType, ResourceID: resourceID, RequestID: c.GetString("request_id"), CorrelationID: c.GetString("request_id"), Result: result, ReasonCode: strconv.Itoa(c.Writer.Status()), UserLoginIP: requestClientIP(c.Request)}
 		if err := reporter.Report(c.Request.Context(), event); err != nil && logger != nil {
 			logger.Error("report platform audit", "error", err, "request_id", event.RequestID)
 		}
 	}
+}
+
+// requestClientIP accepts only public addresses from the managed frontend
+// proxy. The right-most XFF value is used to avoid trusting a client-supplied
+// left-most value, and Docker/private addresses are rejected.
+func requestClientIP(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if ip := publicClientIP(r.Header.Get("X-Real-IP")); ip != nil {
+		return ip.String()
+	}
+	values := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for i := len(values) - 1; i >= 0; i-- {
+		if ip := publicClientIP(values[i]); ip != nil {
+			return ip.String()
+		}
+	}
+	remote := strings.TrimSpace(r.RemoteAddr)
+	if host, _, err := net.SplitHostPort(remote); err == nil {
+		remote = host
+	}
+	if ip := publicClientIP(remote); ip != nil {
+		return ip.String()
+	}
+	return ""
+}
+
+func publicClientIP(value string) *netip.Addr {
+	addr, err := netip.ParseAddr(strings.TrimSpace(value))
+	if err != nil || !addr.IsGlobalUnicast() || addr.IsPrivate() {
+		return nil
+	}
+	return &addr
 }
 
 func isReadMethod(method string) bool {
