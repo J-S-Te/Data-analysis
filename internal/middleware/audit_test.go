@@ -35,7 +35,27 @@ func TestAuditWritesReportsWriteOutcomeAndSkipsReads(t *testing.T) {
 		t.Fatalf("events = %d, want 1", len(reporter.events))
 	}
 	event := reporter.events[0]
-	if event.ActorID != "user-1" || event.ResourceType != "ALERT" || event.ResourceID != "alert-1" || event.Result != "FAILURE" || event.ReasonCode != "403" {
+	if event.ActorID != "user-1" || event.ResourceType != "ALERT" || event.ResourceID != "alert-1" || event.Result != "DENIED" || event.RiskLevel != "MEDIUM" || event.ReasonCode != "403" {
 		t.Fatalf("unexpected event: %#v", event)
+	}
+}
+
+func TestAuditWritesRecordsSensitiveReads(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	reporter := &auditReporterStub{}
+	router := gin.New()
+	router.Use(RequestID(), func(c *gin.Context) {
+		c.Request = c.Request.WithContext(auth.WithPrincipal(c.Request.Context(), auth.Principal{UserID: "user-1", DisplayName: "User One"}))
+		c.Next()
+	}, AuditWrites(reporter, nil))
+	router.GET("/api/v1/embed/:dashboard", func(c *gin.Context) { c.Status(http.StatusOK) })
+	router.GET("/api/v1/alerts", func(c *gin.Context) { c.Status(http.StatusOK) })
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/v1/embed/overview", nil))
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/v1/alerts", nil))
+	if len(reporter.events) != 1 {
+		t.Fatalf("events = %d, want 1 (only sensitive read)", len(reporter.events))
+	}
+	if reporter.events[0].ResourceType != "DATA_ANALYSIS" {
+		t.Fatalf("unexpected event: %#v", reporter.events[0])
 	}
 }

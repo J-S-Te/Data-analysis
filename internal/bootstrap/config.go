@@ -36,6 +36,7 @@ type Config struct {
 	AuditApplicationCode string
 	AuditEnvironmentCode string
 	AuditWorkerID        string
+	AuditRequired        bool
 
 	AuthorizationContextURL string
 	MetabaseInternalURL     string
@@ -60,7 +61,9 @@ func LoadConfig() (Config, error) {
 	pathPrefix := envOr("APP_PATH_PREFIX", "/data_analysis")
 	// 浏览器 origin（同源/CSRF 校验）与平台 API 地址分离：PLATFORM_BASE_URL 在容器内指向 platform-api。
 	publicOrigin := envOr("APP_PUBLIC_ORIGIN", "http://localhost:8081")
-	secure, _ := strconv.ParseBool(envOr("COOKIE_SECURE", "false"))
+	// COOKIE_SECURE 默认跟随 PublicOrigin 协议：https 部署未显式配置时仍获得
+	// Secure Cookie，避免生产漏配导致会话凭据以明文 Cookie 传输。
+	secure := envBool("COOKIE_SECURE", strings.HasPrefix(strings.ToLower(publicOrigin), "https://"))
 	return Config{
 		ListenAddr:         envOr("LISTEN_ADDR", ":8080"),
 		MySQLDSN:           os.Getenv("DASHBOARD_MYSQL_DSN"),
@@ -82,11 +85,12 @@ func LoadConfig() (Config, error) {
 		CatalogApplicationID: os.Getenv("PLATFORM_AUTHORIZATION_CATALOG_APPLICATION_ID"),
 		CatalogClientID:      os.Getenv("PLATFORM_AUTHORIZATION_CATALOG_CLIENT_ID"),
 		CatalogClientSecret:  os.Getenv("PLATFORM_AUTHORIZATION_CATALOG_CLIENT_SECRET"),
-		AuditClientID:        os.Getenv("AUDIT_INGEST_CLIENT_ID"),
-		AuditClientSecret:    os.Getenv("AUDIT_INGEST_CLIENT_SECRET"),
+		AuditClientID:        firstNonEmpty(os.Getenv("PLATFORM_AUDIT_CLIENT_ID"), os.Getenv("AUDIT_INGEST_CLIENT_ID")),
+		AuditClientSecret:    firstNonEmpty(os.Getenv("PLATFORM_AUDIT_CLIENT_SECRET"), os.Getenv("AUDIT_INGEST_CLIENT_SECRET")),
 		AuditApplicationCode: envOr("PLATFORM_APPLICATION_CODE", "data_analysis"),
 		AuditEnvironmentCode: envOr("PLATFORM_ENVIRONMENT_CODE", "dev"),
 		AuditWorkerID:        envOr("AUDIT_WORKER_ID", "dashboard-api"),
+		AuditRequired:        envBool("PLATFORM_AUDIT_REQUIRED", strings.EqualFold(envOr("PLATFORM_ENVIRONMENT_CODE", "dev"), "prod")),
 
 		AuthorizationContextURL: envOr("PLATFORM_AUTHORIZATION_CONTEXT_URL", "http://platform-api:8080/oauth2/authorization-context"),
 		MetabaseInternalURL:     envOr("METABASE_INTERNAL_URL", "http://metabase:3000"),
@@ -100,6 +104,15 @@ func LoadConfig() (Config, error) {
 			"finance":  envOr("MB_DASHBOARD_ID_FINANCE", ""),
 		},
 	}, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func envOr(key string, fallback string) string {

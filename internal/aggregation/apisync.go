@@ -3,6 +3,7 @@ package aggregation
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,9 +19,11 @@ import (
 // APISyncOptions 看板系统经子系统 internal 接口同步的配置（设计方案：看板数据经接口获取）。
 type APISyncOptions struct {
 	// 机器凭证（Keycloak client_credentials）
-	MachineTokenURL     string
-	MachineClientID     string
-	MachineClientSecret string
+	MachineTokenURL      string
+	MachineTokenIssuer   string
+	MachineTokenAudience string
+	MachineClientID      string
+	MachineClientSecret  string
 	// 子系统 internal 接口
 	ContractInternalURL string
 	ProjectInternalURL  string
@@ -101,9 +104,77 @@ func (r *APISyncRunner) machineToken(ctx context.Context) (string, error) {
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&payload); err != nil {
 		return "", err
 	}
+	if err := validateMachineTokenContract(payload.AccessToken, r.options); err != nil {
+		return "", err
+	}
 	r.token = payload.AccessToken
 	r.tokenExpiresAt = time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second)
 	return r.token, nil
+}
+
+type machineAccessTokenClaims struct {
+	Issuer          string          `json:"iss"`
+	AuthorizedParty string          `json:"azp"`
+	ClientID        string          `json:"client_id"`
+	Type            string          `json:"typ"`
+	Audience        json.RawMessage `json:"aud"`
+}
+
+// validateMachineTokenContract performs an early configuration-contract check
+// on the token obtained directly from Keycloak. This is diagnostic only; the
+// contract/project APIs remain responsible for cryptographic verification via
+// OIDC discovery/JWKS before accepting the request.
+func validateMachineTokenContract(rawToken string, options APISyncOptions) error {
+	parts := strings.Split(rawToken, ".")
+	if len(parts) != 3 {
+		return errors.New("machine token is not a compact JWT")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return fmt.Errorf("decode machine token claims: %w", err)
+	}
+	claims := machineAccessTokenClaims{}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return fmt.Errorf("decode machine token claims: %w", err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(claims.Type), "bearer") {
+		return errors.New("machine token typ is not Bearer")
+	}
+	if issuer := strings.TrimRight(strings.TrimSpace(options.MachineTokenIssuer), "/"); issuer != "" && strings.TrimRight(strings.TrimSpace(claims.Issuer), "/") != issuer {
+		return fmt.Errorf("machine token issuer mismatch: got %q", claims.Issuer)
+	}
+	clientID := strings.TrimSpace(options.MachineClientID)
+	if strings.TrimSpace(claims.AuthorizedParty) != clientID || (strings.TrimSpace(claims.ClientID) != "" && strings.TrimSpace(claims.ClientID) != clientID) {
+		return errors.New("machine token authorized party/client_id mismatch")
+	}
+	if audience := strings.TrimSpace(options.MachineTokenAudience); audience != "" {
+		audiences, err := decodeTokenAudience(claims.Audience)
+		if err != nil || !containsTokenAudience(audiences, audience) {
+			return fmt.Errorf("machine token audience does not contain %q", audience)
+		}
+	}
+	return nil
+}
+
+func decodeTokenAudience(raw json.RawMessage) ([]string, error) {
+	var many []string
+	if err := json.Unmarshal(raw, &many); err == nil {
+		return many, nil
+	}
+	var one string
+	if err := json.Unmarshal(raw, &one); err != nil {
+		return nil, err
+	}
+	return []string{one}, nil
+}
+
+func containsTokenAudience(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
 }
 
 // SyncContractDashboard 调合同系统 internal/dashboard，写 api_contract_dashboard 快照。
@@ -141,8 +212,7 @@ func (r *APISyncRunner) syncContractDashboard(ctx context.Context, sink contract
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return fmt.Errorf("contract internal/dashboard returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+		return fmt.Errorf("contract internal/dashboard returned HTTP %d: %s", response.StatusCode, errorResponseBody(response.Body))
 	}
 	var envelope struct {
 		Code string               `json:"code"`
@@ -219,8 +289,7 @@ func (r *APISyncRunner) SyncProjectDashboard(ctx context.Context) error {
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return fmt.Errorf("project internal/dashboard returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+		return fmt.Errorf("project internal/dashboard returned HTTP %d: %s", response.StatusCode, errorResponseBody(response.Body))
 	}
 	var payload struct {
 		Data struct {
@@ -244,6 +313,19 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 'project-api')`,
 		return err
 	}
 	return nil
+}
+
+// errorResponseBody returns a short, control-character-free excerpt of an
+// upstream error body for diagnostics. It deliberately does not echo the full
+// response into logs, avoiding accidental exposure of sensitive upstream content.
+func errorResponseBody(reader io.Reader) string {
+	raw, _ := io.ReadAll(io.LimitReader(reader, 256))
+	return strings.TrimSpace(strings.Map(func(ch rune) rune {
+		if ch < 0x20 && ch != '\t' {
+			return -1
+		}
+		return ch
+	}, string(raw)))
 }
 
 var _ = bytes.MinRead

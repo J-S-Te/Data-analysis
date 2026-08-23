@@ -18,6 +18,7 @@ import (
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 
+	"github.com/unified-identity-auth-platform/data-analysis/internal/platformaudit"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/auth"
 )
 
@@ -39,6 +40,8 @@ type Options struct {
 	AuthorizationContextURL string
 	// 授权复核窗口：超过该时长未复核则调用授权上下文在线复核（接入手册 §3.3）
 	AuthorizationCheckInterval time.Duration
+	// Reporter 可选；非空时在登录/登出后向平台审计上报 auth.login / auth.logout。
+	Reporter platformaudit.Reporter
 }
 
 type Service struct {
@@ -58,6 +61,7 @@ type Service struct {
 	db                      *gorm.DB
 	checkEvery              time.Duration
 	authorizationContextURL string
+	reporter                platformaudit.Reporter
 }
 
 func NewService(ctx context.Context, db *gorm.DB, options Options) (*Service, error) {
@@ -117,6 +121,7 @@ func NewService(ctx context.Context, db *gorm.DB, options Options) (*Service, er
 		checkEvery:              checkEvery,
 		httpClient:              httpClient,
 		authorizationContextURL: options.AuthorizationContextURL,
+		reporter:                options.Reporter,
 	}, nil
 }
 
@@ -210,7 +215,16 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 	if err := s.db.Create(&session).Error; err != nil {
 		return "", Session{}, err
 	}
+	s.reportAuth(ctx, platformaudit.Event{ActorID: session.PlatformUserID, ActorName: session.DisplayName, Action: "auth.login", ResourceType: "auth_session", Result: "SUCCESS", RiskLevel: "LOW"})
 	return sessionToken, session, nil
+}
+
+// reportAuth 向平台审计上报登录/登出事件；审计未配置或上报失败均不影响认证流程。
+func (s *Service) reportAuth(ctx context.Context, event platformaudit.Event) {
+	if s.reporter == nil {
+		return
+	}
+	_ = s.reporter.Report(ctx, event)
 }
 
 // resolveAuthorizationContext 调平台授权上下文端点（Bearer Keycloak access token）解析角色/权限。
@@ -314,6 +328,10 @@ func (s *Service) RevokeSession(cookieValue string) error {
 		return nil
 	}
 	now := time.Now().UTC()
+	var session Session
+	if err := s.db.Where("session_id_hash = ? AND revoked_at IS NULL", tokenHash(cookieValue)).First(&session).Error; err == nil && session.PlatformUserID != "" {
+		s.reportAuth(context.Background(), platformaudit.Event{ActorID: session.PlatformUserID, Action: "auth.logout", ResourceType: "auth_session", Result: "SUCCESS", RiskLevel: "LOW"})
+	}
 	return s.db.Model(&Session{}).Where("session_id_hash = ?", tokenHash(cookieValue)).
 		Update("revoked_at", now).Error
 }
