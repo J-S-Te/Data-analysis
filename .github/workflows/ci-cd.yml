@@ -135,7 +135,7 @@ jobs:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/basic-platform' }}
-          DEPLOY_SCRIPT: ${{ vars.DASHBOARD_DEPLOY_SCRIPT || '/opt/basic-platform/bin/deploy-data-analysis.sh' }}
+          DEPLOY_SCRIPT: ${{ vars.DASHBOARD_DEPLOY_SCRIPT || '/opt/basic-platform/bin/deploy-service.sh' }}
           DASHBOARD_API_IMAGE_REF: ${{ needs.image.outputs.dashboard_api_image_ref }}
           AGGREGATION_WORKER_IMAGE_REF: ${{ needs.image.outputs.aggregation_worker_image_ref }}
           ALERT_WORKER_IMAGE_REF: ${{ needs.image.outputs.alert_worker_image_ref }}
@@ -153,7 +153,7 @@ jobs:
           chmod 600 "$HOME/.ssh/id_ed25519"
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           printf -v remote_command \
-            'deploy_script=%q; deploy_path=%q; command -v bash >/dev/null || { echo "remote bash is unavailable" >&2; exit 127; }; test -d "$deploy_path" || { echo "deployment directory is unavailable: $deploy_path" >&2; exit 1; }; test -x "$deploy_script" || { echo "data-analysis deployment script is missing or not executable: $deploy_script" >&2; echo "install the production deployment baseline before retrying" >&2; exit 126; }; cd "$deploy_path" && exec bash "$deploy_script" %q %q %q %q' \
+            'deploy_script=%q; deploy_path=%q; command -v bash >/dev/null || { echo "remote bash is unavailable" >&2; exit 127; }; test -d "$deploy_path" || { echo "deployment directory is unavailable: $deploy_path" >&2; exit 1; }; test -x "$deploy_script" || { echo "data-analysis deployment script is missing or not executable: $deploy_script" >&2; echo "install the production deployment baseline before retrying" >&2; exit 126; }; cd "$deploy_path" && exec bash "$deploy_script" data-analysis %q %q %q %q' \
             "$DEPLOY_SCRIPT" "$DEPLOY_PATH" "$DASHBOARD_API_IMAGE_REF" "$AGGREGATION_WORKER_IMAGE_REF" "$ALERT_WORKER_IMAGE_REF" "$PRODUCTION_MIGRATE_IMAGE_REF"
           ssh \
             -o BatchMode=yes \
