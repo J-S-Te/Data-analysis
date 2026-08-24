@@ -53,8 +53,15 @@ jobs:
           : "${ACR_PULL_REGISTRY:?missing ACR_PULL_REGISTRY}"
           : "${ACR_NAMESPACE:?missing ACR_NAMESPACE}"
           : "${ACR_REPOSITORY:?missing ACR_REPOSITORY}"
-          echo "push_image=${ACR_PUSH_REGISTRY}/${ACR_NAMESPACE}/${ACR_REPOSITORY}" >> "$GITHUB_OUTPUT"
-          echo "pull_image=${ACR_PULL_REGISTRY}/${ACR_NAMESPACE}/${ACR_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          # ACR/Docker repository references must be lowercase. Normalize user-provided
+          # repository variables here so a value such as Data_analysis cannot produce
+          # an invalid image tag during buildx push.
+          push_registry="${ACR_PUSH_REGISTRY,,}"
+          pull_registry="${ACR_PULL_REGISTRY,,}"
+          namespace="${ACR_NAMESPACE,,}"
+          repository="${ACR_REPOSITORY,,}"
+          echo "push_image=${push_registry}/${namespace}/${repository}" >> "$GITHUB_OUTPUT"
+          echo "pull_image=${pull_registry}/${namespace}/${repository}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
