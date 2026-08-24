@@ -1,4 +1,4 @@
-// Package platformaudit reports concise API write outcomes to the platform audit service.
+// Package platformaudit 将精简的 API 写入结果上报到平台审计服务。
 package platformaudit
 
 import (
