@@ -106,6 +106,28 @@ func TestStripSensitiveProxyHeaders(t *testing.T) {
 	}
 }
 
+func TestBridgeDefaultTokenTTLIsShort(t *testing.T) {
+	bridge, err := New(nil, Options{MetabaseInternalURL: "http://metabase:3000", EmbeddingSecret: "test-secret"})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if bridge.tokenTTL != 2*time.Minute {
+		t.Fatalf("default tokenTTL = %v, want 2m", bridge.tokenTTL)
+	}
+}
+
+func TestBridgeHonorsExplicitTokenTTL(t *testing.T) {
+	bridge, err := New(nil, Options{
+		MetabaseInternalURL: "http://metabase:3000", EmbeddingSecret: "test-secret", TokenTTL: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if bridge.tokenTTL != 30*time.Second {
+		t.Fatalf("tokenTTL = %v, want 30s", bridge.tokenTTL)
+	}
+}
+
 func contains(value, part string) bool {
 	for i := 0; i+len(part) <= len(value); i++ {
 		if value[i:i+len(part)] == part {

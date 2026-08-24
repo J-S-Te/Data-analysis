@@ -1,4 +1,4 @@
-// Package platformaudit reports concise API write outcomes to the platform audit service.
+// Package platformaudit 将精简的 API 写入结果上报到平台审计服务。
 package platformaudit
 
 import (
@@ -19,7 +19,9 @@ import (
 type Event struct {
 	ActorID, ActorName, Action, ResourceType, ResourceID string
 	RequestID, CorrelationID, Result, ReasonCode         string
-	UserLoginIP                                          string
+	// RiskLevel 为 LOW/MEDIUM/HIGH/CRITICAL；为空时按 LOW 上报。
+	RiskLevel   string
+	UserLoginIP string
 }
 
 type Reporter interface {
@@ -63,7 +65,7 @@ func (c *client) Report(ctx context.Context, event Event) error {
 		"application_code": c.applicationCode, "environment_code": c.environmentCode,
 		"actor_type": actorType(event.ActorID), "action": event.Action, "resource_type": event.ResourceType,
 		"request_id": requestID, "trace_id": traceID, "correlation_id": correlationID,
-		"result": event.Result, "risk_level": "LOW", "metadata": map[string]string{"http_status": event.ReasonCode},
+		"result": event.Result, "risk_level": riskLevelOrDefault(event.RiskLevel), "metadata": map[string]string{"http_status": event.ReasonCode},
 	}
 	if event.ActorID != "" {
 		payload["actor_id"] = event.ActorID
@@ -156,6 +158,13 @@ func actorType(actorID string) string {
 		return "SYSTEM"
 	}
 	return "USER"
+}
+func riskLevelOrDefault(level string) string {
+	level = strings.ToUpper(strings.TrimSpace(level))
+	if level != "LOW" && level != "MEDIUM" && level != "HIGH" && level != "CRITICAL" {
+		return "LOW"
+	}
+	return level
 }
 func randomHex(size int) string {
 	raw := make([]byte, size)

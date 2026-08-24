@@ -40,6 +40,7 @@ func New(config Config) (*App, error) {
 	// 表结构由版本化 SQL 迁移创建（migrations/，compose 初始化时执行）；不使用运行时 AutoMigrate。
 
 	ctx := context.Background()
+	auditReporter := platformaudit.NewReporter(config.PlatformBaseURL, config.AuditClientID, config.AuditClientSecret, config.AuditApplicationCode, config.AuditEnvironmentCode)
 	authService, err := oidc.NewService(ctx, db, oidc.Options{
 		Issuer:                  config.OIDCIssuer,
 		BackchannelIssuer:       config.OIDCBackchannel,
@@ -53,6 +54,7 @@ func New(config Config) (*App, error) {
 		SessionTTL:              15 * timeMinute,
 		CodecKey:                config.CodecKey,
 		AuthorizationContextURL: config.AuthorizationContextURL,
+		Reporter:                auditReporter,
 	})
 	if err != nil {
 		return nil, err
@@ -78,7 +80,15 @@ func New(config Config) (*App, error) {
 			response.Error(c, errors.New("database unavailable"))
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		if config.AuditRequired && auditReporter == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not_ready", "audit": "disabled"})
+			return
+		}
+		auditStatus := "disabled"
+		if auditReporter != nil {
+			auditStatus = "enabled"
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ready", "audit": auditStatus})
 	})
 	base.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 
@@ -92,13 +102,16 @@ func New(config Config) (*App, error) {
 	base.GET("/auth/logout", authHandler.Logout)
 
 	api := base.Group("/api/v1", middleware.SessionAuth(authService, "data_analysis_session"))
-	api.Use(middleware.AuditWrites(platformaudit.NewReporter(config.PlatformBaseURL, config.AuditClientID, config.AuditClientSecret, config.AuditApplicationCode, config.AuditEnvironmentCode), slog.Default()))
+	api.Use(middleware.AuditWrites(auditReporter, slog.Default()))
 	api.GET("/auth/me", authHandler.AuthMe)
 
 	// 嵌入桥（设计方案 §9）
 	api.GET("/embed/:dashboard", func(c *gin.Context) { bridge.Issue(c, c.Param("dashboard")) })
-	base.GET("/api/v1/embed-proxy/:token", func(c *gin.Context) { bridge.Proxy(c, c.Param("token")) })
-	base.GET("/api/v1/embed-proxy/:token/*resource", func(c *gin.Context) {
+	// embed-proxy 以 URL 内的一次性令牌为唯一凭证，允许 sandbox（无 allow-same-origin）
+	// iframe 的跨源读取；CORS 仅放宽到该前缀，会话接口不受影响。
+	embedProxy := base.Group("/api/v1/embed-proxy", middleware.EmbedProxyCORS())
+	embedProxy.GET("/:token", func(c *gin.Context) { bridge.Proxy(c, c.Param("token")) })
+	embedProxy.GET("/:token/*resource", func(c *gin.Context) {
 		bridge.ProxyResource(c, c.Param("token"), c.Param("resource"))
 	})
 

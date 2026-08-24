@@ -23,3 +23,13 @@ func TestRequestClientIPRejectsPrivateAddresses(t *testing.T) {
 		t.Fatalf("client IP=%q, want empty", got)
 	}
 }
+
+func TestRequestClientIPIgnoresSpoofedHeadersFromPublicPeer(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "203.0.113.5:12345"
+	req.Header.Set("X-Real-IP", "8.8.8.8")
+	req.Header.Set("X-Forwarded-For", "8.8.8.8, 1.2.3.4")
+	if got := requestClientIP(req); got != "203.0.113.5" {
+		t.Fatalf("client IP=%q, want direct public peer 203.0.113.5", got)
+	}
+}

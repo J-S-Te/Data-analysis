@@ -50,12 +50,14 @@ func main() {
 		os.Exit(1)
 	}
 	apiSync := aggregation.NewAPISyncRunner(aggDB, aggregation.APISyncOptions{
-		MachineTokenURL:     os.Getenv("MACHINE_TOKEN_URL"),
-		MachineClientID:     os.Getenv("MACHINE_CLIENT_ID"),
-		MachineClientSecret: os.Getenv("MACHINE_CLIENT_SECRET"),
-		ContractInternalURL: os.Getenv("CONTRACT_INTERNAL_URL"),
-		ProjectInternalURL:  os.Getenv("PROJECT_INTERNAL_URL"),
-		TenantID:            os.Getenv("OIDC_TENANT_ID"),
+		MachineTokenURL:      os.Getenv("MACHINE_TOKEN_URL"),
+		MachineTokenIssuer:   firstNonEmpty(os.Getenv("MACHINE_TOKEN_ISSUER"), os.Getenv("OIDC_ISSUER")),
+		MachineTokenAudience: firstNonEmpty(os.Getenv("MACHINE_TOKEN_AUDIENCE"), "basic-platform-application"),
+		MachineClientID:      os.Getenv("MACHINE_CLIENT_ID"),
+		MachineClientSecret:  os.Getenv("MACHINE_CLIENT_SECRET"),
+		ContractInternalURL:  os.Getenv("CONTRACT_INTERNAL_URL"),
+		ProjectInternalURL:   os.Getenv("PROJECT_INTERNAL_URL"),
+		TenantID:             os.Getenv("OIDC_TENANT_ID"),
 	})
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -92,6 +94,15 @@ func main() {
 		logger.Error("aggregation-worker stopped with error", "error", err)
 		os.Exit(1)
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func readDSNEnv(code string) string {

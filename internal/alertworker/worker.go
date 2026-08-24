@@ -1,4 +1,4 @@
-// Package alertworker evaluates enabled alert rules against aggregation tables.
+// Package alertworker 根据聚合表计算已启用的预警规则。
 package alertworker
 
 import (

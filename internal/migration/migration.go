@@ -1,4 +1,4 @@
-// Package migration applies the immutable MySQL schema history for data_analysis.
+// Package migration 执行 data_analysis 的不可变 MySQL 架构迁移历史。
 package migration
 
 import (
@@ -26,8 +26,7 @@ const (
 
 var migrationFilePattern = regexp.MustCompile(`^(\d{6})_([a-z0-9_]+)\.sql$`)
 
-// Item is one ordered, immutable SQL migration. Checksum prevents an already
-// released migration from being edited in place.
+// Item 表示一份有序且不可变的 SQL 迁移。Checksum 防止已发布迁移被原地修改。
 type Item struct {
 	Version  uint64
 	Name     string
@@ -35,14 +34,13 @@ type Item struct {
 	Checksum [sha256.Size]byte
 }
 
-// Applied identifies a migration written to the database during the current run.
+// Applied 标识本次运行写入数据库的迁移。
 type Applied struct {
 	Version uint64
 	Name    string
 }
 
-// Load validates migration names, versions and content before a database
-// connection is opened. Versions must start at 000001 and remain contiguous.
+// Load 在建立数据库连接前校验迁移名称、版本和内容。版本必须从 000001 开始并连续递增。
 func Load(source fs.FS) ([]Item, error) {
 	filePaths, err := fs.Glob(source, "*.sql")
 	if err != nil {
@@ -103,7 +101,7 @@ func Load(source fs.FS) ([]Item, error) {
 	return items, nil
 }
 
-// Run applies pending migrations and verifies checksums for applied history.
+// Run 执行待处理迁移，并校验已执行迁移的摘要。
 //
 // MySQL DDL can commit implicitly, so every migration must be safe to retry.
 // A named lock is held on one physical connection for the entire run, preventing
