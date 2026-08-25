@@ -268,7 +268,7 @@ func normalizeManifest(manifest Manifest) (catalogPayload, error) {
 }
 
 func validateOptions(options Options) (*url.URL, error) {
-	if strings.TrimSpace(options.BaseURL) == "" || strings.TrimSpace(options.ApplicationID) == "" || strings.TrimSpace(options.ClientID) == "" || options.ClientSecret == "" {
+	if placeholderRuntimeValue(options.BaseURL) || placeholderRuntimeValue(options.ApplicationID) || placeholderRuntimeValue(options.ClientID) || placeholderRuntimeValue(options.ClientSecret) {
 		return nil, errors.New("authorization catalog synchronization configuration is incomplete")
 	}
 	parsed, err := url.ParseRequestURI(options.BaseURL)
@@ -276,6 +276,13 @@ func validateOptions(options Options) (*url.URL, error) {
 		return nil, errors.New("authorization catalog platform base URL must be an HTTP(S) origin")
 	}
 	return parsed, nil
+}
+
+// placeholderRuntimeValue 判断运行时值是否尚未完成受控接入。占位值绝不能用于请求
+// 平台目录接口，否则会把配置错误伪装成远端 401/403 并触发容器重复重启。
+func placeholderRuntimeValue(value string) bool {
+	value = strings.TrimSpace(value)
+	return value == "" || strings.HasPrefix(value, "PENDING_") || strings.HasPrefix(value, "REPLACE_WITH_")
 }
 
 func requestAccessToken(ctx context.Context, client *http.Client, baseURL *url.URL, options Options) (string, error) {
