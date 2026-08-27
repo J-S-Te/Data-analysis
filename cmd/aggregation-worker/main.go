@@ -79,7 +79,16 @@ func main() {
 		pass.SyncProjectDashboard = apiSync.SyncProjectDashboard
 	}
 	if !pass.Configured() {
+		// 无任何同步通道：once 模式单次执行后退出合理；长驻模式必须保持
+		// 存活等待配置（RunLoop 对空 pass 安全），否则容器会陷入重启循环。
 		logger.Warn("no database sources or internal API endpoints configured; nothing to sync")
+		if *once {
+			return
+		}
+		if err := aggregation.RunLoop(ctx, *interval, pass, logger); err != nil {
+			logger.Error("aggregation-worker stopped with error", "error", err)
+			os.Exit(1)
+		}
 		return
 	}
 	if *once {
