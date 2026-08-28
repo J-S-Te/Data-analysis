@@ -30,18 +30,21 @@ func TestValidateIDTokenClaimsRequiresNonceAndTenantBinding(t *testing.T) {
 
 func TestValidateAuthorizationBinding(t *testing.T) {
 	valid := AuthorizationContext{
-		Subject:         "subject-1",
-		IdentityID:      "identity-1",
-		TenantID:        "tenant-1",
-		ClientID:        "data_analysis-dev-web",
-		ApplicationCode: "data_analysis",
-		EnvironmentCode: "dev",
+		Subject:               "subject-1",
+		IdentityID:            "identity-1",
+		TenantID:              "tenant-1",
+		ClientID:              "data_analysis-dev-web",
+		ApplicationCode:       "data_analysis",
+		EnvironmentCode:       "dev",
+		AuthorizationRevision: 1,
 	}
-	if err := validateAuthorizationBinding(valid, "subject-1", "tenant-1", "data_analysis-dev-web", "data_analysis", "dev"); err != nil {
+	if got, err := validateAuthorizationBinding(valid, "subject-1", "", "tenant-1", "data_analysis-dev-web", "data_analysis", "dev"); err != nil || got != "identity-1" {
 		t.Fatalf("valid authorization binding rejected: %v", err)
 	}
 	tests := map[string]AuthorizationContext{
 		"subject":     func() AuthorizationContext { value := valid; value.Subject = "subject-2"; return value }(),
+		"subject id":  func() AuthorizationContext { value := valid; value.SubjectID = "identity-2"; return value }(),
+		"revision":    func() AuthorizationContext { value := valid; value.AuthorizationRevision = 0; return value }(),
 		"tenant":      func() AuthorizationContext { value := valid; value.TenantID = "tenant-2"; return value }(),
 		"client":      func() AuthorizationContext { value := valid; value.ClientID = "other-client"; return value }(),
 		"application": func() AuthorizationContext { value := valid; value.ApplicationCode = "other"; return value }(),
@@ -49,9 +52,12 @@ func TestValidateAuthorizationBinding(t *testing.T) {
 	}
 	for name, value := range tests {
 		t.Run(name, func(t *testing.T) {
-			if err := validateAuthorizationBinding(value, "subject-1", "tenant-1", "data_analysis-dev-web", "data_analysis", "dev"); err == nil {
+			if _, err := validateAuthorizationBinding(value, "subject-1", "", "tenant-1", "data_analysis-dev-web", "data_analysis", "dev"); err == nil {
 				t.Fatal("mismatched authorization binding was accepted")
 			}
 		})
+	}
+	if got, err := validateAuthorizationBinding(valid, "", "identity-1", "tenant-1", "data_analysis-dev-web", "data_analysis", "dev"); err != nil || got != "identity-1" {
+		t.Fatalf("session refresh binding rejected: subject=%q err=%v", got, err)
 	}
 }

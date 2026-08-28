@@ -38,7 +38,7 @@ func main() {
 	var runner *aggregation.Runner
 	var err error
 	if len(sources) > 0 {
-		runner, err = aggregation.NewRunner(aggDSN, sources)
+		runner, err = aggregation.NewRunner(aggDSN, os.Getenv("OIDC_TENANT_ID"), sources)
 		if err != nil {
 			logger.Error("aggregation runner failed", "error", err)
 			os.Exit(1)
@@ -53,11 +53,17 @@ func main() {
 		MachineTokenURL:      os.Getenv("MACHINE_TOKEN_URL"),
 		MachineTokenIssuer:   firstNonEmpty(os.Getenv("MACHINE_TOKEN_ISSUER"), os.Getenv("OIDC_ISSUER")),
 		MachineTokenAudience: firstNonEmpty(os.Getenv("MACHINE_TOKEN_AUDIENCE"), "basic-platform-application"),
-		MachineClientID:      os.Getenv("MACHINE_CLIENT_ID"),
-		MachineClientSecret:  os.Getenv("MACHINE_CLIENT_SECRET"),
-		ContractInternalURL:  os.Getenv("CONTRACT_INTERNAL_URL"),
-		ProjectInternalURL:   os.Getenv("PROJECT_INTERNAL_URL"),
-		TenantID:             os.Getenv("OIDC_TENANT_ID"),
+		ContractCredential: aggregation.MachineCredential{
+			ClientID: os.Getenv("CONTRACT_MACHINE_CLIENT_ID"), ClientSecret: os.Getenv("CONTRACT_MACHINE_CLIENT_SECRET"),
+			Scope: firstNonEmpty(os.Getenv("CONTRACT_MACHINE_TOKEN_SCOPE"), "dashboard.contract.read"),
+		},
+		ProjectCredential: aggregation.MachineCredential{
+			ClientID: os.Getenv("PROJECT_MACHINE_CLIENT_ID"), ClientSecret: os.Getenv("PROJECT_MACHINE_CLIENT_SECRET"),
+			Scope: firstNonEmpty(os.Getenv("PROJECT_MACHINE_TOKEN_SCOPE"), "dashboard.project.read"),
+		},
+		ContractInternalURL: os.Getenv("CONTRACT_INTERNAL_URL"),
+		ProjectInternalURL:  os.Getenv("PROJECT_INTERNAL_URL"),
+		TenantID:            os.Getenv("OIDC_TENANT_ID"),
 	})
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -69,7 +75,7 @@ func main() {
 	}
 	pass := aggregation.Pass{}
 	if runner != nil {
-		pass.SyncSources = runner.RunOnce
+		// 跨系统同步只由已持久化的访问/管理请求触发；空闲时 Worker 不主动读取源库。
 		pass.SyncJobs = runner.RunQueued
 	}
 	if os.Getenv("CONTRACT_INTERNAL_URL") != "" {

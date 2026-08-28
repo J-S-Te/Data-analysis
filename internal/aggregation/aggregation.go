@@ -23,25 +23,30 @@ const (
 
 // Runner 是聚合任务执行器，封装聚合库连接与源系统同步配置。
 type Runner struct {
-	aggDB   *gorm.DB
-	sources map[string]string // subsystem_code -> 只读 DSN
+	aggDB    *gorm.DB
+	sources  map[string]string // subsystem_code -> 只读 DSN
+	tenantID string
 	// effectiveStatuses 为"已生效"合同状态过滤（字典口径待确认；默认空=不过滤）
 	effectiveStatuses []string
 }
 
-// NewRunner 使用聚合库 DSN 和源系统配置初始化 Runner。
-// aggDSN 为聚合数据库连接串；sources 映射 subsystem_code 到只读源 DSN；
+// NewRunner 使用聚合库 DSN、租户和源系统配置初始化 Runner。
+// aggDSN 为聚合数据库连接串；tenantID 是数据源配置的隔离边界；sources 映射 subsystem_code 到只读源 DSN；
 // 成功时返回可复用的 *Runner，建立连接失败时返回错误并终止后续同步。
-func NewRunner(aggDSN string, sources map[string]string) (*Runner, error) {
+func NewRunner(aggDSN, tenantID string, sources map[string]string) (*Runner, error) {
+	if tenantID == "" {
+		return nil, errors.New("OIDC_TENANT_ID is required for aggregation source isolation")
+	}
 	db, err := gorm.Open(mysql.Open(aggDSN), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
 		return nil, err
 	}
-	return &Runner{aggDB: db, sources: sources}, nil
+	return &Runner{aggDB: db, tenantID: tenantID, sources: sources}, nil
 }
 
 // SyncSource 聚合库 sync_source 记录。
 type SyncSource struct {
+	TenantID       string     `gorm:"column:tenant_id"`
 	ID             string     `gorm:"column:id;primaryKey"`
 	SubsystemCode  string     `gorm:"column:subsystem_code"`
 	DBHost         string     `gorm:"column:db_host"`
@@ -61,6 +66,7 @@ func (SyncSource) TableName() string { return "sync_source" }
 
 // SyncJob 是管理员提交的单次同步请求，由 aggregation-worker 异步领取。
 type SyncJob struct {
+	TenantID      string     `gorm:"column:tenant_id"`
 	ID            string     `gorm:"column:id;primaryKey"`
 	SourceID      string     `gorm:"column:source_id"`
 	SubsystemCode string     `gorm:"column:subsystem_code"`
@@ -69,6 +75,7 @@ type SyncJob struct {
 	StartedAt     *time.Time `gorm:"column:started_at"`
 	FinishedAt    *time.Time `gorm:"column:finished_at"`
 	ErrorMessage  *string    `gorm:"column:error_message"`
+	ActiveKey     *string    `gorm:"column:active_key"`
 }
 
 // TableName 返回 sync_job 表名，供 GORM 映射与同步任务状态更新使用。
@@ -78,13 +85,13 @@ func (SyncJob) TableName() string { return "sync_job" }
 func (r *Runner) EnsureSyncSources(ctx context.Context) error {
 	for code := range r.sources {
 		var count int64
-		if err := r.aggDB.Model(&SyncSource{}).Where("subsystem_code = ?", code).Count(&count).Error; err != nil {
+		if err := r.aggDB.WithContext(ctx).Model(&SyncSource{}).Where("tenant_id = ? AND subsystem_code = ?", r.tenantID, code).Count(&count).Error; err != nil {
 			return err
 		}
 		if count == 0 {
 			now := time.Now().UTC()
-			if err := r.aggDB.Create(&SyncSource{
-				ID: ulid(), SubsystemCode: code, DBHost: "source-secret", DBSchema: code,
+			if err := r.aggDB.WithContext(ctx).Create(&SyncSource{
+				TenantID: r.tenantID, ID: ulid(), SubsystemCode: code, DBHost: "source-secret", DBSchema: code,
 				ReadAccountRef: code + ".read", Enabled: true,
 				LastStatus: "PENDING", CreatedAt: now, UpdatedAt: now,
 			}).Error; err != nil {
@@ -135,13 +142,13 @@ func (r *Runner) RunOnce(ctx context.Context) error {
 // ctx 用于控制数据库查询与调度循环；返回值仅在查询/更新失败时为非 nil，其余执行失败会进入作业行级失败快照并继续处理后续行。
 func (r *Runner) RunQueued(ctx context.Context) error {
 	var jobs []SyncJob
-	if err := r.aggDB.WithContext(ctx).Where("status = ?", "QUEUED").Order("requested_at ASC").Limit(10).Find(&jobs).Error; err != nil {
+	if err := r.aggDB.WithContext(ctx).Where("tenant_id = ? AND status = ?", r.tenantID, "QUEUED").Order("requested_at ASC, id ASC").Limit(10).Find(&jobs).Error; err != nil {
 		return err
 	}
 	for _, job := range jobs {
 		now := time.Now().UTC()
 		result := r.aggDB.WithContext(ctx).Model(&SyncJob{}).
-			Where("id = ? AND status = ?", job.ID, "QUEUED").
+			Where("tenant_id = ? AND id = ? AND status = ?", job.TenantID, job.ID, "QUEUED").
 			Updates(map[string]interface{}{"status": "RUNNING", "started_at": now, "error_message": nil})
 		if result.Error != nil {
 			return result.Error
@@ -151,13 +158,13 @@ func (r *Runner) RunQueued(ctx context.Context) error {
 		}
 		err := r.runSource(ctx, job.SubsystemCode, r.sources[job.SubsystemCode])
 		finished := time.Now().UTC()
-		updates := map[string]interface{}{"status": "SUCCESS", "finished_at": finished, "error_message": nil}
+		updates := map[string]interface{}{"status": "SUCCESS", "finished_at": finished, "error_message": nil, "active_key": nil}
 		if err != nil {
 			message := err.Error()
 			updates["status"] = "FAILED"
 			updates["error_message"] = message
 		}
-		if updateErr := r.aggDB.WithContext(ctx).Model(&SyncJob{}).Where("id = ?", job.ID).Updates(updates).Error; updateErr != nil {
+		if updateErr := r.aggDB.WithContext(ctx).Model(&SyncJob{}).Where("tenant_id = ? AND id = ?", job.TenantID, job.ID).Updates(updates).Error; updateErr != nil {
 			return updateErr
 		}
 	}
@@ -185,7 +192,7 @@ func (r *Runner) mark(ctx context.Context, code string, status string, runAt tim
 	} else {
 		updates["last_error"] = nil
 	}
-	_ = r.aggDB.Model(&SyncSource{}).Where("subsystem_code = ?", code).Updates(updates).Error
+	_ = r.aggDB.WithContext(ctx).Model(&SyncSource{}).Where("tenant_id = ? AND subsystem_code = ?", r.tenantID, code).Updates(updates).Error
 }
 
 type connectionPoolCloser interface {

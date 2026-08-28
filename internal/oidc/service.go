@@ -32,6 +32,8 @@ type Options struct {
 	TenantID          string
 	ApplicationCode   string
 	EnvironmentCode   string
+	CatalogVersion    string
+	RoleConfigHash    string
 	PathPrefix        string
 	SessionTTL        time.Duration
 	CodecKey          []byte // 32 字节
@@ -55,6 +57,8 @@ type Service struct {
 	clientID                string
 	applicationCode         string
 	environmentCode         string
+	catalogVersion          string
+	roleConfigHash          string
 	pathPrefix              string
 	sessionTTL              time.Duration
 	codec                   *secretCodec
@@ -114,6 +118,8 @@ func NewService(ctx context.Context, db *gorm.DB, options Options) (*Service, er
 		clientID:                options.ClientID,
 		applicationCode:         options.ApplicationCode,
 		environmentCode:         options.EnvironmentCode,
+		catalogVersion:          strings.TrimSpace(options.CatalogVersion),
+		roleConfigHash:          strings.TrimSpace(options.RoleConfigHash),
 		pathPrefix:              options.PathPrefix,
 		sessionTTL:              sessionTTL,
 		codec:                   codec,
@@ -138,15 +144,20 @@ type idTokenClaims struct {
 
 // AuthorizationContext 平台授权上下文响应（对齐 contract authorization_context.go）。
 type AuthorizationContext struct {
-	Subject               string   `json:"sub"`
-	IdentityID            string   `json:"identity_id"`
-	TenantID              string   `json:"tenant_id"`
-	ClientID              string   `json:"client_id"`
-	ApplicationCode       string   `json:"application_code"`
-	EnvironmentCode       string   `json:"environment_code"`
-	Roles                 []string `json:"roles"`
-	Permissions           []string `json:"permissions"`
-	AuthorizationRevision uint64   `json:"authorization_revision"`
+	Subject                    string   `json:"sub"`
+	SubjectID                  string   `json:"subject_id"`
+	IdentityID                 string   `json:"identity_id"`
+	TenantID                   string   `json:"tenant_id"`
+	ClientID                   string   `json:"client_id"`
+	ApplicationCode            string   `json:"application_code"`
+	EnvironmentCode            string   `json:"environment_code"`
+	Roles                      []string `json:"roles"`
+	Permissions                []string `json:"permissions"`
+	CatalogVersion             string   `json:"catalog_version"`
+	CompatibleCatalogVersions  []string `json:"compatible_catalog_versions"`
+	RoleConfigHash             string   `json:"role_config_hash"`
+	CompatibleRoleConfigHashes []string `json:"compatible_role_config_hashes"`
+	AuthorizationRevision      uint64   `json:"authorization_revision"`
 }
 
 // AuthorizationURL 生成 Keycloak 授权地址（Authorization Code + PKCE S256）。
@@ -187,7 +198,11 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 		slog.Warn("resolve authorization context failed", "error", err.Error(), "url", s.authorizationContextURL)
 		return "", Session{}, fmt.Errorf("resolve authorization context: %w", err)
 	}
-	if err := validateAuthorizationBinding(authz, claims.Sub, claims.TenantID, s.clientID, s.applicationCode, s.environmentCode); err != nil {
+	platformSubjectID, err := validateAuthorizationBinding(authz, claims.Sub, "", claims.TenantID, s.clientID, s.applicationCode, s.environmentCode)
+	if err != nil {
+		return "", Session{}, err
+	}
+	if err := validateCatalogWindow(authz, s.catalogVersion, s.roleConfigHash); err != nil {
 		return "", Session{}, err
 	}
 	rolesJSON, _ := json.Marshal(authz.Roles)
@@ -200,7 +215,7 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 	session = Session{
 		SessionIDHash:          tokenHash(sessionToken),
 		TenantID:               authz.TenantID,
-		PlatformUserID:         claims.Sub,
+		PlatformUserID:         platformSubjectID,
 		DisplayName:            claims.Name,
 		RolesJSON:              string(rolesJSON),
 		PermissionsJSON:        string(permissionsJSON),
@@ -291,8 +306,11 @@ func (s *Service) Authenticate(ctx context.Context, cookieValue string) (auth.Pr
 		if resolveErr != nil {
 			return auth.Principal{}, fmt.Errorf("refresh authorization context: %w", resolveErr)
 		}
-		if bindErr := validateAuthorizationBinding(authz, session.PlatformUserID, session.TenantID, s.clientID, s.applicationCode, s.environmentCode); bindErr != nil {
+		if _, bindErr := validateAuthorizationBinding(authz, "", session.PlatformUserID, session.TenantID, s.clientID, s.applicationCode, s.environmentCode); bindErr != nil {
 			return auth.Principal{}, bindErr
+		}
+		if windowErr := validateCatalogWindow(authz, s.catalogVersion, s.roleConfigHash); windowErr != nil {
+			return auth.Principal{}, windowErr
 		}
 		rolesJSON, _ := json.Marshal(authz.Roles)
 		permissionsJSON, _ := json.Marshal(authz.Permissions)
@@ -401,17 +419,54 @@ func validateIDTokenClaims(claims idTokenClaims, expectedNonce, configuredTenant
 	return nil
 }
 
-func validateAuthorizationBinding(value AuthorizationContext, subject, tenant, clientID, applicationCode, environmentCode string) error {
-	if value.Subject != subject || value.TenantID != tenant {
-		return errors.New("OIDC and authorization identities differ")
+func validateAuthorizationBinding(value AuthorizationContext, tokenSubject, platformSubjectID, tenant, clientID, applicationCode, environmentCode string) (string, error) {
+	canonicalSubjectID := strings.TrimSpace(value.SubjectID)
+	if canonicalSubjectID == "" {
+		canonicalSubjectID = strings.TrimSpace(value.IdentityID)
 	}
-	if strings.TrimSpace(value.IdentityID) == "" {
-		return errors.New("authorization context identity is missing")
+	if canonicalSubjectID == "" || value.IdentityID != canonicalSubjectID || value.TenantID != tenant || value.AuthorizationRevision == 0 {
+		return "", errors.New("authorization context platform subject, tenant or revision is invalid")
+	}
+	if tokenSubject != "" && value.Subject != tokenSubject {
+		return "", errors.New("OIDC and authorization token subjects differ")
+	}
+	if platformSubjectID != "" && canonicalSubjectID != platformSubjectID {
+		return "", errors.New("authorization context platform subject changed")
 	}
 	if value.ClientID != clientID || value.ApplicationCode != applicationCode || value.EnvironmentCode != environmentCode {
-		return errors.New("authorization context client, application or environment binding mismatch")
+		return "", errors.New("authorization context client, application or environment binding mismatch")
+	}
+	return canonicalSubjectID, nil
+}
+
+func validateCatalogWindow(value AuthorizationContext, localVersion, localHash string) error {
+	allMissing := value.CatalogVersion == "" && len(value.CompatibleCatalogVersions) == 0 && value.RoleConfigHash == "" && len(value.CompatibleRoleConfigHashes) == 0
+	if allMissing {
+		return nil
+	}
+	if localVersion == "" || localHash == "" || value.CatalogVersion == "" || value.RoleConfigHash == "" || len(value.CompatibleCatalogVersions) == 0 || len(value.CompatibleCatalogVersions) > 2 || len(value.CompatibleRoleConfigHashes) == 0 || len(value.CompatibleRoleConfigHashes) > 2 {
+		return errors.New("authorization catalog compatibility window is incomplete")
+	}
+	if !catalogValuePresent(value.CompatibleCatalogVersions, value.CatalogVersion) || !catalogValuePresent(value.CompatibleCatalogVersions, localVersion) || !catalogValuePresent(value.CompatibleRoleConfigHashes, value.RoleConfigHash) || !catalogValuePresent(value.CompatibleRoleConfigHashes, localHash) {
+		return errors.New("local authorization catalog is outside the N/N-1 compatibility window")
 	}
 	return nil
+}
+
+func catalogValuePresent(values []string, expected string) bool {
+	seen := map[string]struct{}{}
+	found := false
+	for _, value := range values {
+		if value == "" || value != strings.TrimSpace(value) {
+			return false
+		}
+		if _, duplicate := seen[value]; duplicate {
+			return false
+		}
+		seen[value] = struct{}{}
+		found = found || value == expected
+	}
+	return found
 }
 
 func (s *Service) DecryptNonce(cipher []byte) (string, error)    { return s.codec.decrypt(cipher) }

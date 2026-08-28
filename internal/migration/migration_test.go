@@ -49,6 +49,31 @@ func TestEmbeddedMigrationsCoverDashboardAPISnapshots(t *testing.T) {
 	}
 }
 
+func TestEmbeddedMigrationsProtectTenantScopedAdministration(t *testing.T) {
+	t.Parallel()
+
+	items, err := Load(migrations.Files)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	var tenantMigration string
+	for _, item := range items {
+		if item.Version == 9 {
+			tenantMigration = item.SQL
+			break
+		}
+	}
+	for _, expected := range []string{
+		"ALTER TABLE sync_source", "tenant_id", "uk_sync_source_tenant",
+		"ALTER TABLE sync_job", "active_key", "uk_sync_job_active_source",
+		"ALTER TABLE alert_rule", "uk_alert_rule_tenant",
+	} {
+		if !strings.Contains(tenantMigration, expected) {
+			t.Errorf("tenant migration does not contain %q", expected)
+		}
+	}
+}
+
 func TestLoadRejectsChangedVersionSequence(t *testing.T) {
 	t.Parallel()
 
