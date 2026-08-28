@@ -75,7 +75,9 @@ func main() {
 	}
 	pass := aggregation.Pass{}
 	if runner != nil {
-		// 跨系统同步只由已持久化的访问/管理请求触发；空闲时 Worker 不主动读取源库。
+		// 主动跨库同步：从源库（合同/客户）读取并写入聚合库维表，保证看板有数据。
+		pass.SyncSources = runner.RunOnce
+		// 跨系统同步也支持由已持久化的访问/管理请求（队列）触发。
 		pass.SyncJobs = runner.RunQueued
 	}
 	if os.Getenv("CONTRACT_INTERNAL_URL") != "" {
