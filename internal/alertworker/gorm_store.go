@@ -2,6 +2,8 @@ package alertworker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"time"
 
 	"gorm.io/gorm"
@@ -14,16 +16,25 @@ type gormRule struct {
 }
 
 // GormStore 使用版本化迁移创建的 alert_rule、alert_item 和 dim_contract 表。
-type GormStore struct{ db *gorm.DB }
+type GormStore struct {
+	db       *gorm.DB
+	tenantID string
+}
 
-func NewGormStore(db *gorm.DB) *GormStore { return &GormStore{db: db} }
+// NewGormStore 构造只读取指定租户规则的预警仓储。
+func NewGormStore(db *gorm.DB, tenantID string) *GormStore {
+	return &GormStore{db: db, tenantID: tenantID}
+}
 
 func (s *GormStore) ListEnabledRules(ctx context.Context) ([]Rule, error) {
+	if err := s.ensureDefaultRule(ctx); err != nil {
+		return nil, err
+	}
 	var rows []gormRule
 	if err := s.db.WithContext(ctx).
 		Table("alert_rule").
 		Select("rule_code, severity, threshold_json").
-		Where("enabled = ?", true).
+		Where("tenant_id = ? AND enabled = ?", s.tenantID, true).
 		Order("rule_code").
 		Find(&rows).Error; err != nil {
 		return nil, err
@@ -37,6 +48,17 @@ func (s *GormStore) ListEnabledRules(ctx context.Context) ([]Rule, error) {
 		})
 	}
 	return rules, nil
+}
+
+// ensureDefaultRule 为首次运行的租户写入可执行的最小默认规则，不覆盖已由管理员维护的规则。
+func (s *GormStore) ensureDefaultRule(ctx context.Context) error {
+	now := time.Now().UTC()
+	sum := sha256.Sum256([]byte("data-analysis:alert-rule:" + s.tenantID + ":CONTRACT_EXPIRY"))
+	id := hex.EncodeToString(sum[:])[:26]
+	return s.db.WithContext(ctx).Exec(`INSERT INTO alert_rule
+(tenant_id, id, rule_code, name, source_fct, severity, enabled, threshold_json, created_at, updated_at)
+VALUES (?, ?, 'CONTRACT_EXPIRY', '合同到期提醒', 'dim_contract', 'HIGH', 1, '{"days":30}', ?, ?)
+ON DUPLICATE KEY UPDATE tenant_id = tenant_id`, s.tenantID, id, now, now).Error
 }
 
 func (s *GormStore) FindContractExpiryCandidates(

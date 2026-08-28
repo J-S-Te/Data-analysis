@@ -42,11 +42,11 @@ func TestSyncContractDashboardMapsVerifiedTenantSnapshot(t *testing.T) {
 	runner := &APISyncRunner{
 		options: APISyncOptions{
 			ContractInternalURL: server.URL,
+			ContractCredential:  MachineCredential{ClientID: "contract-reader"},
 			TenantID:            tenantID,
 			HTTPTimeout:         time.Second,
 		},
-		token:          "machine-token",
-		tokenExpiresAt: time.Now().Add(time.Hour),
+		tokens: map[string]cachedMachineToken{"contract-reader": {value: "machine-token", expiresAt: time.Now().Add(time.Hour)}},
 	}
 
 	var captured contractDashboardSnapshot
@@ -79,11 +79,11 @@ func TestSyncContractDashboardRejectsCrossTenantResponse(t *testing.T) {
 	runner := &APISyncRunner{
 		options: APISyncOptions{
 			ContractInternalURL: server.URL,
+			ContractCredential:  MachineCredential{ClientID: "contract-reader"},
 			TenantID:            "tenant-1",
 			HTTPTimeout:         time.Second,
 		},
-		token:          "machine-token",
-		tokenExpiresAt: time.Now().Add(time.Hour),
+		tokens: map[string]cachedMachineToken{"contract-reader": {value: "machine-token", expiresAt: time.Now().Add(time.Hour)}},
 	}
 	persisted := false
 	err := runner.syncContractDashboard(context.Background(), func(context.Context, contractDashboardSnapshot) error {

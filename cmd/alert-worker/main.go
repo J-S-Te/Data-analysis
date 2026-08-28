@@ -38,7 +38,12 @@ func main() {
 		logger.Error("open dashboard database failed", "error", err)
 		os.Exit(1)
 	}
-	worker := alertworker.New(alertworker.NewGormStore(db))
+	tenantID := os.Getenv("OIDC_TENANT_ID")
+	if tenantID == "" {
+		logger.Error("OIDC_TENANT_ID is required for alert rule isolation")
+		os.Exit(1)
+	}
+	worker := alertworker.New(alertworker.NewGormStore(db, tenantID))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 

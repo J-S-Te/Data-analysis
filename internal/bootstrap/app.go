@@ -13,12 +13,20 @@ import (
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/embedbridge"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/middleware"
-	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin"
-	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/alerts"
-	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard"
-	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/dictionary"
+	adminapplication "github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin/application"
+	admininfrastructure "github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin/infrastructure"
+	adminhttp "github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin/interfaces/http"
+	alertsapplication "github.com/unified-identity-auth-platform/data-analysis/internal/modules/alerts/application"
+	alertsinfrastructure "github.com/unified-identity-auth-platform/data-analysis/internal/modules/alerts/infrastructure"
+	alertshttp "github.com/unified-identity-auth-platform/data-analysis/internal/modules/alerts/interfaces/http"
+	dashboardapplication "github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard/application"
+	dashboardinfrastructure "github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard/infrastructure"
+	dashboardhttp "github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard/interfaces/http"
+	dictionaryapplication "github.com/unified-identity-auth-platform/data-analysis/internal/modules/dictionary/application"
+	dictionaryhttp "github.com/unified-identity-auth-platform/data-analysis/internal/modules/dictionary/interfaces/http"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/oidc"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/platformaudit"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/platformcatalog"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/response"
 )
 
@@ -40,6 +48,11 @@ func New(config Config) (*App, error) {
 	// 表结构由版本化 SQL 迁移创建（migrations/，compose 初始化时执行）；不使用运行时 AutoMigrate。
 
 	ctx := context.Background()
+	localCatalog := platformcatalog.DataAnalysisManifest()
+	localRoleConfigHash, err := platformcatalog.ClaimsRoleConfigHash(localCatalog)
+	if err != nil {
+		return nil, err
+	}
 	auditReporter := platformaudit.NewReporter(config.PlatformBaseURL, config.AuditClientID, config.AuditClientSecret, config.AuditApplicationCode, config.AuditEnvironmentCode)
 	authService, err := oidc.NewService(ctx, db, oidc.Options{
 		Issuer:                  config.OIDCIssuer,
@@ -50,6 +63,8 @@ func New(config Config) (*App, error) {
 		TenantID:                config.OIDCTenantID,
 		ApplicationCode:         config.AuditApplicationCode,
 		EnvironmentCode:         config.AuditEnvironmentCode,
+		CatalogVersion:          localCatalog.Version,
+		RoleConfigHash:          localRoleConfigHash,
 		PathPrefix:              config.PathPrefix,
 		SessionTTL:              15 * timeMinute,
 		CodecKey:                config.CodecKey,
@@ -100,6 +115,7 @@ func New(config Config) (*App, error) {
 	base.GET("/auth/login", authHandler.Login)
 	base.GET("/auth/callback", authHandler.Callback)
 	base.GET("/auth/logout", authHandler.Logout)
+	base.POST("/auth/backchannel-logout", authService.BackchannelLogout)
 
 	api := base.Group("/api/v1", middleware.SessionAuth(authService, "data_analysis_session"))
 	api.Use(middleware.AuditWrites(auditReporter, slog.Default()))
@@ -116,16 +132,16 @@ func New(config Config) (*App, error) {
 	})
 
 	// 业务桩（聚合库表就绪后生效）
-	alertHandler := alerts.NewHandler(db)
+	alertHandler := alertshttp.NewHandler(alertsapplication.NewService(alertsinfrastructure.NewGORMRepository(db)))
 	api.GET("/alerts", middleware.RequirePermission("alert.view"), alertHandler.List)
 	api.POST("/alerts/:id/ack", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("alert.manage"), func(c *gin.Context) { alertHandler.UpdateStatus(c, c.Param("id"), "ACK") })
 	api.POST("/alerts/:id/close", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("alert.manage"), func(c *gin.Context) { alertHandler.UpdateStatus(c, c.Param("id"), "CLOSED") })
 
-	dictHandler := dictionary.NewHandler()
+	dictHandler := dictionaryhttp.NewHandler(dictionaryapplication.NewCatalogService())
 	api.GET("/dictionary", middleware.RequirePermission("dictionary.view"), dictHandler.Get)
 
-	adminHandler := admin.NewHandler(db)
-	dashboardHandler := dashboard.NewHandler(db)
+	adminHandler := adminhttp.NewHandler(adminapplication.NewService(admininfrastructure.NewGORMRepository(db)))
+	dashboardHandler := dashboardhttp.NewHandler(dashboardapplication.NewService(dashboardinfrastructure.NewGORMRepository(db)))
 	api.GET("/dashboard/contract", middleware.RequirePermission("dashboard.contract.view"), dashboardHandler.Contract)
 	api.GET("/dashboard/project", middleware.RequirePermission("dashboard.project.view"), dashboardHandler.Project)
 	api.GET("/admin/sources", middleware.RequirePermission("aggregation.manage"), adminHandler.ListSources)
