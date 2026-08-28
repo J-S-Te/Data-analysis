@@ -133,6 +133,7 @@ func (r *APISyncRunner) machineToken(ctx context.Context, credential MachineCred
 
 type machineAccessTokenClaims struct {
 	Issuer          string          `json:"iss"`
+	Subject         string          `json:"sub"`
 	AuthorizedParty string          `json:"azp"`
 	ClientID        string          `json:"client_id"`
 	Type            string          `json:"typ"`
@@ -168,8 +169,14 @@ func validateMachineTokenContract(rawToken string, options APISyncOptions, crede
 		return fmt.Errorf("machine token issuer mismatch: got %q", claims.Issuer)
 	}
 	clientID := strings.TrimSpace(credential.ClientID)
-	if strings.TrimSpace(claims.AuthorizedParty) != clientID || (strings.TrimSpace(claims.ClientID) != "" && strings.TrimSpace(claims.ClientID) != clientID) {
-		return errors.New("machine token authorized party/client_id mismatch")
+	// 基础平台签发的 application JWT 用 sub 承载外部 client_id（如
+	// data_analysis-prod-dashboard-reader）；老版本 Keycloak 机器令牌用 azp。
+	// 优先校验 sub，缺失时回退到 azp，client_id 若存在也必须一致。
+	subject := strings.TrimSpace(claims.Subject)
+	authorizedParty := strings.TrimSpace(claims.AuthorizedParty)
+	subjectMatch := (subject != "" && subject == clientID) || (subject == "" && authorizedParty == clientID)
+	if !subjectMatch || (strings.TrimSpace(claims.ClientID) != "" && strings.TrimSpace(claims.ClientID) != clientID) {
+		return errors.New("machine token subject/authorized party/client_id mismatch")
 	}
 	if len(claims.Scopes) != 1 || claims.Scopes[0] != strings.TrimSpace(credential.Scope) {
 		return errors.New("platform machine token scope does not match the requested single scope")
