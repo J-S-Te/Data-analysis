@@ -14,6 +14,7 @@ const listLimit = 200
 // Repository persists tenant-scoped alert state.
 type Repository interface {
 	ListByTenant(context.Context, string, int) ([]domain.Item, error)
+	SummaryByTenant(context.Context, string) (domain.Summary, error)
 	UpdateStatus(context.Context, string, string, string, time.Time, *time.Time) (bool, error)
 }
 
@@ -37,6 +38,11 @@ func NewServiceWithClock(repository Repository, now func() time.Time) *Service {
 // List returns at most 200 alerts visible in the given tenant.
 func (service *Service) List(ctx context.Context, tenantID string) ([]domain.Item, error) {
 	return service.repository.ListByTenant(ctx, tenantID, listLimit)
+}
+
+// Summary 返回当前租户的预警总量、状态和严重度聚合。
+func (service *Service) Summary(ctx context.Context, tenantID string) (domain.Summary, error) {
+	return service.repository.SummaryByTenant(ctx, tenantID)
 }
 
 // UpdateStatus changes one alert state inside its tenant boundary. It reports

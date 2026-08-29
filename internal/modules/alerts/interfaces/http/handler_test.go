@@ -22,6 +22,9 @@ func (stub *alertServiceStub) List(_ context.Context, tenantID string) ([]domain
 	stub.listTenantID = tenantID
 	return []domain.Item{{ID: "alert-1", TenantID: tenantID, Status: "OPEN"}}, nil
 }
+func (stub *alertServiceStub) Summary(context.Context, string) (domain.Summary, error) {
+	return domain.Summary{BySeverity: map[string]int64{}, ByType: map[string]int64{}}, nil
+}
 
 func (stub *alertServiceStub) UpdateStatus(_ context.Context, tenantID, id, status string) (bool, error) {
 	stub.updateTenantID, stub.updateID, stub.updateStatus = tenantID, id, status

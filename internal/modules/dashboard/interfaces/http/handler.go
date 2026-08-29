@@ -4,6 +4,7 @@ package http
 import (
 	"context"
 	"errors"
+	"fmt"
 	stdhttp "net/http"
 
 	"github.com/gin-gonic/gin"
@@ -21,6 +22,10 @@ import (
 type dashboardQueryService interface {
 	Contract(context.Context, string) (domain.ContractSnapshot, error)
 	Project(context.Context, string) (domain.ProjectSnapshot, error)
+}
+type advancedDashboardService interface {
+	Contracts(context.Context, string, int, int) ([]domain.ContractDetail, int64, error)
+	Trend(context.Context, string, int) ([]domain.TrendPoint, error)
 }
 
 // Handler exposes dashboard read use cases through Gin without importing GORM.
@@ -61,4 +66,47 @@ func (handler *Handler) Project(c *gin.Context) {
 		return
 	}
 	response.OK(c, snapshot)
+}
+
+// Contracts 返回合同下钻分页数据。
+func (handler *Handler) Contracts(c *gin.Context) {
+	p, ok := auth.FromContext(c.Request.Context())
+	if !ok {
+		response.Error(c, apperror.ErrUnauthenticated)
+		return
+	}
+	service, ok := handler.service.(advancedDashboardService)
+	if !ok {
+		response.Error(c, apperror.New(stdhttp.StatusNotImplemented, "DASHBOARD_DETAIL_UNAVAILABLE", "合同明细暂不可用"))
+		return
+	}
+	var page, pageSize int
+	_, _ = fmt.Sscan(c.DefaultQuery("page", "1"), &page)
+	_, _ = fmt.Sscan(c.DefaultQuery("page_size", "20"), &pageSize)
+	items, total, err := service.Contracts(c.Request.Context(), p.TenantID, page, pageSize)
+	if err != nil {
+		response.Error(c, apperror.Wrap(err, 500, "CONTRACT_DETAIL_FAILED", "合同明细加载失败"))
+		return
+	}
+	response.OK(c, gin.H{"items": items, "total": total, "page": page, "page_size": pageSize})
+}
+
+// Trend 返回月度趋势数据。
+func (handler *Handler) Trend(c *gin.Context) {
+	p, ok := auth.FromContext(c.Request.Context())
+	if !ok {
+		response.Error(c, apperror.ErrUnauthenticated)
+		return
+	}
+	service, ok := handler.service.(advancedDashboardService)
+	if !ok {
+		response.Error(c, apperror.New(501, "DASHBOARD_TREND_UNAVAILABLE", "趋势数据暂不可用"))
+		return
+	}
+	points, err := service.Trend(c.Request.Context(), p.TenantID, 12)
+	if err != nil {
+		response.Error(c, apperror.Wrap(err, 500, "DASHBOARD_TREND_FAILED", "趋势加载失败"))
+		return
+	}
+	response.OK(c, points)
 }

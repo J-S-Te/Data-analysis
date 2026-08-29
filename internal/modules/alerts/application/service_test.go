@@ -16,6 +16,9 @@ type repositoryStub struct {
 func (stub *repositoryStub) ListByTenant(context.Context, string, int) ([]domain.Item, error) {
 	return nil, nil
 }
+func (stub *repositoryStub) SummaryByTenant(context.Context, string) (domain.Summary, error) {
+	return domain.Summary{BySeverity: map[string]int64{}, ByType: map[string]int64{}}, nil
+}
 
 func (stub *repositoryStub) UpdateStatus(_ context.Context, _ string, tenantID, _ string, _ time.Time, closedAt *time.Time) (bool, error) {
 	stub.updatedTenantID = tenantID
