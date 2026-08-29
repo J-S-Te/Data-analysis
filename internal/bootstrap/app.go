@@ -148,6 +148,7 @@ func New(config Config) (*App, error) {
 	api.POST("/admin/sources/:id/trigger", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("aggregation.manage"), func(c *gin.Context) { adminHandler.TriggerSource(c, c.Param("id")) })
 	api.GET("/alert-rules", middleware.RequirePermission("alert.manage"), adminHandler.ListAlertRules)
 	api.PUT("/alert-rules", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("alert.manage"), adminHandler.PutAlertRules)
+	api.DELETE("/alert-rules/:id", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("alert.manage"), func(c *gin.Context) { adminHandler.DeleteAlertRule(c, c.Param("id")) })
 
 	server := &http.Server{Addr: config.ListenAddr, Handler: router}
 	return &App{Config: config, DB: db, Router: router, Server: server}, nil

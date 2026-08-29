@@ -5,12 +5,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	"gorm.io/gorm"
 
+	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin/application"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin/domain"
 )
 
@@ -64,7 +67,7 @@ func (alertRuleRecord) TableName() string { return "alert_rule" }
 func (record alertRuleRecord) toDomain() domain.AlertRule {
 	return domain.AlertRule{TenantID: record.TenantID, ID: record.ID, RuleCode: record.RuleCode, Name: record.Name, SourceFCT: record.SourceFCT,
 		Severity: record.Severity, Enabled: record.Enabled, ThresholdJSON: record.ThresholdJSON, UpdatedBy: record.UpdatedBy,
-		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
+		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, Version: 1}
 }
 
 func alertRuleRecordFromDomain(rule domain.AlertRule) alertRuleRecord {
@@ -156,8 +159,48 @@ func (repository *GORMRepository) ReplaceAlertRules(ctx context.Context, tenantI
 		for _, rule := range rules {
 			records = append(records, alertRuleRecordFromDomain(rule))
 		}
-		return tx.Create(&records).Error
+		if err := tx.Create(&records).Error; err != nil {
+			return err
+		}
+		// 规则表采用整表替换以保持现有 API 语义；版本表保留每次提交的不可变快照。
+		for _, rule := range rules {
+			var latest int64
+			tx.Table("alert_rule_version").Where("tenant_id = ? AND rule_id = ?", tenantID, rule.ID).
+				Select("COALESCE(MAX(version), 0)", tenantID, rule.ID).Scan(&latest)
+			version := latest + 1
+			snapshot, err := json.Marshal(rule)
+			if err != nil {
+				return err
+			}
+			id := defaultAlertRuleVersionID(tenantID, rule.ID, version)
+			if err := tx.Exec(`INSERT INTO alert_rule_version
+(id, tenant_id, rule_id, version, rule_snapshot, changed_by, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE rule_snapshot = VALUES(rule_snapshot), changed_by = VALUES(changed_by)`,
+				id, tenantID, rule.ID, version, string(snapshot), rule.UpdatedBy, rule.UpdatedAt).Error; err != nil {
+				return err
+			}
+		}
+		return nil
 	})
+}
+
+// DeleteAlertRule 删除无历史告警的租户规则；已有历史告警时返回保护错误。
+func (repository *GORMRepository) DeleteAlertRule(ctx context.Context, tenantID, ruleID string) error {
+	var count int64
+	if err := repository.db.WithContext(ctx).Table("alert_rule").Where("tenant_id = ? AND id = ?", tenantID, ruleID).Count(&count).Error; err != nil {
+		return err
+	}
+	if count == 0 {
+		return application.ErrRuleNotFound
+	}
+	if err := repository.db.WithContext(ctx).Table("alert_item").Where("tenant_id = ? AND rule_code = (SELECT rule_code FROM alert_rule WHERE tenant_id = ? AND id = ?)", tenantID, tenantID, ruleID).Count(&count).Error; err != nil {
+		return err
+	}
+	if count > 0 {
+		return application.ErrRuleHasHistory
+	}
+	return repository.db.WithContext(ctx).Exec("DELETE FROM alert_rule WHERE tenant_id = ? AND id = ?", tenantID, ruleID).Error
 }
 
 func isDuplicateKeyError(err error) bool {
@@ -170,3 +213,8 @@ func defaultAlertRuleID(tenantID string) string {
 }
 
 func stringPtr(value string) *string { return &value }
+
+func defaultAlertRuleVersionID(tenantID, ruleID string, version int64) string {
+	sum := sha256.Sum256([]byte("data-analysis:alert-rule-version:" + tenantID + ":" + ruleID + ":" + fmt.Sprint(version)))
+	return strings.ToUpper(hex.EncodeToString(sum[:]))[:26]
+}

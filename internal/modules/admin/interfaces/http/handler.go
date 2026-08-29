@@ -20,6 +20,32 @@ type managementService interface {
 	TriggerSource(context.Context, string, string) (domain.SyncJob, error)
 	ListAlertRules(context.Context, string) ([]domain.AlertRule, error)
 	ReplaceAlertRules(context.Context, string, string, []domain.AlertRule) ([]domain.AlertRule, error)
+	DeleteAlertRule(context.Context, string, string) error
+}
+
+// DeleteAlertRule 删除没有历史预警记录的规则。
+func (handler *Handler) DeleteAlertRule(c *gin.Context, id string) {
+	principal, ok := auth.FromContext(c.Request.Context())
+	if !ok {
+		response.Error(c, apperror.ErrUnauthenticated)
+		return
+	}
+	if !hasAdminRole(principal.Roles) {
+		response.Error(c, apperror.New(stdhttp.StatusForbidden, "FORBIDDEN", "仅管理员可以删除预警规则"))
+		return
+	}
+	if err := handler.service.DeleteAlertRule(c.Request.Context(), principal.TenantID, id); err != nil {
+		switch {
+		case errors.Is(err, application.ErrRuleNotFound):
+			response.Error(c, apperror.New(stdhttp.StatusNotFound, "RULE_NOT_FOUND", "预警规则不存在"))
+		case errors.Is(err, application.ErrRuleHasHistory):
+			response.Error(c, apperror.New(stdhttp.StatusConflict, "RULE_HAS_HISTORY", "已有历史预警的规则不能删除，请停用规则"))
+		default:
+			response.Error(c, apperror.Wrap(err, stdhttp.StatusInternalServerError, "RULE_DELETE_FAILED", "删除预警规则失败"))
+		}
+		return
+	}
+	response.OK(c, gin.H{"id": id, "deleted": true})
 }
 
 // Handler 暴露数据源和预警规则管理接口，不直接依赖 GORM。
@@ -71,15 +97,22 @@ func (handler *Handler) ListAlertRules(c *gin.Context) {
 
 // PutAlertRules 按原有整表替换语义保存预警规则。
 func (handler *Handler) PutAlertRules(c *gin.Context) {
+	principal, ok := auth.FromContext(c.Request.Context())
+	if !ok {
+		response.Error(c, apperror.ErrUnauthenticated)
+		return
+	}
+	if !hasAdminRole(principal.Roles) {
+		response.Error(c, apperror.New(stdhttp.StatusForbidden, "FORBIDDEN", "仅管理员可以修改预警规则"))
+		return
+	}
 	var input []alertRuleRequest
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.Error(c, apperror.New(stdhttp.StatusBadRequest, "RULE_PAYLOAD_INVALID", "invalid rule payload"))
 		return
 	}
 	actorID := ""
-	if principal, ok := auth.FromContext(c.Request.Context()); ok {
-		actorID = principal.UserID
-	}
+	actorID = principal.UserID
 	rules, err := handler.service.ReplaceAlertRules(c.Request.Context(), tenantID(c), actorID, alertRulesFromRequest(input))
 	if err != nil {
 		if errors.Is(err, application.ErrRulePayloadInvalid) {
@@ -90,6 +123,15 @@ func (handler *Handler) PutAlertRules(c *gin.Context) {
 		return
 	}
 	response.OK(c, rules)
+}
+
+func hasAdminRole(roles []string) bool {
+	for _, role := range roles {
+		if role == "admin" {
+			return true
+		}
+	}
+	return false
 }
 
 type alertRuleRequest struct {
