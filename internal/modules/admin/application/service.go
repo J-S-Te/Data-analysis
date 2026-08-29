@@ -43,6 +43,31 @@ type Repository interface {
 	DeleteAlertRule(context.Context, string, string) error
 }
 
+// TriggerAllSources 为当前租户一次性排入全部启用数据源，并跳过已有活动任务。
+func (service *Service) TriggerAllSources(ctx context.Context, tenantID string) (queued, skipped int, err error) {
+	sources, err := service.repository.ListSources(ctx, tenantID)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, source := range sources {
+		if !source.Enabled {
+			skipped++
+			continue
+		}
+		job := domain.SyncJob{TenantID: tenantID, ID: service.newID(), SourceID: source.ID, SubsystemCode: source.SubsystemCode, Status: "QUEUED", RequestedAt: service.now()}
+		created, createErr := service.repository.CreateSyncJob(ctx, job)
+		if createErr != nil {
+			return queued, skipped, createErr
+		}
+		if created {
+			queued++
+		} else {
+			skipped++
+		}
+	}
+	return queued, skipped, nil
+}
+
 // DeleteAlertRule 仅删除没有历史预警的规则，避免破坏审计和历史追溯。
 func (service *Service) DeleteAlertRule(ctx context.Context, tenantID, ruleID string) error {
 	if strings.TrimSpace(ruleID) == "" {

@@ -54,6 +54,40 @@ func (repository *GORMRepository) ListByTenant(ctx context.Context, tenantID str
 	return items, nil
 }
 
+// SummaryByTenant 在数据库侧完成聚合，避免将租户全部预警加载到应用内存。
+func (repository *GORMRepository) SummaryByTenant(ctx context.Context, tenantID string) (domain.Summary, error) {
+	var counts struct{ Total, Open, Ack, Closed int64 }
+	if err := repository.db.WithContext(ctx).Table("alert_item").Select("COUNT(*) total, COALESCE(SUM(status = 'OPEN'),0) open, COALESCE(SUM(status = 'ACK'),0) ack, COALESCE(SUM(status = 'CLOSED'),0) closed").Where("tenant_id = ?", tenantID).Scan(&counts).Error; err != nil {
+		return domain.Summary{}, err
+	}
+	summary := domain.Summary{Total: counts.Total, Open: counts.Open, Ack: counts.Ack, Closed: counts.Closed, BySeverity: map[string]int64{}, ByType: map[string]int64{}}
+	var severity []struct {
+		Key   string `gorm:"column:key"`
+		Count int64  `gorm:"column:count"`
+	}
+	if err := repository.db.WithContext(ctx).Table("alert_item").Select("severity key, COUNT(*) count").Where("tenant_id = ?", tenantID).Group("severity").Scan(&severity).Error; err != nil {
+		return domain.Summary{}, err
+	}
+	for _, row := range severity {
+		if row.Key != "" {
+			summary.BySeverity[row.Key] = row.Count
+		}
+	}
+	var types []struct {
+		Key   string `gorm:"column:key"`
+		Count int64  `gorm:"column:count"`
+	}
+	if err := repository.db.WithContext(ctx).Table("alert_item").Select("alert_type key, COUNT(*) count").Where("tenant_id = ?", tenantID).Group("alert_type").Scan(&types).Error; err != nil {
+		return domain.Summary{}, err
+	}
+	for _, row := range types {
+		if row.Key != "" {
+			summary.ByType[row.Key] = row.Count
+		}
+	}
+	return summary, nil
+}
+
 // UpdateStatus changes alert state only when the record belongs to the tenant.
 func (repository *GORMRepository) UpdateStatus(ctx context.Context, id, tenantID, status string, updatedAt time.Time, closedAt *time.Time) (bool, error) {
 	result := repository.db.WithContext(ctx).Model(&alertRecord{}).

@@ -18,9 +18,25 @@ import (
 type managementService interface {
 	ListSources(context.Context, string) ([]domain.SyncSource, error)
 	TriggerSource(context.Context, string, string) (domain.SyncJob, error)
+	TriggerAllSources(context.Context, string) (int, int, error)
 	ListAlertRules(context.Context, string) ([]domain.AlertRule, error)
 	ReplaceAlertRules(context.Context, string, string, []domain.AlertRule) ([]domain.AlertRule, error)
 	DeleteAlertRule(context.Context, string, string) error
+}
+
+// TriggerAllSources 将当前租户全部启用数据源一次性入队。
+func (handler *Handler) TriggerAllSources(c *gin.Context) {
+	principal, ok := auth.FromContext(c.Request.Context())
+	if !ok {
+		response.Error(c, apperror.ErrUnauthenticated)
+		return
+	}
+	queued, skipped, err := handler.service.TriggerAllSources(c.Request.Context(), principal.TenantID)
+	if err != nil {
+		response.Error(c, apperror.Wrap(err, stdhttp.StatusInternalServerError, "SYNC_ALL_FAILED", "批量同步入队失败"))
+		return
+	}
+	response.OK(c, gin.H{"queued": queued, "skipped": skipped, "note": "已将启用的数据源加入同步队列"})
 }
 
 // DeleteAlertRule 删除没有历史预警记录的规则。

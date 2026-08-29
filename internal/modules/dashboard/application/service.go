@@ -24,6 +24,11 @@ type SnapshotRepository interface {
 // protocol or storage technology.
 type Service struct{ snapshots SnapshotRepository }
 
+type advancedRepository interface {
+	ListContracts(context.Context, string, int, int) ([]domain.ContractDetail, int64, error)
+	ListTrend(context.Context, string, int) ([]domain.TrendPoint, error)
+}
+
 // NewService constructs the dashboard application service.
 func NewService(snapshots SnapshotRepository) *Service { return &Service{snapshots: snapshots} }
 
@@ -52,4 +57,22 @@ func (service *Service) Project(ctx context.Context, tenantID string) (domain.Pr
 		snapshot.StatusCounts = map[string]int{}
 	}
 	return snapshot, nil
+}
+
+// Contracts 返回租户合同下钻明细，并限制分页大小。
+func (service *Service) Contracts(ctx context.Context, tenantID string, page, pageSize int) ([]domain.ContractDetail, int64, error) {
+	repository, ok := service.snapshots.(advancedRepository)
+	if !ok {
+		return nil, 0, errors.New("contract detail repository is not configured")
+	}
+	return repository.ListContracts(ctx, tenantID, page, pageSize)
+}
+
+// Trend 返回合同与项目月度趋势。
+func (service *Service) Trend(ctx context.Context, tenantID string, months int) ([]domain.TrendPoint, error) {
+	repository, ok := service.snapshots.(advancedRepository)
+	if !ok {
+		return nil, errors.New("dashboard trend repository is not configured")
+	}
+	return repository.ListTrend(ctx, tenantID, months)
 }

@@ -15,6 +15,7 @@ import (
 
 type alertService interface {
 	List(context.Context, string) ([]domain.Item, error)
+	Summary(context.Context, string) (domain.Summary, error)
 	UpdateStatus(context.Context, string, string, string) (bool, error)
 }
 
@@ -37,6 +38,21 @@ func (handler *Handler) List(c *gin.Context) {
 		return
 	}
 	response.OK(c, items)
+}
+
+// Summary 返回当前租户预警聚合，不泄露其他租户记录。
+func (handler *Handler) Summary(c *gin.Context) {
+	principal, ok := auth.FromContext(c.Request.Context())
+	if !ok {
+		response.Error(c, apperror.ErrUnauthenticated)
+		return
+	}
+	summary, err := handler.service.Summary(c.Request.Context(), principal.TenantID)
+	if err != nil {
+		response.Error(c, apperror.Wrap(err, stdhttp.StatusInternalServerError, "ALERT_SUMMARY_FAILED", "failed to aggregate alerts"))
+		return
+	}
+	response.OK(c, summary)
 }
 
 // UpdateStatus changes an alert to ACK or CLOSED within the authenticated tenant.

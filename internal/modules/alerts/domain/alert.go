@@ -17,3 +17,13 @@ type Item struct {
 	CreatedAt string  `json:"created_at"`
 	UpdatedAt string  `json:"updated_at"`
 }
+
+// Summary 是租户范围内预警的聚合统计，供经营总览展示数量与严重度分布。
+type Summary struct {
+	Total      int64            `json:"total"`
+	Open       int64            `json:"open"`
+	Ack        int64            `json:"ack"`
+	Closed     int64            `json:"closed"`
+	BySeverity map[string]int64 `json:"by_severity"`
+	ByType     map[string]int64 `json:"by_type"`
+}

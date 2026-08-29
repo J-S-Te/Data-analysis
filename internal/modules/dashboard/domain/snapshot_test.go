@@ -12,7 +12,7 @@ func TestSnapshotJSONUsesAPIFieldNames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal contract snapshot: %v", err)
 	}
-	if got := string(contract); got != `{"available":true,"tenant_id":"tenant-1","snapshot_at":"","total_amount_minor":0,"total_contracts":2,"approval_contracts":0,"active_contracts":0,"expired_contracts":0}` {
+	if got := string(contract); got != `{"available":true,"tenant_id":"tenant-1","snapshot_at":"","total_amount_minor":0,"total_contracts":2,"approval_contracts":0,"active_contracts":0,"expired_contracts":0,"opportunity_count":0,"won_contract_count":0,"discount_buckets":null}` {
 		t.Fatalf("unexpected contract JSON: %s", got)
 	}
 
