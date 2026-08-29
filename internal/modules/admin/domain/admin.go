@@ -39,4 +39,5 @@ type AlertRule struct {
 	UpdatedBy     *string   `json:"updated_by"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
+	Version       int64     `json:"version"`
 }

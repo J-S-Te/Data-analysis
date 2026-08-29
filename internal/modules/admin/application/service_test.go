@@ -41,6 +41,7 @@ func (stub *repositoryStub) ReplaceAlertRules(_ context.Context, _ string, rules
 	stub.rules = rules
 	return nil
 }
+func (stub *repositoryStub) DeleteAlertRule(context.Context, string, string) error { return nil }
 
 func TestTriggerSourceQueuesEnabledSource(t *testing.T) {
 	stub := &repositoryStub{source: domain.SyncSource{ID: "source-1", SubsystemCode: "contract_management", Enabled: true}, found: true, createJob: true}

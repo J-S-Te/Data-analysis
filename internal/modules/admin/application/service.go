@@ -26,6 +26,8 @@ var (
 	ErrSyncAlreadyQueued = errors.New("sync source already has an active job")
 	// ErrRulePayloadInvalid 表示预警规则缺少必要业务字段。
 	ErrRulePayloadInvalid = errors.New("invalid alert rule payload")
+	ErrRuleNotFound       = errors.New("alert rule not found")
+	ErrRuleHasHistory     = errors.New("alert rule has alert history")
 )
 
 const maxRulesPerTenant = 50
@@ -38,6 +40,15 @@ type Repository interface {
 	EnsureDefaultAlertRules(context.Context, string, time.Time) error
 	ListAlertRules(context.Context, string) ([]domain.AlertRule, error)
 	ReplaceAlertRules(context.Context, string, []domain.AlertRule) error
+	DeleteAlertRule(context.Context, string, string) error
+}
+
+// DeleteAlertRule 仅删除没有历史预警的规则，避免破坏审计和历史追溯。
+func (service *Service) DeleteAlertRule(ctx context.Context, tenantID, ruleID string) error {
+	if strings.TrimSpace(ruleID) == "" {
+		return ErrRuleNotFound
+	}
+	return service.repository.DeleteAlertRule(ctx, tenantID, ruleID)
 }
 
 // Service 协调数据源入队和预警规则替换用例。
