@@ -83,6 +83,12 @@ func (handler *Handler) Contracts(c *gin.Context) {
 	var page, pageSize int
 	_, _ = fmt.Sscan(c.DefaultQuery("page", "1"), &page)
 	_, _ = fmt.Sscan(c.DefaultQuery("page_size", "20"), &pageSize)
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 20
+	}
 	items, total, err := service.Contracts(c.Request.Context(), p.TenantID, page, pageSize)
 	if err != nil {
 		response.Error(c, apperror.Wrap(err, 500, "CONTRACT_DETAIL_FAILED", "合同明细加载失败"))

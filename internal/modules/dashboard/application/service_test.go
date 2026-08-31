@@ -43,3 +43,32 @@ func TestContractKeepsTenantBoundaryAtApplicationLayer(t *testing.T) {
 		t.Fatalf("unexpected contract snapshot: %#v", snapshot)
 	}
 }
+
+type advancedSnapshotRepositoryStub struct {
+	snapshotRepositoryStub
+	page     int
+	pageSize int
+}
+
+func (stub *advancedSnapshotRepositoryStub) ListContracts(_ context.Context, _ string, page, pageSize int) ([]domain.ContractDetail, int64, error) {
+	stub.page, stub.pageSize = page, pageSize
+	return nil, 0, nil
+}
+
+func (stub *advancedSnapshotRepositoryStub) ListTrend(context.Context, string, int) ([]domain.TrendPoint, error) {
+	return nil, nil
+}
+
+func TestContractsNormalizesPaginationBeforeRepositoryCall(t *testing.T) {
+	service := NewService(&advancedSnapshotRepositoryStub{})
+	repository := service.snapshots.(*advancedSnapshotRepositoryStub)
+	_, _, err := service.Contracts(context.Background(), "tenant-1", 0, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The application boundary must not pass values that the repository would
+	// silently reinterpret, keeping response metadata and query semantics aligned.
+	if repository.page != 1 || repository.pageSize != 20 {
+		t.Fatalf("pagination = (%d, %d), want (1, 20)", repository.page, repository.pageSize)
+	}
+}

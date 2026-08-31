@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"gorm.io/gorm"
 
@@ -35,7 +36,7 @@ func (repository *GORMRepository) LatestContract(ctx context.Context, tenantID s
 	err := repository.db.WithContext(ctx).Table("api_contract_dashboard").
 		Where("tenant_id = ?", tenantID).Order("snapshot_at DESC").First(&row).Error
 	if err == gorm.ErrRecordNotFound {
-		return domain.ContractSnapshot{}, false, nil
+		return domain.ContractSnapshot{DiscountBuckets: map[string]int64{}}, false, nil
 	}
 	if err != nil {
 		return domain.ContractSnapshot{}, false, err
@@ -121,8 +122,8 @@ func (repository *GORMRepository) ListTrend(ctx context.Context, tenantID string
 	if months < 1 || months > 24 {
 		months = 12
 	}
-	var rows []domain.TrendPoint
-	err := repository.db.WithContext(ctx).Table("fct_contract_signing f").Select("f.period_month period, COALESCE(SUM(f.sign_amount_minor),0) contract_amount_minor, COALESCE(SUM(f.contract_count),0) contract_count, 0 project_count").Where("f.tenant_id = ?", tenantID).Group("f.period_month").Order("f.period_month DESC").Limit(months).Scan(&rows).Error
+	var contractRows []domain.TrendPoint
+	err := repository.db.WithContext(ctx).Table("fct_contract_signing f").Select("f.period_month period, COALESCE(SUM(f.sign_amount_minor),0) contract_amount_minor, COALESCE(SUM(f.contract_count),0) contract_count, 0 project_count").Where("f.tenant_id = ?", tenantID).Group("f.period_month").Order("f.period_month DESC").Limit(months).Scan(&contractRows).Error
 	if err != nil {
 		return nil, err
 	}
@@ -140,8 +141,35 @@ func (repository *GORMRepository) ListTrend(ctx context.Context, tenantID string
 			projectByPeriod[item.Period] = item.Count
 		}
 	}
-	for index := range rows {
-		rows[index].ProjectCount = int64(projectByPeriod[rows[index].Period])
-	}
+	rows := mergeTrendPoints(contractRows, projectByPeriod, months)
 	return rows, nil
+}
+
+// mergeTrendPoints combines contract facts and the latest project snapshot per
+// month before applying the month limit. This keeps project-only months visible.
+func mergeTrendPoints(contractRows []domain.TrendPoint, projectByPeriod map[string]int, months int) []domain.TrendPoint {
+	byPeriod := make(map[string]domain.TrendPoint, len(contractRows)+len(projectByPeriod))
+	for _, row := range contractRows {
+		row.ProjectCount = int64(projectByPeriod[row.Period])
+		byPeriod[row.Period] = row
+	}
+	for period, projectCount := range projectByPeriod {
+		if _, exists := byPeriod[period]; exists {
+			continue
+		}
+		byPeriod[period] = domain.TrendPoint{Period: period, ProjectCount: int64(projectCount)}
+	}
+	periods := make([]string, 0, len(byPeriod))
+	for period := range byPeriod {
+		periods = append(periods, period)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(periods)))
+	if len(periods) > months {
+		periods = periods[:months]
+	}
+	rows := make([]domain.TrendPoint, 0, len(periods))
+	for _, period := range periods {
+		rows = append(rows, byPeriod[period])
+	}
+	return rows
 }
