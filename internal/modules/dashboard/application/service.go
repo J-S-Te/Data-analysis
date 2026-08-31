@@ -29,6 +29,22 @@ type advancedRepository interface {
 	ListTrend(context.Context, string, int) ([]domain.TrendPoint, error)
 }
 
+const (
+	defaultContractDetailPage     = 1
+	defaultContractDetailPageSize = 20
+	maxContractDetailPageSize     = 100
+)
+
+func normalizeContractDetailPagination(page, pageSize int) (int, int) {
+	if page < 1 {
+		page = defaultContractDetailPage
+	}
+	if pageSize < 1 || pageSize > maxContractDetailPageSize {
+		pageSize = defaultContractDetailPageSize
+	}
+	return page, pageSize
+}
+
 // NewService constructs the dashboard application service.
 func NewService(snapshots SnapshotRepository) *Service { return &Service{snapshots: snapshots} }
 
@@ -41,6 +57,9 @@ func (service *Service) Contract(ctx context.Context, tenantID string) (domain.C
 	}
 	snapshot.TenantID = tenantID
 	snapshot.Available = available
+	if snapshot.DiscountBuckets == nil {
+		snapshot.DiscountBuckets = map[string]int64{}
+	}
 	return snapshot, nil
 }
 
@@ -65,6 +84,7 @@ func (service *Service) Contracts(ctx context.Context, tenantID string, page, pa
 	if !ok {
 		return nil, 0, errors.New("contract detail repository is not configured")
 	}
+	page, pageSize = normalizeContractDetailPagination(page, pageSize)
 	return repository.ListContracts(ctx, tenantID, page, pageSize)
 }
 
