@@ -12,3 +12,5 @@
 .gocache/
 .docker-config/
 .buildx/
+
+.ai
