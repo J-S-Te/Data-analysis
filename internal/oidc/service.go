@@ -10,7 +10,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -493,14 +492,4 @@ func GenerateState() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(raw), nil
-}
-
-// BuildRedirectURL 拼接同源登出后回调地址（只允许同源）。
-func BuildRedirectURL(base string, path string) string {
-	u, err := url.Parse(base)
-	if err != nil {
-		return ""
-	}
-	u.Path = path
-	return u.String()
 }

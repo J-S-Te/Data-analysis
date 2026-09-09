@@ -118,22 +118,6 @@ func (h *Handler) AuthMe(c *gin.Context) {
 	})
 }
 
-// RequireSameOrigin 写请求同源 + CSRF 头校验（对齐 CRM crmauth）。
-func (h *Handler) RequireSameOrigin(c *gin.Context) {
-	switch c.Request.Method {
-	case http.MethodGet, http.MethodHead, http.MethodOptions:
-		c.Next()
-		return
-	}
-	origin := c.GetHeader("Origin")
-	if h.options.PublicOrigin == "" || origin != h.options.PublicOrigin || c.GetHeader("X-CSRF-Token") != "1" {
-		response.Error(c, apperror.ErrForbidden)
-		c.Abort()
-		return
-	}
-	c.Next()
-}
-
 func (h *Handler) setCookie(c *gin.Context, value string, expires time.Time) {
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     h.options.CookieName,

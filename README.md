@@ -1,8 +1,8 @@
 # data_analysis · 数据看板与统计分析子系统
 
-> 新子系统骨架（V0.1，2026-08-17）。技术栈与工程模式**严格对齐 customer_and_opportunity**（Go + Gin + GORM + Temporal + 多 cmd 二进制 + 单 Dockerfile + Vue 3 统一前端模块）。
+> 校准日期：2026-09-04。该仓库提供数据看板 API、聚合 Worker、告警 Worker、授权目录发布和版本化迁移；统一前端模块位于 `frontend/src/modules/data_analysis/`。
 >
-> 权威设计：`Data-analysis/数据看板与统计分析子系统 · 基础平台接入与鉴权设计方案.md`（V0.1）
+> 当前生产边界：生产 Compose、Nginx 路由和子系统清单已具备，但真实生产接入仍依赖 `METABASE_EMBEDDING_SECRET`、数据库凭据、最小权限机器 Client、数据源配置和上线验收。不得将编排资产视为已投产。
 > 权限基线：`authz/permission-manifest.yaml`（V1，格式对齐合同 manifest）
 >
 > **部署拓扑（团队约定）**：前端代码在统一仓库 `frontend/src/modules/data_analysis/`（随 `frontend` Docker 镜像构建，与其余子系统同一前端容器）；本目录仅存放**后端**（Go），`dashboard-api` 等各自独立 Docker（见 `compose.yaml`）。
@@ -12,7 +12,7 @@
 - 后端仓库：`data_analysis/` 独立 Git 仓库，与 `platform`、`contract_management` 等子系统保持相同的版本边界。
 - Go module：`github.com/unified-identity-auth-platform/data-analysis`。
 - 当前应用版本：根目录 `VERSION` 中的 `0.1.0`；发布标签建议使用 `v0.1.0` 格式。
-- 当前数据库版本：`000005_api_project_dashboard`。数据库实际版本以 `da_schema_migration` 为准，不能仅根据文件名推断。
+- 当前迁移文件范围：`000001` 至 `000012_metric_definitions`。数据库实际版本以 `da_schema_migration` 为准，不能仅根据文件名推断。
 - 统一前端仍归属 `frontend` 仓库，不随本后端仓库单独发版。
 
 ## 目录结构
@@ -21,7 +21,7 @@
 data_analysis/
 ├── cmd/
 │   ├── dashboard-api/          # 嵌入桥 + 业务 API（OIDC 会话 / embed / 预警中心 / 字典 / 管理）
-│   ├── aggregation-worker/     # 夜间跨库同步 + T+1 预计算（可定时循环；Temporal 调度待接入）
+│   ├── aggregation-worker/     # 跨库同步与预计算（队列任务与定时循环）
 │   ├── alert-worker/           # 预警规则计算（聚合库上，幂等）
 │   ├── authz-catalog/          # 授权目录发布（复用 CRM platformcatalog 模式）
 │   ├── local-migrate/          # 本地迁移执行
@@ -39,7 +39,7 @@ data_analysis/
 │       ├── dictionary/         # 指标字典 API
 │       └── admin/              # 预警规则配置 / 数据源状态
 ├── authz/permission-manifest.yaml
-├── migrations/                 # 聚合库版本化 SQL（当前 000001 至 000005）
+├── migrations/                 # 聚合库版本化 SQL（当前 000001 至 000012）
 ├── Dockerfile                  # 单 Dockerfile 多二进制
 ├── compose.yaml                # dashboard-api / dashboard-mysql / metabase / workers
 └── .env.example
@@ -49,7 +49,7 @@ data_analysis/
 
 ```bash
 go mod tidy            # 首次拉取依赖
-cd .. && bash platform/scripts/subsystem.sh onboard --application-code data_analysis ...   # 平台接入（见设计方案 §3.1）
+# 首次接入通过平台“应用接入”控制面完成；本地排障才使用 subsystem.sh。
 cd data_analysis
 go run ./cmd/local-migrate
 go run ./cmd/dashboard-api
@@ -66,4 +66,4 @@ go run ./cmd/dashboard-api
 4. MySQL DDL 可能隐式提交，因此每份迁移必须可安全重试，优先使用 `IF NOT EXISTS` 和幂等数据变更。
 5. 运行时禁止 `AutoMigrate`。MySQL 初始化目录只创建 `dashboard_metabase`，业务 Schema 必须通过迁移二进制生成。
 
-> 子系统仍处于 V0.1 增量建设阶段；实现状态以代码、测试和 `da_schema_migration` 记录为准。
+> 实现状态以代码、测试和 `da_schema_migration` 记录为准。生产发布前还必须完成数据源、Metabase 嵌入密钥、机器身份、授权目录和运行验收。
