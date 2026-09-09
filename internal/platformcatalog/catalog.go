@@ -142,35 +142,6 @@ func ClaimsRoleConfigHash(manifest Manifest) (string, error) {
 	return payload.ClaimsRoleConfigHash, nil
 }
 
-// 完整目录校验和覆盖展示元数据和策略；它与 Claims 兼容哈希分离，后者只跟踪会改变授权解释的
-// 角色—权限映射。
-func CatalogChecksum(manifest Manifest) (string, error) {
-	payload, err := normalizeManifest(manifest)
-	if err != nil {
-		return "", err
-	}
-	return payload.Checksum, nil
-}
-
-// 认证校验与发布流程复用同一目录，避免本地允许列表和平台目录各自维护后发生漂移。
-func HasPermission(manifest Manifest, expected string) bool {
-	for _, item := range manifest.Permissions {
-		if item.Code == expected {
-			return true
-		}
-	}
-	return false
-}
-
-func HasRole(manifest Manifest, expected string) bool {
-	for _, item := range manifest.Roles {
-		if item.Code == expected {
-			return true
-		}
-	}
-	return false
-}
-
 // 校验运行时 OIDC 配置期望的映射与当前二进制内置目录完全一致，滚动发布中的不兼容副本会拒绝启动。
 func ValidateClaimsRoleConfigHash(manifest Manifest, configured string) error {
 	expected, err := ClaimsRoleConfigHash(manifest)
