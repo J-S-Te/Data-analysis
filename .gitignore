@@ -13,4 +13,7 @@
 .docker-config/
 .buildx/
 
+# macOS Finder metadata
+.DS_Store
+
 .ai
