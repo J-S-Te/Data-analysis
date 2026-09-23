@@ -119,6 +119,10 @@ func New(config Config) (*App, error) {
 
 	api := base.Group("/api/v1", middleware.SessionAuth(authService, "data_analysis_session"))
 	api.Use(middleware.AuditWrites(auditReporter, slog.Default()))
+	// 组级同源兜底（SEC-D11）：cookie 会话下的所有不安全方法先过 Origin/CSRF 校验，
+	// 即使个别路由忘记单独挂载 RequireSameOriginWrite 也默认受保护；
+	// PublicOrigin 为空时该中间件失败关闭，拒绝全部写请求。
+	api.Use(middleware.RequireSameOriginWrite(config.PublicOrigin))
 	api.GET("/auth/me", authHandler.AuthMe)
 
 	// 嵌入桥（设计方案 §9）
