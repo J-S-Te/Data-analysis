@@ -25,6 +25,7 @@ jobs:
       - run: go test ./...
       - run: go vet ./...
       - run: python3 scripts/test-deploy-path.py
+      - run: python3 scripts/test-deploy-remote.py
 
   image:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -134,6 +135,7 @@ jobs:
     environment:
       name: test
     steps:
+      - uses: actions/checkout@v5
       - name: Deploy immutable data-analysis images
         shell: bash
         env:
@@ -164,8 +166,8 @@ jobs:
           chmod 600 "$HOME/.ssh/id_ed25519"
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           printf -v remote_command \
-            'deploy_script=%q; deploy_path=%q; command -v bash >/dev/null || { echo "remote bash is unavailable" >&2; exit 127; }; test -d "$deploy_path" || { echo "deployment directory is unavailable: $deploy_path" >&2; exit 1; }; test -x "$deploy_script" || { echo "data-analysis deployment script is missing or not executable: $deploy_script" >&2; echo "install the production deployment baseline before retrying" >&2; exit 126; }; cd "$deploy_path" && exec bash "$deploy_script" data-analysis %q %q %q %q' \
-            "$DEPLOY_SCRIPT" "$DEPLOY_PATH" "$DASHBOARD_API_IMAGE_REF" "$AGGREGATION_WORKER_IMAGE_REF" "$ALERT_WORKER_IMAGE_REF" "$PRODUCTION_MIGRATE_IMAGE_REF"
+            'bash -s -- %q %q %q %q %q %q' \
+            "$DEPLOY_PATH" "$DEPLOY_SCRIPT" "$DASHBOARD_API_IMAGE_REF" "$AGGREGATION_WORKER_IMAGE_REF" "$ALERT_WORKER_IMAGE_REF" "$PRODUCTION_MIGRATE_IMAGE_REF"
           ssh \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
@@ -174,4 +176,4 @@ jobs:
             -o ServerAliveCountMax=4 \
             -p "$DEPLOY_PORT" \
             "$DEPLOY_USER@$DEPLOY_HOST" \
-            "$remote_command"
+            "$remote_command" < scripts/deploy-remote.sh
