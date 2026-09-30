@@ -1,9 +1,23 @@
-.git
-.gitignore
-.env
-.env.*
-bin/
-.gopath/
-.docker-config/
-.buildx/
-coverage.out
+# Deny unknown inputs by default. Host-built Mach-O binaries, developer env
+# files and local Docker caches must never enter linux/amd64 image layers.
+**
+!Dockerfile
+!go.mod
+!go.sum
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+!migrations/
+!migrations/**
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.jks
+**/*.bak
+**/*.backup
+**/*.dump
+**/dump*.sql
+**/.DS_Store

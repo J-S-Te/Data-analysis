@@ -141,8 +141,8 @@ jobs:
           DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
-          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/basic-platform' }}
-          DEPLOY_SCRIPT: ${{ vars.DASHBOARD_DEPLOY_SCRIPT || '/opt/basic-platform/bin/deploy-service.sh' }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/unified-identity-platform' }}
+          DEPLOY_SCRIPT: ${{ vars.DASHBOARD_DEPLOY_SCRIPT || '/opt/unified-identity-platform/bin/deploy-service.sh' }}
           DASHBOARD_API_IMAGE_REF: ${{ needs.image.outputs.dashboard_api_image_ref }}
           AGGREGATION_WORKER_IMAGE_REF: ${{ needs.image.outputs.aggregation_worker_image_ref }}
           ALERT_WORKER_IMAGE_REF: ${{ needs.image.outputs.alert_worker_image_ref }}

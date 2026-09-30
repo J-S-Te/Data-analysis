@@ -166,11 +166,14 @@ func riskLevelOrDefault(level string) string {
 	}
 	return level
 }
+
+// randomHex 生成 size 字节 CSPRNG 熵的十六进制串（输出长度 2*size）。
+// 安全理由（AUD-2026-032）：审计 request_id/event_id 不允许时间戳回退——那会重新
+// 引入可预测、可碰撞的弱随机；crypto/rand.Read 自 Go 1.24 起保证填满且不返回错误，
+// 失败即进程级随机源故障，无安全回退值。
 func randomHex(size int) string {
 	raw := make([]byte, size)
-	if _, err := rand.Read(raw); err != nil {
-		return fmt.Sprintf("%x", time.Now().UnixNano())
-	}
+	_, _ = rand.Read(raw)
 	return hex.EncodeToString(raw)
 }
 func traceIDs() (string, string, error) {

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/driver/mysql"
@@ -159,8 +160,23 @@ func New(config Config) (*App, error) {
 	api.PUT("/alert-rules", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("alert.manage"), adminHandler.PutAlertRules)
 	api.DELETE("/alert-rules/:id", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("alert.manage"), func(c *gin.Context) { adminHandler.DeleteAlertRule(c, c.Param("id")) })
 
-	server := &http.Server{Addr: config.ListenAddr, Handler: router}
+	server := newHTTPServer(config.ListenAddr, router)
 	return &App{Config: config, DB: db, Router: router, Server: server}, nil
+}
+
+// newHTTPServer 构造 dashboard-api 的 http.Server。
+// 安全理由（AUD-2026-031）：四项超时全缺会暴露 slowloris 等慢连接资源耗尽面；
+// 取值对齐 project_management/cmd/api/main.go 的既有配置（5s/15s/45s/60s），
+// 保持子系统间一致的连接生命周期口径。
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      45 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 }
 
 const timeMinute = 60 * 1e9 // ns

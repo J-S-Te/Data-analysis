@@ -2,7 +2,8 @@
 package middleware
 
 import (
-	"errors"
+	"crypto/rand"
+	"encoding/hex"
 	"net/http"
 	"net/url"
 	"strings"
@@ -105,20 +106,12 @@ func RequestID() gin.HandlerFunc {
 	}
 }
 
+// randomHex 生成 size 字节 CSPRNG 熵的十六进制串（输出长度 2*size，与原实现一致）。
+// 安全理由（AUD-2026-032）：原实现为时间种子 LCG，request_id 可预测、可碰撞；
+// crypto/rand.Read 自 Go 1.24 起保证填满且不返回错误，失败即进程级随机源故障，
+// 不允许退回任何可预测值（时间戳回退正是本发现要消除的弱随机路径）。
 func randomHex(size int) string {
-	const alphabet = "0123456789abcdef"
-	raw := make([]byte, size*2)
-	seed := uint64(0)
-	for i := range raw {
-		if i%8 == 0 {
-			seed = uint64(timeNowNanos())
-		}
-		seed = seed*6364136223846793005 + 1442695040888963407
-		raw[i] = alphabet[seed>>56&0x0F]
-	}
-	return string(raw)
+	raw := make([]byte, size)
+	_, _ = rand.Read(raw)
+	return hex.EncodeToString(raw)
 }
-
-func timeNowNanos() int64 { return nowNanos() }
-
-var _ = errors.New // keep errors import for future use
