@@ -19,6 +19,11 @@ const (
 	statusRunning = "RUNNING"
 	statusSuccess = "SUCCESS"
 	statusFailed  = "FAILED"
+	// upsertChunkSize 是写入侧每次提交给聚合库的行数（既有节奏，保持不变）。
+	upsertChunkSize = 200
+	// sourceReadBatchSize 是源表游标分批读取的每批行数（AUD-2026-030）：读侧不再
+	// 整表一次性载入内存，最终行集合与全量读取等价。
+	sourceReadBatchSize = 500
 )
 
 // Runner 是聚合任务执行器，封装聚合库连接与源系统同步配置。
@@ -207,6 +212,37 @@ func closeSourceConnectionPool(pool connectionPoolCloser, source string) {
 	}
 }
 
+// scanSourceBatches 按主键升序游标分批读取源表行，避免整表一次性载入内存（AUD-2026-030）。
+// pkColumn 必须是唯一且可全序比较的列（数值自增主键或业务字符串主键均可）：每批按
+// WHERE pk > 上一批末行主键 ORDER BY pk ASC LIMIT batchSize 读取，读不满一批即为最后
+// 一批；主键唯一保证全序且每行恰好被读取一次，最终行集合与整表全量读取等价（先后两次
+// 批查询之间新提交的更高主键行会被顺带读入，不会漏读已存在行）。selectColumns 为显式
+// 列清单，keyOf 从行结构提取主键；onBatch 在每批读取后立即执行既有落库逻辑，返回错误
+// 时终止扫描并原样返回。src 为只读源库连接，连接池生命周期由调用方管理。
+func scanSourceBatches[T any, K comparable](src *gorm.DB, table, selectColumns, pkColumn string, keyOf func(T) K, batchSize int, onBatch func([]T) error) error {
+	var lastKey K
+	for batch := 0; ; batch++ {
+		rows := make([]T, 0, batchSize)
+		query := src.Table(table).Select(selectColumns).Order(pkColumn + " ASC").Limit(batchSize)
+		if batch > 0 {
+			query = query.Where(pkColumn+" > ?", lastKey)
+		}
+		if err := query.Find(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		if err := onBatch(rows); err != nil {
+			return err
+		}
+		if len(rows) < batchSize {
+			return nil
+		}
+		lastKey = keyOf(rows[len(rows)-1])
+	}
+}
+
 // syncContract 合同库 → dim_contract（con_contract 全量快照，幂等 upsert）。
 func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 	src, err := gorm.Open(mysql.Open(dsn), &gorm.Config{DisableAutomaticPing: true})
@@ -239,52 +275,56 @@ func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 		ProjectID       *string
 		UpdatedAt       time.Time
 	}
-	rows := make([]sourceRow, 0, 500)
-	if err := src.Table("con_contract").
-		Select("tenant_id, id, contract_number, title, contract_type, service_type, status, start_date, end_date, crm_customer_id, opportunity_id, amount_minor, currency, owner_user_id, owner_org_id, owner_identity_id, project_id, updated_at").
-		Find(&rows).Error; err != nil {
-		return err
-	}
-	if len(rows) == 0 {
-		slog.Info("contract source empty", "rows", 0)
-		return nil
-	}
 	now := time.Now().UTC()
-	for i := 0; i < len(rows); i += 200 {
-		end := i + 200
-		if end > len(rows) {
-			end = len(rows)
-		}
-		batch := rows[i:end]
-		for _, row := range batch {
-			tenant := row.TenantID
-			org := ""
-			if row.OwnerOrgID != nil {
-				org = *row.OwnerOrgID
-			}
-			identity := ""
-			if row.OwnerIdentityID != nil {
-				identity = *row.OwnerIdentityID
-			}
-			project := ""
-			if row.ProjectID != nil {
-				project = *row.ProjectID
-			}
-			var crmID *uint64
-			if row.CRMCustomerID != nil {
-				crmID = row.CRMCustomerID
-			}
-			if err := r.aggDB.Exec(`INSERT INTO dim_contract
+	total := 0
+	// AUD-2026-030：con_contract 全量改为主键（id，字符串业务主键）游标分批读取，
+	// 每批内沿用既有 200 行 upsert 分块，落库结果与全量读取等价。
+	if err := scanSourceBatches(src, "con_contract",
+		"tenant_id, id, contract_number, title, contract_type, service_type, status, start_date, end_date, crm_customer_id, opportunity_id, amount_minor, currency, owner_user_id, owner_org_id, owner_identity_id, project_id, updated_at",
+		"id", func(row sourceRow) string { return row.ID }, sourceReadBatchSize, func(rows []sourceRow) error {
+			total += len(rows)
+			for i := 0; i < len(rows); i += upsertChunkSize {
+				end := i + upsertChunkSize
+				if end > len(rows) {
+					end = len(rows)
+				}
+				batch := rows[i:end]
+				for _, row := range batch {
+					tenant := row.TenantID
+					org := ""
+					if row.OwnerOrgID != nil {
+						org = *row.OwnerOrgID
+					}
+					identity := ""
+					if row.OwnerIdentityID != nil {
+						identity = *row.OwnerIdentityID
+					}
+					project := ""
+					if row.ProjectID != nil {
+						project = *row.ProjectID
+					}
+					var crmID *uint64
+					if row.CRMCustomerID != nil {
+						crmID = row.CRMCustomerID
+					}
+					if err := r.aggDB.Exec(`INSERT INTO dim_contract
 (tenant_id, contract_id, contract_number, title, contract_type, service_type, status, start_date, end_date, crm_customer_id, opportunity_id, amount_minor, currency, owner_user_id, owner_org_id, owner_identity_id, project_id, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE title=VALUES(title), status=VALUES(status), start_date=VALUES(start_date), end_date=VALUES(end_date), crm_customer_id=VALUES(crm_customer_id), amount_minor=VALUES(amount_minor), owner_org_id=VALUES(owner_org_id), updated_at=VALUES(updated_at)`,
-				tenant, row.ID, row.ContractNumber, row.Title, row.ContractType, row.ServiceType, row.Status,
-				row.StartDate, row.EndDate, crmID, row.OpportunityID, row.AmountMinor, row.Currency,
-				row.OwnerUserID, org, identity, project, row.UpdatedAt).Error; err != nil {
-				return err
+						tenant, row.ID, row.ContractNumber, row.Title, row.ContractType, row.ServiceType, row.Status,
+						row.StartDate, row.EndDate, crmID, row.OpportunityID, row.AmountMinor, row.Currency,
+						row.OwnerUserID, org, identity, project, row.UpdatedAt).Error; err != nil {
+						return err
+					}
+				}
+				slog.Info("dim_contract upserted", "rows", len(batch), "updated_at", now.Format(time.RFC3339))
 			}
-		}
-		slog.Info("dim_contract upserted", "rows", len(batch), "updated_at", now.Format(time.RFC3339))
+			return nil
+		}); err != nil {
+		return err
+	}
+	if total == 0 {
+		slog.Info("contract source empty", "rows", 0)
 	}
 	return nil
 }
@@ -316,28 +356,31 @@ func (r *Runner) syncCRM(ctx context.Context, dsn string) error {
 		DeletedAt    *time.Time
 		UpdatedAt    time.Time
 	}
-	customers := make([]customerRow, 0, 500)
-	if err := src.Table("crm_customers").
-		Select("id, tenant_id, customer_no, name, customer_type, industry, region, status, owner_user_id, owner_org_id, deleted_at, updated_at").
-		Find(&customers).Error; err != nil {
-		return err
-	}
-	for i := 0; i < len(customers); i += 200 {
-		end := i + 200
-		if end > len(customers) {
-			end = len(customers)
-		}
-		for _, row := range customers[i:end] {
-			if err := r.aggDB.Exec(`INSERT INTO dim_customer
+	// AUD-2026-030：crm_customers 全量改为主键（id，自增）游标分批读取，
+	// 每批内沿用既有 200 行 upsert 分块，落库结果与全量读取等价。
+	if err := scanSourceBatches(src, "crm_customers",
+		"id, tenant_id, customer_no, name, customer_type, industry, region, status, owner_user_id, owner_org_id, deleted_at, updated_at",
+		"id", func(row customerRow) uint64 { return row.ID }, sourceReadBatchSize, func(rows []customerRow) error {
+			for i := 0; i < len(rows); i += upsertChunkSize {
+				end := i + upsertChunkSize
+				if end > len(rows) {
+					end = len(rows)
+				}
+				for _, row := range rows[i:end] {
+					if err := r.aggDB.Exec(`INSERT INTO dim_customer
 (tenant_id, customer_id, customer_no, customer_name, customer_type, industry, region, status, owner_user_id, owner_org_id, deleted_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE customer_name=VALUES(customer_name), customer_type=VALUES(customer_type), industry=VALUES(industry), region=VALUES(region), status=VALUES(status), deleted_at=VALUES(deleted_at), updated_at=VALUES(updated_at)`,
-				row.TenantID, row.ID, row.CustomerNo, row.Name, row.CustomerType, row.Industry, row.Region,
-				row.Status, row.OwnerUserID, row.OwnerOrgID, row.DeletedAt, row.UpdatedAt).Error; err != nil {
-				return err
+						row.TenantID, row.ID, row.CustomerNo, row.Name, row.CustomerType, row.Industry, row.Region,
+						row.Status, row.OwnerUserID, row.OwnerOrgID, row.DeletedAt, row.UpdatedAt).Error; err != nil {
+						return err
+					}
+				}
+				slog.Info("dim_customer upserted", "rows", len(rows[i:end]))
 			}
-		}
-		slog.Info("dim_customer upserted", "rows", len(customers[i:end]))
+			return nil
+		}); err != nil {
+		return err
 	}
 	// 商机
 	type opportunityRow struct {
@@ -360,29 +403,32 @@ ON DUPLICATE KEY UPDATE customer_name=VALUES(customer_name), customer_type=VALUE
 		DeletedAt        *time.Time
 		UpdatedAt        time.Time
 	}
-	opportunities := make([]opportunityRow, 0, 500)
-	if err := src.Table("crm_opportunities").
-		Select("id, tenant_id, opportunity_no, name, customer_id, type, source, expected_amount, expected_sign_date, owner_user_id, owner_org_id, current_stage, opp_status, contract_ref, lost_reason, stage_changed_at, deleted_at, updated_at").
-		Find(&opportunities).Error; err != nil {
-		return err
-	}
-	for i := 0; i < len(opportunities); i += 200 {
-		end := i + 200
-		if end > len(opportunities) {
-			end = len(opportunities)
-		}
-		for _, row := range opportunities[i:end] {
-			if err := r.aggDB.Exec(`INSERT INTO dim_opportunity
+	// AUD-2026-030：crm_opportunities 全量改为主键（id，自增）游标分批读取，
+	// 每批内沿用既有 200 行 upsert 分块，落库结果与全量读取等价。
+	if err := scanSourceBatches(src, "crm_opportunities",
+		"id, tenant_id, opportunity_no, name, customer_id, type, source, expected_amount, expected_sign_date, owner_user_id, owner_org_id, current_stage, opp_status, contract_ref, lost_reason, stage_changed_at, deleted_at, updated_at",
+		"id", func(row opportunityRow) uint64 { return row.ID }, sourceReadBatchSize, func(rows []opportunityRow) error {
+			for i := 0; i < len(rows); i += upsertChunkSize {
+				end := i + upsertChunkSize
+				if end > len(rows) {
+					end = len(rows)
+				}
+				for _, row := range rows[i:end] {
+					if err := r.aggDB.Exec(`INSERT INTO dim_opportunity
 (tenant_id, opportunity_id, opportunity_no, name, customer_id, type, source, expected_amount, expected_sign_date, owner_user_id, owner_org_id, current_stage, opp_status, contract_ref, lost_reason, stage_changed_at, deleted_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE name=VALUES(name), current_stage=VALUES(current_stage), opp_status=VALUES(opp_status), contract_ref=VALUES(contract_ref), lost_reason=VALUES(lost_reason), deleted_at=VALUES(deleted_at), updated_at=VALUES(updated_at)`,
-				row.TenantID, row.ID, row.OpportunityNo, row.Name, row.CustomerID, row.Type, row.Source,
-				row.ExpectedAmount, row.ExpectedSignDate, row.OwnerUserID, row.OwnerOrgID, row.CurrentStage,
-				row.OppStatus, row.ContractRef, row.LostReason, row.StageChangedAt, row.DeletedAt, row.UpdatedAt).Error; err != nil {
-				return err
+						row.TenantID, row.ID, row.OpportunityNo, row.Name, row.CustomerID, row.Type, row.Source,
+						row.ExpectedAmount, row.ExpectedSignDate, row.OwnerUserID, row.OwnerOrgID, row.CurrentStage,
+						row.OppStatus, row.ContractRef, row.LostReason, row.StageChangedAt, row.DeletedAt, row.UpdatedAt).Error; err != nil {
+						return err
+					}
+				}
+				slog.Info("dim_opportunity upserted", "rows", len(rows[i:end]))
 			}
-		}
-		slog.Info("dim_opportunity upserted", "rows", len(opportunities[i:end]))
+			return nil
+		}); err != nil {
+		return err
 	}
 	return nil
 }

@@ -30,6 +30,7 @@ func (s *failingReporterStub) Report(_ context.Context, event platformaudit.Even
 }
 
 // newAuditTestRouter 组装与 bootstrap 一致的中间件链：RequestID → 主体注入 → AuditWrites。
+// 同时注册写路由与敏感读路由（GET /api/v1/embed/:dashboard），供缓冲/拒绝语义用例复用。
 func newAuditTestRouter(reporter platformaudit.Reporter, logger *slog.Logger, handler gin.HandlerFunc) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -38,6 +39,7 @@ func newAuditTestRouter(reporter platformaudit.Reporter, logger *slog.Logger, ha
 		c.Next()
 	}, AuditWrites(reporter, logger))
 	router.POST("/api/v1/alerts/:id/close", handler)
+	router.GET("/api/v1/embed/:dashboard", handler)
 	return router
 }
 
@@ -163,5 +165,128 @@ func TestAuditWritesSuccessFlushesBusinessResponseUnderRequiredAudit(t *testing.
 	}
 	if strings.Contains(logs.String(), "report platform audit failed") {
 		t.Fatalf("unexpected failure log: %s", logs.String())
+	}
+}
+
+// AUD-2026-006：强制审计模式下敏感读（GET /embed/:dashboard 一次性嵌入令牌签发）
+// 也必须先缓冲响应：Report 失败时客户端只能拿到 503，绝不能拿到已签发的令牌。
+func TestAuditWritesRejectsSensitiveReadWhenReportFailsUnderRequiredAudit(t *testing.T) {
+	t.Setenv("PLATFORM_AUDIT_REQUIRED", "true")
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	reporter := &failingReporterStub{err: errors.New("platform audit ingest unavailable")}
+	router := newAuditTestRouter(reporter, logger, func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"token": "one-time-embed-token", "expires_at": 1})
+	})
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/embed/overview", nil))
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "one-time-embed-token") {
+		t.Fatalf("issued embed token must never reach the client when audit report fails; body = %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "AUDIT_WRITE_REJECTED") {
+		t.Fatalf("body = %s, want AUDIT_WRITE_REJECTED", recorder.Body.String())
+	}
+	if reporter.calls != 1 {
+		t.Fatalf("Report calls = %d, want 1", reporter.calls)
+	}
+	logged := logs.String()
+	if !strings.Contains(logged, "report platform audit failed") || !strings.Contains(logged, "GET /api/v1/embed/overview") {
+		t.Fatalf("failure log must contain route: %s", logged)
+	}
+}
+
+// AUD-2026-006：强制审计模式下敏感读 Report 成功时，业务响应（令牌）照常提交。
+func TestAuditWritesFlushesSensitiveReadWhenReportSucceedsUnderRequiredAudit(t *testing.T) {
+	t.Setenv("PLATFORM_AUDIT_REQUIRED", "true")
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	reporter := &failingReporterStub{}
+	router := newAuditTestRouter(reporter, logger, func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"token": "one-time-embed-token"})
+	})
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/embed/overview", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "one-time-embed-token") {
+		t.Fatalf("business body not flushed after successful audit report: %s", recorder.Body.String())
+	}
+	if len(reporter.events) != 1 || reporter.events[0].Result != "SUCCESS" {
+		t.Fatalf("unexpected events: %#v", reporter.events)
+	}
+	if strings.Contains(logs.String(), "report platform audit failed") {
+		t.Fatalf("unexpected failure log: %s", logs.String())
+	}
+}
+
+// AUD-2026-006：响应超过 64KiB 缓冲上限时降级 write-through，业务响应照常完整返回
+// （即使 Report 失败也无法撤回），并留下含 limit_bytes 的降级告警日志。
+func TestAuditWritesDegradesToWriteThroughWhenResponseExceedsBufferLimit(t *testing.T) {
+	t.Setenv("PLATFORM_AUDIT_REQUIRED", "true")
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	reporter := &failingReporterStub{err: errors.New("platform audit ingest unavailable")}
+	oversized := strings.Repeat("x", maxAuditBufferedResponseBytes+1024)
+	router := newAuditTestRouter(reporter, logger, func(c *gin.Context) {
+		c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(oversized))
+	})
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/alerts/alert-1/close", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (oversized response degrades to write-through)", recorder.Code, http.StatusOK)
+	}
+	if recorder.Body.Len() != len(oversized) {
+		t.Fatalf("body length = %d, want %d (write-through must not truncate the response)", recorder.Body.Len(), len(oversized))
+	}
+	if strings.Contains(recorder.Body.String(), "AUDIT_WRITE_REJECTED") {
+		t.Fatal("503 must not be appended after the already committed oversized response")
+	}
+	logged := logs.String()
+	if !strings.Contains(logged, "degrading to write-through") {
+		t.Fatalf("missing degrade warn log: %s", logged)
+	}
+	if !strings.Contains(logged, `"limit_bytes":65536`) {
+		t.Fatalf("degrade warn log must contain limit_bytes field: %s", logged)
+	}
+	if !strings.Contains(logged, "report platform audit failed") {
+		t.Fatalf("report failure must still be logged for oversized responses: %s", logged)
+	}
+}
+
+// AUD-2026-006：非强制模式下敏感读行为完全不变——Report 失败不影响业务响应，
+// 仅补上可告警的错误日志。
+func TestAuditWritesSensitiveReadUnchangedWhenAuditNotRequired(t *testing.T) {
+	t.Setenv("PLATFORM_AUDIT_REQUIRED", "false")
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	reporter := &failingReporterStub{err: errors.New("platform audit ingest unavailable")}
+	router := newAuditTestRouter(reporter, logger, func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"token": "one-time-embed-token"})
+	})
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/embed/overview", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (business outcome unchanged); body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "one-time-embed-token") {
+		t.Fatalf("business body must still be delivered when audit not required: %s", recorder.Body.String())
+	}
+	if strings.Contains(logs.String(), "degrading to write-through") {
+		t.Fatalf("no buffer should exist in non-required mode: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "report platform audit failed") {
+		t.Fatalf("missing report failure log: %s", logs.String())
 	}
 }

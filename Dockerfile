@@ -1,15 +1,25 @@
 # 单 Dockerfile 多二进制（对齐 customer_and_opportunity/Dockerfile）
-FROM golang:1.26.4-alpine AS builder
+FROM golang:1.25.4-alpine AS builder
 
-ARG GOPROXY=https://goproxy.cn,direct
-ENV GOPROXY=${GOPROXY}
+ARG GOPROXY=https://goproxy.cn|https://proxy.golang.org|direct
+ARG GOSUMDB=sum.golang.google.cn
+ENV GOPROXY=${GOPROXY} \
+    GOSUMDB=${GOSUMDB}
 
 WORKDIR /src
 
 COPY go.mod go.sum* ./
-RUN go mod download
+RUN set -eu; \
+    for attempt in 1 2 3 4 5; do \
+      if go mod download && go mod verify; then exit 0; fi; \
+      echo "go module download failed (attempt ${attempt}/5)" >&2; \
+      sleep $((attempt * 2)); \
+    done; \
+    exit 1
 
-COPY . ./
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+COPY migrations/ ./migrations/
 
 RUN set -eu; \
     for command in \

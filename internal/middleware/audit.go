@@ -26,8 +26,10 @@ import (
 //  1. 上报失败一律 error 日志（含路由与请求 id）；
 //  2. 强制审计模式（PLATFORM_AUDIT_REQUIRED 或 PLATFORM_ENVIRONMENT_CODE=prod）下：
 //     - reporter 缺失 => 在执行业务 handler 之前就拒绝请求（503），不产生无审计的写；
-//     - 写请求先缓冲响应，Report 成功才提交给客户端；失败则丢弃业务响应并返回
-//     503，保证“审计写不进去 ⇒ 客户端拿不到成功”。
+//     - 写请求与敏感读（AUD-2026-006：如 GET /embed/:dashboard 一次性嵌入令牌签发、
+//     export/download）先缓冲响应（上限 64KiB，超限降级 write-through 并告警），
+//     Report 成功才提交给客户端；失败则丢弃业务响应并返回 503，保证
+//     “审计写不进去 ⇒ 客户端拿不到成功”。
 //
 // 非强制模式保持原有放行语义，仅补上可告警的错误日志。
 func AuditWrites(reporter platformaudit.Reporter, logger *slog.Logger) gin.HandlerFunc {
@@ -59,8 +61,12 @@ func AuditWrites(reporter platformaudit.Reporter, logger *slog.Logger) gin.Handl
 		required := auditRequired()
 		origWriter := c.Writer
 		var buffered *auditBuffer
-		if required && !isReadMethod(c.Request.Method) {
-			buffered = newAuditBuffer(origWriter)
+		// AUD-2026-006：强制审计模式下不安全方法（写）与敏感读（如 embed 一次性
+		// 嵌入令牌签发）都先缓冲响应，Report 失败时才能丢弃业务响应并返回 503；
+		// 不缓冲则 503 追加在已提交响应之后，敏感数据早已离开服务端。
+		// 上面普通读已提前放行，这里的条件即“将被记录审计事件的请求”。
+		if required && (!isReadMethod(c.Request.Method) || sensitiveRead(c.Request.URL.Path)) {
+			buffered = newAuditBuffer(origWriter, maxAuditBufferedResponseBytes, logger)
 			c.Writer = buffered
 		}
 		// handler panic 展平时先恢复真实 writer，外层 gin.Recovery 才能把 500 写出去；
@@ -81,14 +87,16 @@ func AuditWrites(reporter platformaudit.Reporter, logger *slog.Logger) gin.Handl
 				"status", status,
 				"error", err,
 			)
-			if required {
-				// 强制审计模式：审计事件写入失败必须拒绝该请求，不能静默成功。
+			if required && (buffered == nil || !buffered.overflowed) {
+				// 强制审计模式（SEC-D4b/AUD-2026-006）：审计事件写入失败必须拒绝请求，
+				// 不能静默成功。响应超限降级 write-through 后已提交给客户端，事后 503
+				// 无法撤回业务数据，只能保留上面的 error 日志供告警。
 				c.Writer = origWriter
 				response.Error(c, apperror.New(http.StatusServiceUnavailable, "AUDIT_WRITE_REJECTED", "审计记录写入失败，操作未被确认"))
 			}
 			return
 		}
-		if buffered != nil {
+		if buffered != nil && !buffered.overflowed {
 			buffered.flushTo(origWriter)
 		}
 	}
