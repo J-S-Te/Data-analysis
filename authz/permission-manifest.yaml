@@ -4,7 +4,7 @@ kind: PermissionManifest
 metadata:
   application_code: data_analysis
   name: 数据看板与统计分析
-  version: 1
+  version: 2
   owner: data_analysis
   description: 看板查看、预警、字典与管理权限；行级数据范围由 dashboard-api 服务层强制实现
 
@@ -104,8 +104,24 @@ permissions:
     risk_level: LOW
     enforced_by:
       - GET /data_analysis/api/v1/dictionary
+      - GET /data_analysis/api/v1/dictionary/metrics/{code}/versions
     constraints:
-      - 字典为版本化只读口径，禁止修改
+      - 普通用户只读；当前租户隔离
+
+  - code: dictionary.manage
+    name: 管理指标字典
+    resource: metric_dictionary
+    action: manage
+    risk_level: HIGH
+    enforced_by:
+      - PUT /data_analysis/api/v1/dictionary
+      - POST /data_analysis/api/v1/dictionary/metrics
+      - PUT /data_analysis/api/v1/dictionary/metrics/{code}
+      - PATCH /data_analysis/api/v1/dictionary/metrics/{code}/enabled
+      - DELETE /data_analysis/api/v1/dictionary/metrics/{code}
+    constraints:
+      - 字典口径不是可执行 SQL；未绑定指标禁止启用
+      - 变更保留版本并审计，内置及已引用指标禁止删除
 
   - code: aggregation.manage
     name: 管理数据源与同步
@@ -120,6 +136,20 @@ permissions:
       - 触发同步必须审计
 
 roles:
+  - code: admin
+    name: 超级管理员
+    permissions:
+      - dashboard.overview.view
+      - dashboard.contract.view
+      - dashboard.project.view
+      - dashboard.report.view
+      - dashboard.finance.view
+      - alert.view
+      - alert.manage
+      - dictionary.view
+      - dictionary.manage
+      - aggregation.manage
+
   - code: boss
     name: 老板/总经理
     permissions:
@@ -163,6 +193,7 @@ roles:
     permissions:
       - dashboard.overview.view
       - dictionary.view
+      - dictionary.manage
       - alert.manage
       - aggregation.manage
 
@@ -215,6 +246,7 @@ compatibility:
     - alert.view
     - alert.manage
     - dictionary.view
+    - dictionary.manage
     - aggregation.manage
   known_gaps:
     - 平台不承载业务行级范围；数据范围由 dashboard-api 基于平台组织数据自研实现（四层防线，见设计方案 §4.3）

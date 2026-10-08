@@ -46,8 +46,8 @@ func (handler *Handler) DeleteAlertRule(c *gin.Context, id string) {
 		response.Error(c, apperror.ErrUnauthenticated)
 		return
 	}
-	if !hasAdminRole(principal.Roles) {
-		response.Error(c, apperror.New(stdhttp.StatusForbidden, "FORBIDDEN", "仅管理员可以删除预警规则"))
+	if !principal.HasPermission("alert.manage") {
+		response.Error(c, apperror.New(stdhttp.StatusForbidden, "FORBIDDEN", "没有预警规则管理权限"))
 		return
 	}
 	if err := handler.service.DeleteAlertRule(c.Request.Context(), principal.TenantID, id); err != nil {
@@ -111,15 +111,15 @@ func (handler *Handler) ListAlertRules(c *gin.Context) {
 	response.OK(c, rules)
 }
 
-// PutAlertRules 按原有整表替换语义保存预警规则。
+// PutAlertRules 原子保存预警规则并检查版本；省略的规则不会被隐式删除。
 func (handler *Handler) PutAlertRules(c *gin.Context) {
 	principal, ok := auth.FromContext(c.Request.Context())
 	if !ok {
 		response.Error(c, apperror.ErrUnauthenticated)
 		return
 	}
-	if !hasAdminRole(principal.Roles) {
-		response.Error(c, apperror.New(stdhttp.StatusForbidden, "FORBIDDEN", "仅管理员可以修改预警规则"))
+	if !principal.HasPermission("alert.manage") {
+		response.Error(c, apperror.New(stdhttp.StatusForbidden, "FORBIDDEN", "没有预警规则管理权限"))
 		return
 	}
 	var input []alertRuleRequest
@@ -131,6 +131,10 @@ func (handler *Handler) PutAlertRules(c *gin.Context) {
 	actorID = principal.UserID
 	rules, err := handler.service.ReplaceAlertRules(c.Request.Context(), tenantID(c), actorID, alertRulesFromRequest(input))
 	if err != nil {
+		if errors.Is(err, application.ErrRuleVersionConflict) {
+			response.Error(c, apperror.New(stdhttp.StatusConflict, "RULE_VERSION_CONFLICT", "规则已被修改，请重新加载后再保存"))
+			return
+		}
 		if errors.Is(err, application.ErrRulePayloadInvalid) {
 			response.Error(c, apperror.New(stdhttp.StatusBadRequest, "RULE_PAYLOAD_INVALID", "rule_code, name and source_fct are required"))
 			return
@@ -141,16 +145,9 @@ func (handler *Handler) PutAlertRules(c *gin.Context) {
 	response.OK(c, rules)
 }
 
-func hasAdminRole(roles []string) bool {
-	for _, role := range roles {
-		if role == "admin" {
-			return true
-		}
-	}
-	return false
-}
-
 type alertRuleRequest struct {
+	ID            string  `json:"id"`
+	Version       int64   `json:"version"`
 	RuleCode      string  `json:"rule_code"`
 	Name          string  `json:"name"`
 	SourceFCT     string  `json:"source_fct"`
@@ -162,7 +159,7 @@ type alertRuleRequest struct {
 func alertRulesFromRequest(input []alertRuleRequest) []domain.AlertRule {
 	rules := make([]domain.AlertRule, 0, len(input))
 	for _, rule := range input {
-		rules = append(rules, domain.AlertRule{RuleCode: rule.RuleCode, Name: rule.Name, SourceFCT: rule.SourceFCT, Severity: rule.Severity, Enabled: rule.Enabled, ThresholdJSON: rule.ThresholdJSON})
+		rules = append(rules, domain.AlertRule{ID: rule.ID, Version: rule.Version, RuleCode: rule.RuleCode, Name: rule.Name, SourceFCT: rule.SourceFCT, Severity: rule.Severity, Enabled: rule.Enabled, ThresholdJSON: rule.ThresholdJSON})
 	}
 	return rules
 }
