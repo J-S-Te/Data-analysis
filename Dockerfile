@@ -57,4 +57,7 @@ ENTRYPOINT ["/app/local-migrate"]
 
 FROM runtime-base AS production-migrate
 COPY --from=builder /out/production-migrate /app/production-migrate
+# 发布脚本从本镜像读取内嵌授权目录哈希并原子写回运行配置；
+# 携带 print 工具避免为读取哈希额外构建与分发第五个镜像。
+COPY --from=builder /out/authz-catalog /app/authz-catalog
 ENTRYPOINT ["/app/production-migrate"]
