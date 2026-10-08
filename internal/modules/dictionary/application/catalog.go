@@ -2,11 +2,8 @@
 package application
 
 import (
-	"context"
-	"errors"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/dictionary/domain"
 	"gorm.io/gorm"
-	"time"
 )
 
 // CatalogService owns the versioned dictionary currently published by this
@@ -26,48 +23,11 @@ func NewCatalogService(dbs ...*gorm.DB) *CatalogService {
 func (service *CatalogService) Get() domain.Catalog {
 	return domain.Catalog{
 		Version: "2026-07-28", Source: "Data-analysis/数据看板与统计分析子系统·指标字典（模板）.md",
-		Status: "ALL_CONFIRMED", Note: "指标口径只读；新增或修订需更新版本并通过发布评审", Metrics: publishedMetrics,
+		Status: "BUILTIN_CATALOG", Note: "目录版本是内置口径发布日期；各指标version是租户定义版本。指标定义维护不自动接入统计计算；只有绑定受控执行器的指标可启用", Metrics: builtinMetrics(),
 	}
 }
 
 // ListForTenant 返回租户自定义指标；尚未配置时使用内置目录。
-func (service *CatalogService) ListForTenant(ctx context.Context, tenantID string) domain.Catalog {
-	catalog := service.Get()
-	if service.db == nil {
-		return catalog
-	}
-	var rows []domain.Metric
-	if service.db.WithContext(ctx).Table("metric_definition").Where("tenant_id = ?", tenantID).Order("code").Find(&rows).Error == nil && len(rows) > 0 {
-		catalog.Metrics = rows
-		catalog.Version = time.Now().UTC().Format("2006-01-02")
-		catalog.Status = "TENANT_CUSTOM"
-	}
-	return catalog
-}
-
-// SaveTenantMetrics 原子替换租户指标定义，严格校验必填字段。
-func (service *CatalogService) SaveTenantMetrics(ctx context.Context, tenantID, actorID string, metrics []domain.Metric) error {
-	if service.db == nil || tenantID == "" || len(metrics) == 0 {
-		return errors.New("metric definitions are not configured")
-	}
-	now := time.Now().UTC()
-	return service.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		for _, metric := range metrics {
-			if metric.Code == "" || metric.Name == "" || metric.Dashboard == "" || metric.Definition == "" || metric.Formula == "" || metric.Source == "" || metric.Period == "" {
-				return errors.New("metric definition fields are required")
-			}
-			var id string
-			tx.Table("metric_definition").Where("tenant_id = ? AND code = ?", tenantID, metric.Code).Pluck("id", &id)
-			if id == "" {
-				id = metric.Code + tenantID
-			}
-			if err := tx.Exec(`INSERT INTO metric_definition (id,tenant_id,code,name,dashboard,definition,formula,source,period,status,version,updated_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),dashboard=VALUES(dashboard),definition=VALUES(definition),formula=VALUES(formula),source=VALUES(source),period=VALUES(period),status=VALUES(status),version=version+1,updated_by=VALUES(updated_by),updated_at=VALUES(updated_at)`, id, tenantID, metric.Code, metric.Name, metric.Dashboard, metric.Definition, metric.Formula, metric.Source, metric.Period, metric.Status, actorID, now, now).Error; err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
 
 func metric(code, name, dashboard, definition, formula, source, period, status string) domain.Metric {
 	return domain.Metric{Code: code, Name: name, Dashboard: dashboard, Definition: definition, Formula: formula, Source: source, Period: period, Status: status}

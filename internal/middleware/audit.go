@@ -220,7 +220,9 @@ func auditResource(c *gin.Context) (string, string) {
 	case strings.Contains(path, "/alerts/"):
 		return "ALERT", c.Param("id")
 	case strings.Contains(path, "/alert-rules"):
-		return "ALERT_RULE", ""
+		return "ALERT_RULE", c.Param("id")
+	case strings.Contains(path, "/dictionary"):
+		return "METRIC_DICTIONARY", c.Param("code")
 	case strings.Contains(path, "/admin/sources/"):
 		return "SYNC_SOURCE", c.Param("id")
 	default:

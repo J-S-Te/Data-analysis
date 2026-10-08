@@ -35,7 +35,7 @@ func (stub *repositoryStub) EnsureDefaultAlertRules(_ context.Context, tenantID 
 	return nil
 }
 func (stub *repositoryStub) ListAlertRules(context.Context, string) ([]domain.AlertRule, error) {
-	return nil, nil
+	return stub.rules, nil
 }
 func (stub *repositoryStub) ReplaceAlertRules(_ context.Context, _ string, rules []domain.AlertRule) error {
 	stub.rules = rules
@@ -86,13 +86,40 @@ func TestReplaceAlertRulesRejectsUnsafeThresholdAndDuplicateCode(t *testing.T) {
 	}
 }
 
-func TestListAlertRulesInitializesTenantDefaults(t *testing.T) {
+func TestListAlertRulesDoesNotRecreateDeletedDefaults(t *testing.T) {
 	stub := &repositoryStub{}
 	service := NewService(stub)
 	if _, err := service.ListAlertRules(context.Background(), "tenant-1"); err != nil {
 		t.Fatalf("ListAlertRules() error = %v", err)
 	}
-	if stub.defaultTenant != "tenant-1" {
-		t.Fatalf("default tenant = %q, want tenant-1", stub.defaultTenant)
+	if stub.defaultTenant != "" {
+		t.Fatalf("read unexpectedly seeded defaults for %q", stub.defaultTenant)
+	}
+}
+
+func TestRuleWritesRejectEmptyIdentityAndName(t *testing.T) {
+	threshold := `{"days":30}`
+	rule := domain.AlertRule{RuleCode: "CONTRACT_EXPIRY", Name: " ", SourceFCT: "dim_contract", Severity: "HIGH", ThresholdJSON: &threshold}
+	service := NewService(&repositoryStub{})
+	for _, ids := range [][2]string{{"tenant", "actor"}, {"", "actor"}, {"tenant", ""}} {
+		if _, err := service.ReplaceAlertRules(context.Background(), ids[0], ids[1], []domain.AlertRule{rule}); err != ErrRulePayloadInvalid {
+			t.Fatalf("invalid input accepted: %v", err)
+		}
+	}
+}
+
+func TestRuleWritesRejectForgedCreationIdentity(t *testing.T) {
+	threshold := `{"days":30}`
+	valid := domain.AlertRule{RuleCode: "CONTRACT_EXPIRY", Name: "到期提醒", SourceFCT: "dim_contract", Severity: "HIGH", ThresholdJSON: &threshold}
+	for _, ids := range []struct {
+		id      string
+		version int64
+	}{{"", 1}, {"", -1}, {"forged", 1}, {"ABCDEFGHIJKLMNOPQRSTUVWXYZ", 0}} {
+		input := valid
+		input.ID = ids.id
+		input.Version = ids.version
+		if _, err := NewService(&repositoryStub{}).ReplaceAlertRules(context.Background(), "tenant", "actor", []domain.AlertRule{input}); err != ErrRulePayloadInvalid {
+			t.Fatalf("forged identity accepted: %+v %v", ids, err)
+		}
 	}
 }

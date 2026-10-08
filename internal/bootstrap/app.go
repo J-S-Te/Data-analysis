@@ -145,7 +145,12 @@ func New(config Config) (*App, error) {
 
 	dictHandler := dictionaryhttp.NewHandler(dictionaryapplication.NewCatalogService(db))
 	api.GET("/dictionary", middleware.RequirePermission("dictionary.view"), dictHandler.Get)
-	api.PUT("/dictionary", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("dictionary.view"), dictHandler.Put)
+	api.PUT("/dictionary", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("dictionary.manage"), dictHandler.Put)
+	api.POST("/dictionary/metrics", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("dictionary.manage"), dictHandler.Create)
+	api.PUT("/dictionary/metrics/:code", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("dictionary.manage"), dictHandler.Update)
+	api.PATCH("/dictionary/metrics/:code/enabled", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("dictionary.manage"), dictHandler.SetEnabled)
+	api.DELETE("/dictionary/metrics/:code", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("dictionary.manage"), dictHandler.Delete)
+	api.GET("/dictionary/metrics/:code/versions", middleware.RequirePermission("dictionary.view"), dictHandler.History)
 
 	adminHandler := adminhttp.NewHandler(adminapplication.NewService(admininfrastructure.NewGORMRepository(db)))
 	dashboardHandler := dashboardhttp.NewHandler(dashboardapplication.NewService(dashboardinfrastructure.NewGORMRepository(db)))

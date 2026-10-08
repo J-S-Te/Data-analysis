@@ -2,11 +2,13 @@ package alertworker
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
+	"sort"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type gormRule struct {
@@ -27,7 +29,7 @@ func NewGormStore(db *gorm.DB, tenantID string) *GormStore {
 }
 
 func (s *GormStore) ListEnabledRules(ctx context.Context) ([]Rule, error) {
-	if err := s.ensureDefaultRule(ctx); err != nil {
+	if err := s.validateTenant(); err != nil {
 		return nil, err
 	}
 	var rows []gormRule
@@ -50,15 +52,11 @@ func (s *GormStore) ListEnabledRules(ctx context.Context) ([]Rule, error) {
 	return rules, nil
 }
 
-// ensureDefaultRule 为首次运行的租户写入可执行的最小默认规则，不覆盖已由管理员维护的规则。
-func (s *GormStore) ensureDefaultRule(ctx context.Context) error {
-	now := time.Now().UTC()
-	sum := sha256.Sum256([]byte("data-analysis:alert-rule:" + s.tenantID + ":CONTRACT_EXPIRY"))
-	id := hex.EncodeToString(sum[:])[:26]
-	return s.db.WithContext(ctx).Exec(`INSERT INTO alert_rule
-(tenant_id, id, rule_code, name, source_fct, severity, enabled, threshold_json, created_at, updated_at)
-VALUES (?, ?, 'CONTRACT_EXPIRY', '合同到期提醒', 'dim_contract', 'HIGH', 1, '{"days":30}', ?, ?)
-ON DUPLICATE KEY UPDATE tenant_id = tenant_id`, s.tenantID, id, now, now).Error
+func (s *GormStore) validateTenant() error {
+	if strings.TrimSpace(s.tenantID) == "" {
+		return errors.New("alert worker tenant_id is required")
+	}
+	return nil
 }
 
 func (s *GormStore) FindContractExpiryCandidates(
@@ -66,6 +64,9 @@ func (s *GormStore) FindContractExpiryCandidates(
 	evaluatedAt time.Time,
 	days int,
 ) ([]ContractExpiryCandidate, error) {
+	if err := s.validateTenant(); err != nil {
+		return nil, err
+	}
 	var candidates []ContractExpiryCandidate
 	err := s.db.WithContext(ctx).
 		Table("dim_contract").
@@ -73,20 +74,62 @@ func (s *GormStore) FindContractExpiryCandidates(
 CONCAT('合同「', title, '」将在 ', DATE_FORMAT(end_date, '%Y-%m-%d'), ' 到期') AS title,
 end_date AS due_date`).
 		Where("end_date IS NOT NULL").
+		Where("tenant_id = ?", s.tenantID).
 		Where("end_date >= DATE(?)", evaluatedAt).
 		Where("end_date <= DATE_ADD(DATE(?), INTERVAL ? DAY)", evaluatedAt, days).
 		Where("status NOT IN ?", []string{"COMPLETED", "ARCHIVED", "TERMINATED"}).
 		Order("tenant_id, end_date, contract_id").
 		Find(&candidates).Error
-	return candidates, err
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range candidates {
+		if candidate.TenantID != s.tenantID {
+			return nil, errors.New("contract expiry candidate tenant does not match worker tenant")
+		}
+	}
+	return candidates, nil
 }
 
 func (s *GormStore) UpsertAlerts(ctx context.Context, alerts []Alert) error {
+	if err := s.validateTenant(); err != nil {
+		return err
+	}
 	if len(alerts) == 0 {
 		return nil
 	}
+	ruleCodes := make(map[string]bool)
+	for _, alert := range alerts {
+		if alert.TenantID != s.tenantID {
+			return errors.New("alert tenant does not match worker tenant")
+		}
+		ruleCodes[alert.RuleCode] = false
+	}
+	codes := make([]string, 0, len(ruleCodes))
+	for code := range ruleCodes {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 与规则停用/删除共用规则行锁，避免候选查询之后继续写入失效规则。
+		for _, code := range codes {
+			var row struct{ Enabled bool }
+			err := tx.Table("alert_rule").Select("enabled").
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("tenant_id = ? AND rule_code = ?", s.tenantID, code).
+				Take(&row).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			ruleCodes[code] = row.Enabled
+		}
 		for _, alert := range alerts {
+			if !ruleCodes[alert.RuleCode] {
+				continue
+			}
 			if err := tx.Exec(`INSERT INTO alert_item
 (id, tenant_id, alert_type, rule_code, severity, target_ref, title, due_date, status, closed_at, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', NULL, ?, ?)

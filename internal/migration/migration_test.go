@@ -116,3 +116,26 @@ func TestOpenDatabaseRequiresDSN(t *testing.T) {
 		t.Fatalf("openDatabase() error = %v, want required DSN error", err)
 	}
 }
+
+func TestMetricGovernanceMigrationKeepsExistingDefinitionsAndAddsHistory(t *testing.T) {
+	items, err := Load(migrations.Files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sql string
+	for _, item := range items {
+		if item.Version == 13 {
+			sql = item.SQL
+		}
+	}
+	for _, fragment := range []string{"information_schema.columns", "ADD COLUMN enabled", "ADD COLUMN origin", "ADD COLUMN deleted_at", "metric_definition_version", "metric_definition_reference", "uk_metric_version", "metric_snapshot JSON"} {
+		if !strings.Contains(sql, fragment) {
+			t.Errorf("metric migration missing %q", fragment)
+		}
+	}
+	for _, fragment := range []string{"DROP TABLE", "TRUNCATE", "DELETE FROM metric_definition"} {
+		if strings.Contains(sql, fragment) {
+			t.Errorf("metric migration destroys existing definitions: %s", fragment)
+		}
+	}
+}

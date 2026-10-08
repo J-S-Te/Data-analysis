@@ -25,9 +25,10 @@ var (
 	// ErrSyncAlreadyQueued 表示同一租户的数据源已有等待或执行中的同步任务。
 	ErrSyncAlreadyQueued = errors.New("sync source already has an active job")
 	// ErrRulePayloadInvalid 表示预警规则缺少必要业务字段。
-	ErrRulePayloadInvalid = errors.New("invalid alert rule payload")
-	ErrRuleNotFound       = errors.New("alert rule not found")
-	ErrRuleHasHistory     = errors.New("alert rule has alert history")
+	ErrRulePayloadInvalid  = errors.New("invalid alert rule payload")
+	ErrRuleNotFound        = errors.New("alert rule not found")
+	ErrRuleHasHistory      = errors.New("alert rule has alert history")
+	ErrRuleVersionConflict = errors.New("alert rule version conflict")
 )
 
 const maxRulesPerTenant = 50
@@ -37,7 +38,6 @@ type Repository interface {
 	ListSources(context.Context, string) ([]domain.SyncSource, error)
 	FindSource(context.Context, string, string) (domain.SyncSource, bool, error)
 	CreateSyncJob(context.Context, domain.SyncJob) (bool, error)
-	EnsureDefaultAlertRules(context.Context, string, time.Time) error
 	ListAlertRules(context.Context, string) ([]domain.AlertRule, error)
 	ReplaceAlertRules(context.Context, string, []domain.AlertRule) error
 	DeleteAlertRule(context.Context, string, string) error
@@ -118,17 +118,15 @@ func (service *Service) TriggerSource(ctx context.Context, tenantID, sourceID st
 
 // ListAlertRules 返回按规则编码排序的预警规则。
 func (service *Service) ListAlertRules(ctx context.Context, tenantID string) ([]domain.AlertRule, error) {
-	if err := service.repository.EnsureDefaultAlertRules(ctx, tenantID, service.now()); err != nil {
-		return nil, err
+	if strings.TrimSpace(tenantID) == "" {
+		return nil, ErrRulePayloadInvalid
 	}
 	return service.repository.ListAlertRules(ctx, tenantID)
 }
 
-// ReplaceAlertRules 保持原有整表替换语义，并在应用层统一校验规则字段。
-
-// ReplaceAlertRules 在指定租户内原子替换预警规则，并拒绝无法由 Worker 安全执行的配置。
+// ReplaceAlertRules 在指定租户内原子保存规则，删除使用独立的历史保护接口。
 func (service *Service) ReplaceAlertRules(ctx context.Context, tenantID, actorID string, input []domain.AlertRule) ([]domain.AlertRule, error) {
-	if len(input) == 0 || len(input) > maxRulesPerTenant {
+	if strings.TrimSpace(tenantID) == "" || strings.TrimSpace(actorID) == "" || len(input) == 0 || len(input) > maxRulesPerTenant {
 		return nil, ErrRulePayloadInvalid
 	}
 	now := service.now()
@@ -142,6 +140,9 @@ func (service *Service) ReplaceAlertRules(ctx context.Context, tenantID, actorID
 		if !validAlertRule(rule) {
 			return nil, ErrRulePayloadInvalid
 		}
+		if rule.Version < 0 || (rule.ID == "" && rule.Version != 0) || (rule.ID != "" && (len(rule.ID) != 26 || rule.Version < 1)) {
+			return nil, ErrRulePayloadInvalid
+		}
 		if _, duplicated := seenCodes[rule.RuleCode]; duplicated {
 			return nil, ErrRulePayloadInvalid
 		}
@@ -150,7 +151,10 @@ func (service *Service) ReplaceAlertRules(ctx context.Context, tenantID, actorID
 			rule.ID = service.newID()
 		}
 		rule.TenantID = tenantID
-		rule.CreatedAt, rule.UpdatedAt = now, now
+		rule.UpdatedAt = now
+		if rule.CreatedAt.IsZero() {
+			rule.CreatedAt = now
+		}
 		if actorID != "" {
 			actor := actorID
 			rule.UpdatedBy = &actor
@@ -160,11 +164,11 @@ func (service *Service) ReplaceAlertRules(ctx context.Context, tenantID, actorID
 	if err := service.repository.ReplaceAlertRules(ctx, tenantID, rules); err != nil {
 		return nil, err
 	}
-	return rules, nil
+	return service.repository.ListAlertRules(ctx, tenantID)
 }
 
 func validAlertRule(rule domain.AlertRule) bool {
-	if rule.RuleCode != "CONTRACT_EXPIRY" || rule.SourceFCT != "dim_contract" || len(rule.Name) > 128 {
+	if rule.RuleCode != "CONTRACT_EXPIRY" || rule.SourceFCT != "dim_contract" || rule.Name == "" || len([]rune(rule.Name)) > 128 {
 		return false
 	}
 	if rule.Severity != "LOW" && rule.Severity != "MEDIUM" && rule.Severity != "HIGH" {
