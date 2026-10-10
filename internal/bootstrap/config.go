@@ -42,6 +42,7 @@ type Config struct {
 	MetabaseInternalURL     string
 	MetabaseBasePath        string
 	MetabaseEmbeddingSecret string
+	EmbedPublicOrigin       string
 	DashboardIDs            map[string]string
 }
 
@@ -96,6 +97,7 @@ func LoadConfig() (Config, error) {
 		MetabaseInternalURL:     envOr("METABASE_INTERNAL_URL", "http://metabase:3000"),
 		MetabaseBasePath:        strings.TrimRight(envOr("METABASE_BASE_PATH", "/"), "/"),
 		MetabaseEmbeddingSecret: os.Getenv("METABASE_EMBEDDING_SECRET"),
+		EmbedPublicOrigin:       os.Getenv("BI_EMBED_PUBLIC_ORIGIN"),
 		DashboardIDs: map[string]string{
 			"overview": envOr("MB_DASHBOARD_ID_OVERVIEW", ""),
 			"contract": envOr("MB_DASHBOARD_ID_CONTRACT", ""),

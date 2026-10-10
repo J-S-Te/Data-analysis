@@ -21,6 +21,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/oidc"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/apperror"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/auth"
@@ -28,12 +29,15 @@ import (
 )
 
 type Options struct {
+	LicenseCheck        commercial.Check
 	MetabaseInternalURL string // 如 http://metabase:3000
 	MetabaseBasePath    string // Metabase 服务路径前缀，如 / 或 /mb
 	EmbeddingSecret     string // Metabase Admin 设置中的嵌入密钥
 	TokenTTL            time.Duration
 	DashboardIDs        map[string]string // dashboard_code -> Metabase dashboard ID
 	PathPrefix          string
+	PublicOrigin        string
+	EmbedPublicOrigin   string
 }
 
 type Bridge struct {
@@ -47,6 +51,13 @@ func New(db *gorm.DB, options Options) (*Bridge, error) {
 	if options.MetabaseInternalURL == "" || options.EmbeddingSecret == "" {
 		return nil, errors.New("embed bridge requires metabase internal url and embedding secret")
 	}
+	if options.EmbedPublicOrigin != "" {
+		origin, err := isolatedEmbedOrigin(options.PublicOrigin, options.EmbedPublicOrigin)
+		if err != nil {
+			return nil, err
+		}
+		options.EmbedPublicOrigin = origin
+	}
 	ttl := options.TokenTTL
 	if ttl <= 0 {
 		// 一次性嵌入令牌的默认有效期：缩短以压缩签名 URL 泄露后的重放窗口。
@@ -57,6 +68,9 @@ func New(db *gorm.DB, options Options) (*Bridge, error) {
 
 // Issue 校验权限后签发一次性嵌入令牌（设计方案 §9：GET /api/v1/embed/{dashboard_code}）。
 func (b *Bridge) Issue(c *gin.Context, dashboardCode string) {
+	if commercial.Reject(c, b.options.LicenseCheck.Allow(c.Request.Context(), commercial.MutateBusiness)) {
+		return
+	}
 	principal, ok := auth.FromContext(c.Request.Context())
 	if !ok {
 		response.Error(c, apperror.ErrUnauthenticated)
@@ -65,6 +79,14 @@ func (b *Bridge) Issue(c *gin.Context, dashboardCode string) {
 	permission, exists := b.permissionFor(dashboardCode)
 	if !exists || !principal.HasPermission(permission) {
 		response.Error(c, apperror.ErrForbidden)
+		return
+	}
+	if _, err := metabaseDashboardResource(b.dashboardIDs[dashboardCode]); err != nil {
+		response.Error(c, apperror.New(http.StatusServiceUnavailable, "EMBED_DASHBOARD_UNCONFIGURED", "dashboard embedding is not configured"))
+		return
+	}
+	if b.options.EmbedPublicOrigin == "" {
+		response.Error(c, apperror.New(http.StatusServiceUnavailable, "EMBED_ORIGIN_UNCONFIGURED", "isolated dashboard embedding is not configured"))
 		return
 	}
 	token, err := randomToken()
@@ -92,17 +114,23 @@ func (b *Bridge) Issue(c *gin.Context, dashboardCode string) {
 	response.OK(c, gin.H{
 		"token":      token,
 		"expires_at": now.Add(b.tokenTTL).Unix(),
+		"embed_url":  b.options.EmbedPublicOrigin + strings.TrimRight(b.options.PathPrefix, "/") + "/api/v1/embed-proxy/" + token,
 	})
 }
 
 // Proxy 单次消费令牌并代理到内网 Metabase（设计方案 §9：GET /api/v1/embed-proxy/{token}）。
 func (b *Bridge) Proxy(c *gin.Context, token string) {
+	if !b.requireEmbedHost(c) {
+		return
+	}
+	if commercial.Reject(c, b.options.LicenseCheck.Allow(c.Request.Context(), commercial.MutateBusiness)) {
+		return
+	}
 	record, ok := b.embedRecord(c, token, true)
 	if !ok {
 		response.Error(c, apperror.ErrForbidden)
 		return
 	}
-	now := time.Now().UTC()
 	dashboardID, ok := b.dashboardIDs[record.DashboardCode]
 	if !ok {
 		response.Error(c, apperror.New(http.StatusNotFound, "EMBED_DASHBOARD_UNKNOWN", "unknown dashboard"))
@@ -115,7 +143,7 @@ func (b *Bridge) Proxy(c *gin.Context, token string) {
 		response.Error(c, apperror.New(http.StatusForbidden, "EMBED_SCOPE_INVALID", "invalid embed scope"))
 		return
 	}
-	signedURL, err := b.signedEmbedURL(dashboardID, scope, now.Add(b.tokenTTL))
+	signedURL, err := b.signedEmbedURL(dashboardID, scope, record.ExpiresAt)
 	if err != nil {
 		response.Error(c, apperror.New(http.StatusInternalServerError, "EMBED_SIGN_FAILED", "failed to sign embed url"))
 		return
@@ -135,7 +163,13 @@ func (b *Bridge) Proxy(c *gin.Context, token string) {
 // The token remains in the browser-visible path, so resources are only exposed
 // while the original short-lived embed grant is still valid.
 func (b *Bridge) ProxyResource(c *gin.Context, token, resource string) {
-	if _, ok := b.embedRecord(c, token, false); !ok {
+	if !b.requireEmbedHost(c) {
+		return
+	}
+	if commercial.Reject(c, b.options.LicenseCheck.Allow(c.Request.Context(), commercial.MutateBusiness)) {
+		return
+	}
+	if record, ok := b.embedRecord(c, token, false); !ok || record.ConsumedAt == nil {
 		response.Error(c, apperror.ErrForbidden)
 		return
 	}
@@ -177,11 +211,17 @@ func (b *Bridge) modifyProxyResponse(token string, rewriteDocument bool) func(*h
 		// 令牌存在于 iframe URL 中，禁止 Referer 外带并避免代理响应被共享缓存。
 		resp.Header.Set("Referrer-Policy", "no-referrer")
 		resp.Header.Set("Cache-Control", "no-store")
+		// The gateway never delivers upstream cookies to the platform or the
+		// isolated host. Embed SQL uses the signed, tenant-locked capability.
+		resp.Header.Del("Set-Cookie")
 		// The response is already behind the permission-checked, short-lived
 		// embed proxy, so remove only the headers that reject iframe embedding.
 		resp.Header.Del("X-Frame-Options")
 		if csp := resp.Header.Get("Content-Security-Policy"); csp != "" {
 			resp.Header.Set("Content-Security-Policy", withoutFrameAncestors(csp))
+		}
+		if b.options.PublicOrigin != "" {
+			resp.Header.Add("Content-Security-Policy", "frame-ancestors "+b.options.PublicOrigin)
 		}
 		if !rewriteDocument || !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") {
 			return nil
@@ -197,6 +237,15 @@ func (b *Bridge) modifyProxyResponse(token string, rewriteDocument bool) func(*h
 		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 		return nil
 	}
+}
+
+func (b *Bridge) requireEmbedHost(c *gin.Context) bool {
+	u, err := url.Parse(b.options.EmbedPublicOrigin)
+	if err != nil || u.Host == "" || !strings.EqualFold(c.Request.Host, u.Host) {
+		response.Error(c, apperror.ErrForbidden)
+		return false
+	}
+	return true
 }
 
 func (b *Bridge) embedRecord(c *gin.Context, token string, consume bool) (oidc.EmbedToken, bool) {
@@ -347,8 +396,12 @@ func withoutFrameAncestors(csp string) string {
 
 // signedEmbedURL 生成 Metabase 签名嵌入 URL（HMAC-SHA256）。
 func (b *Bridge) signedEmbedURL(dashboardID string, params map[string]interface{}, expires time.Time) (signedEmbed, error) {
+	resource, err := metabaseDashboardResource(dashboardID)
+	if err != nil {
+		return signedEmbed{}, err
+	}
 	payload := map[string]interface{}{
-		"resource": map[string]string{"dashboard": dashboardID},
+		"resource": map[string]interface{}{"dashboard": resource},
 		"params":   params,
 		"exp":      expires.Unix(),
 	}
@@ -356,11 +409,29 @@ func (b *Bridge) signedEmbedURL(dashboardID string, params map[string]interface{
 	if err != nil {
 		return signedEmbed{}, err
 	}
-	encoded := base64.RawURLEncoding.EncodeToString(raw)
+	// Metabase accepts a standard compact HS256 JWT, not payload.signature.
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	encoded := header + "." + base64.RawURLEncoding.EncodeToString(raw)
 	mac := hmac.New(sha256.New, []byte(b.options.EmbeddingSecret))
 	mac.Write([]byte(encoded))
 	signature := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	return signedEmbed{token: encoded + "." + signature}, nil
+}
+
+func metabaseDashboardResource(value string) (interface{}, error) {
+	if value == "" || value != strings.TrimSpace(value) {
+		return nil, errors.New("missing or invalid dashboard ID")
+	}
+	if id, err := strconv.ParseInt(value, 10, 64); err == nil && id > 0 {
+		return id, nil
+	}
+	// Metabase also supports its stable 21-character URL-safe entity IDs.
+	if len(value) == 21 && strings.IndexFunc(value, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-')
+	}) == -1 {
+		return value, nil
+	}
+	return nil, errors.New("invalid dashboard ID")
 }
 
 type signedEmbed struct{ token string }

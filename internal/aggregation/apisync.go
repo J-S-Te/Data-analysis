@@ -18,6 +18,7 @@ import (
 
 // APISyncOptions 看板系统经子系统 internal 接口同步的配置（设计方案：看板数据经接口获取）。
 type APISyncOptions struct {
+	LicenseCheck func(context.Context) error
 	// 机器令牌由基础平台 OAuth client_credentials 端点签发。
 	MachineTokenURL      string
 	MachineTokenIssuer   string
@@ -69,6 +70,13 @@ type APISyncRunner struct {
 	tokens  map[string]cachedMachineToken
 }
 
+func (r *APISyncRunner) checkLicense(ctx context.Context) error {
+	if r.options.LicenseCheck != nil {
+		return r.options.LicenseCheck(ctx)
+	}
+	return nil
+}
+
 type cachedMachineToken struct {
 	value     string
 	expiresAt time.Time
@@ -90,6 +98,9 @@ func NewAPISyncRunner(db *gorm.DB, options APISyncOptions) *APISyncRunner {
 // 2）HTTP 请求失败、状态码非 200 或返回体解析失败都会返回错误；
 // 3）成功时返回可复用的 token 并更新本地过期时间。
 func (r *APISyncRunner) machineToken(ctx context.Context, credential MachineCredential) (string, error) {
+	if err := r.checkLicense(ctx); err != nil {
+		return "", err
+	}
 	credential.ClientID = strings.TrimSpace(credential.ClientID)
 	credential.Scope = strings.TrimSpace(credential.Scope)
 	if cached := r.tokens[credential.ClientID]; cached.value != "" && time.Now().Before(cached.expiresAt.Add(-30*time.Second)) {
@@ -221,6 +232,9 @@ func (r *APISyncRunner) SyncContractDashboard(ctx context.Context) error {
 // - 只在合同接口、租户校验、快照写入都通过时返回 nil；
 // - 任一环节失败均返回错误，调用方可根据错误原因决定是否重试。
 func (r *APISyncRunner) syncContractDashboard(ctx context.Context, sink contractSnapshotSink) error {
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
 	if strings.TrimSpace(r.options.ContractInternalURL) == "" {
 		return errors.New("contract internal URL is not configured")
 	}
@@ -269,6 +283,9 @@ func (r *APISyncRunner) syncContractDashboard(ctx context.Context, sink contract
 	if sink == nil {
 		return errors.New("contract dashboard snapshot sink is not configured")
 	}
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
 	return sink(ctx, contractDashboardSnapshot{
 		TenantID:          tenantID,
 		SnapshotAt:        time.Now().UTC(),
@@ -281,6 +298,9 @@ func (r *APISyncRunner) syncContractDashboard(ctx context.Context, sink contract
 }
 
 func (r *APISyncRunner) persistContractDashboard(ctx context.Context, snapshot contractDashboardSnapshot) error {
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
 	if r.db == nil {
 		return errors.New("aggregation database is not configured")
 	}
@@ -299,6 +319,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 'contract-api')`,
 // 返回错误的典型触发条件包括：项目内置接口未配置、租户 ID 未配置、机器令牌获取失败、
 // 内部接口非 200、JSON 反序列化失败，或数据库写入失败。
 func (r *APISyncRunner) SyncProjectDashboard(ctx context.Context) error {
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
 	if strings.TrimSpace(r.options.ProjectInternalURL) == "" {
 		return errors.New("project internal URL is not configured")
 	}
@@ -343,6 +366,9 @@ func (r *APISyncRunner) SyncProjectDashboard(ctx context.Context) error {
 	}
 	statusJSON, _ := json.Marshal(payload.Data.StatusCounts)
 	now := time.Now().UTC()
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
 	if err := r.db.Exec(`INSERT INTO api_project_dashboard
 (tenant_id, snapshot_at, project_count, in_flight_projects, risk_projects, service_items, status_counts_json, source)
 VALUES (?, ?, ?, ?, ?, ?, ?, 'project-api')`,

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/aggregation"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
@@ -23,6 +24,14 @@ func main() {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	licenseCheck, err := commercial.Start(ctx)
+	if err != nil {
+		logger.Error("commercial license configuration invalid")
+		os.Exit(1)
+	}
+	checkBusiness := func(ctx context.Context) error { return licenseCheck.Allow(ctx, commercial.MutateBusiness) }
 
 	aggDSN := os.Getenv("DASHBOARD_MYSQL_DSN")
 	if aggDSN == "" {
@@ -36,13 +45,13 @@ func main() {
 		}
 	}
 	var runner *aggregation.Runner
-	var err error
 	if len(sources) > 0 {
 		runner, err = aggregation.NewRunner(aggDSN, os.Getenv("OIDC_TENANT_ID"), sources)
 		if err != nil {
 			logger.Error("aggregation runner failed", "error", err)
 			os.Exit(1)
 		}
+		runner.LicenseCheck = checkBusiness
 	}
 	aggDB, err := gorm.Open(mysql.Open(aggDSN), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
@@ -50,6 +59,7 @@ func main() {
 		os.Exit(1)
 	}
 	apiSync := aggregation.NewAPISyncRunner(aggDB, aggregation.APISyncOptions{
+		LicenseCheck:         checkBusiness,
 		MachineTokenURL:      os.Getenv("MACHINE_TOKEN_URL"),
 		MachineTokenIssuer:   firstNonEmpty(os.Getenv("MACHINE_TOKEN_ISSUER"), os.Getenv("OIDC_ISSUER")),
 		MachineTokenAudience: firstNonEmpty(os.Getenv("MACHINE_TOKEN_AUDIENCE"), "basic-platform-application"),
@@ -65,18 +75,15 @@ func main() {
 		ProjectInternalURL:  os.Getenv("PROJECT_INTERNAL_URL"),
 		TenantID:            os.Getenv("OIDC_TENANT_ID"),
 	})
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	if runner != nil {
-		if err := runner.EnsureSyncSources(ctx); err != nil {
-			logger.Error("ensure sync sources failed", "error", err)
-			os.Exit(1)
-		}
-	}
-	pass := aggregation.Pass{}
+	pass := aggregation.Pass{LicenseCheck: checkBusiness}
 	if runner != nil {
 		// 主动跨库同步：从源库（合同/客户）读取并写入聚合库维表，保证看板有数据。
-		pass.SyncSources = runner.RunOnce
+		pass.SyncSources = func(ctx context.Context) error {
+			if err := runner.EnsureSyncSources(ctx); err != nil {
+				return err
+			}
+			return runner.RunOnce(ctx)
+		}
 		// 跨系统同步也支持由已持久化的访问/管理请求（队列）触发。
 		pass.SyncJobs = runner.RunQueued
 	}

@@ -9,6 +9,9 @@ ENV GOPROXY=${GOPROXY} \
 WORKDIR /src
 
 COPY go.mod go.sum* ./
+COPY third_party/license-core/ ./third_party/license-core/
+COPY scripts/license-core-sync.sh scripts/license-core.sha256 ./scripts/
+RUN sh scripts/license-core-sync.sh --check
 RUN set -eu; \
     for attempt in 1 2 3 4 5; do \
       if go mod download && go mod verify; then exit 0; fi; \
@@ -29,8 +32,10 @@ RUN set -eu; \
     done
 
 FROM alpine:3.21 AS runtime-base
+ARG APP_VERSION
+LABEL org.opencontainers.image.version=${APP_VERSION} com.basic-platform.license.protocol="1"
 
-RUN apk add --no-cache ca-certificates tzdata wget
+RUN apk add --no-cache ca-certificates tzdata wget && mkdir -p /var/lib/commercial-license
 
 WORKDIR /app
 

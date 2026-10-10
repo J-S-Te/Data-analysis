@@ -1,12 +1,18 @@
 package embedbridge
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/auth"
 )
 
 func TestRewriteEmbedDocumentUsesTokenResourcePrefix(t *testing.T) {
@@ -48,21 +54,66 @@ func TestSignedEmbedURLCarriesTenantScope(t *testing.T) {
 		t.Fatalf("signedEmbedURL() error = %v", err)
 	}
 	parts := strings.Split(signed.token, ".")
-	if len(parts) != 2 {
-		t.Fatalf("signed token parts = %d, want 2", len(parts))
+	if len(parts) != 3 {
+		t.Fatalf("signed token parts = %d, want standard JWT 3", len(parts))
 	}
-	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	header, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil || string(header) != `{"alg":"HS256","typ":"JWT"}` {
+		t.Fatal("invalid JWT algorithm/header")
+	}
+	mac := hmac.New(sha256.New, []byte("test-secret"))
+	mac.Write([]byte(parts[0] + "." + parts[1]))
+	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || !hmac.Equal(signature, mac.Sum(nil)) {
+		t.Fatal("JWT signature does not cover header and payload")
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		t.Fatalf("decode payload: %v", err)
 	}
 	var payload struct {
-		Params map[string]interface{} `json:"params"`
+		Params   map[string]interface{} `json:"params"`
+		Resource map[string]interface{} `json:"resource"`
+		Expires  int64                  `json:"exp"`
 	}
 	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 		t.Fatalf("decode JSON payload: %v", err)
 	}
 	if got := payload.Params["tenant_id"]; got != "tenant-1" {
 		t.Fatalf("tenant_id = %#v, want tenant-1", got)
+	}
+	if payload.Resource["dashboard"] != float64(42) || payload.Expires != 2_000_000_000 {
+		t.Fatal("dashboard must be numeric and expiry must remain absolute")
+	}
+}
+
+func TestMetabaseDashboardResourceRejectsUnconfiguredAndMalformedIDs(t *testing.T) {
+	for _, value := range []string{"", " ", " 42", "42 ", "0", "-1", "../42", "arbitrary", "9223372036854775808"} {
+		if _, err := metabaseDashboardResource(value); err == nil {
+			t.Errorf("invalid dashboard accepted: %q", value)
+		}
+	}
+	const entity = "abcdefghijklmnopqrstu"
+	if got, err := metabaseDashboardResource(entity); err != nil || got != entity {
+		t.Fatal("valid stable entity ID rejected")
+	}
+}
+
+func TestIssueUnconfiguredDashboardDoesNotPersistGrant(t *testing.T) {
+	// A nil database deliberately proves failure occurs before token persistence.
+	bridge, err := New(nil, Options{MetabaseInternalURL: "http://metabase:3000", EmbeddingSecret: "test-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/embed/overview", nil)
+	c.Request = c.Request.WithContext(auth.WithPrincipal(c.Request.Context(), auth.Principal{
+		TenantID: "tenant-1", UserID: "user-1", Permissions: map[string]struct{}{"dashboard.overview.view": {}},
+	}))
+	bridge.Issue(c, "overview")
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "EMBED_DASHBOARD_UNCONFIGURED") {
+		t.Fatalf("unexpected unconfigured response: %d %s", w.Code, w.Body.String())
 	}
 }
 

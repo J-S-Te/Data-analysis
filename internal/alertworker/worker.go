@@ -55,8 +55,9 @@ type Store interface {
 
 // Worker 按现有聚合表计算预警；同一租户、类型和目标重复执行时幂等更新。
 type Worker struct {
-	store Store
-	now   func() time.Time
+	LicenseCheck func(context.Context) error
+	store        Store
+	now          func() time.Time
 }
 
 func New(store Store) *Worker {
@@ -65,6 +66,11 @@ func New(store Store) *Worker {
 
 // RunOnce 计算一轮所有已启用规则，并返回成功写入的候选数量。
 func (w *Worker) RunOnce(ctx context.Context) (int, error) {
+	if w.LicenseCheck != nil {
+		if err := w.LicenseCheck(ctx); err != nil {
+			return 0, err
+		}
+	}
 	rules, err := w.store.ListEnabledRules(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("list enabled alert rules: %w", err)
@@ -74,6 +80,11 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 	processed := 0
 	var runErrors []error
 	for _, rule := range rules {
+		if w.LicenseCheck != nil {
+			if err := w.LicenseCheck(ctx); err != nil {
+				return processed, err
+			}
+		}
 		switch strings.ToUpper(strings.TrimSpace(rule.Code)) {
 		case RuleContractExpiry:
 			count, evaluateErr := w.evaluateContractExpiry(ctx, rule, evaluatedAt)
@@ -110,6 +121,11 @@ func (w *Worker) evaluateContractExpiry(ctx context.Context, rule Rule, evaluate
 			DueDate:     candidate.DueDate,
 			EvaluatedAt: evaluatedAt,
 		})
+	}
+	if w.LicenseCheck != nil {
+		if err := w.LicenseCheck(ctx); err != nil {
+			return 0, err
+		}
 	}
 	if err := w.store.UpsertAlerts(ctx, alerts); err != nil {
 		return 0, fmt.Errorf("upsert contract expiry alerts: %w", err)

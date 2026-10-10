@@ -49,6 +49,7 @@ func main() {
 		logger.Error("data-analysis startup failed", "error", err)
 		os.Exit(1)
 	}
+	defer app.StopLicense()
 	go func() {
 		logger.Info("dashboard-api listening", "addr", config.ListenAddr)
 		if err := app.Server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

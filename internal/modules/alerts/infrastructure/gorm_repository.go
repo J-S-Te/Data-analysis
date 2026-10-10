@@ -62,10 +62,10 @@ func (repository *GORMRepository) SummaryByTenant(ctx context.Context, tenantID 
 	}
 	summary := domain.Summary{Total: counts.Total, Open: counts.Open, Ack: counts.Ack, Closed: counts.Closed, BySeverity: map[string]int64{}, ByType: map[string]int64{}}
 	var severity []struct {
-		Key   string `gorm:"column:key"`
+		Key   string `gorm:"column:group_value"`
 		Count int64  `gorm:"column:count"`
 	}
-	if err := repository.db.WithContext(ctx).Table("alert_item").Select("severity key, COUNT(*) count").Where("tenant_id = ?", tenantID).Group("severity").Scan(&severity).Error; err != nil {
+	if err := repository.db.WithContext(ctx).Table("alert_item").Select("severity AS group_value, COUNT(*) AS count").Where("tenant_id = ?", tenantID).Group("severity").Scan(&severity).Error; err != nil {
 		return domain.Summary{}, err
 	}
 	for _, row := range severity {
@@ -74,10 +74,10 @@ func (repository *GORMRepository) SummaryByTenant(ctx context.Context, tenantID 
 		}
 	}
 	var types []struct {
-		Key   string `gorm:"column:key"`
+		Key   string `gorm:"column:group_value"`
 		Count int64  `gorm:"column:count"`
 	}
-	if err := repository.db.WithContext(ctx).Table("alert_item").Select("alert_type key, COUNT(*) count").Where("tenant_id = ?", tenantID).Group("alert_type").Scan(&types).Error; err != nil {
+	if err := repository.db.WithContext(ctx).Table("alert_item").Select("alert_type AS group_value, COUNT(*) AS count").Where("tenant_id = ?", tenantID).Group("alert_type").Scan(&types).Error; err != nil {
 		return domain.Summary{}, err
 	}
 	for _, row := range types {

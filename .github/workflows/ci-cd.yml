@@ -22,6 +22,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
+      - run: sh scripts/license-core-sync.sh --check
       - run: go test ./...
       - run: go vet ./...
       - run: python3 scripts/test-deploy-path.py
@@ -73,6 +74,8 @@ jobs:
       - id: dashboard_api
         uses: docker/build-push-action@v6
         with:
+          build-args: |
+            APP_VERSION=${{ github.sha }}
           context: .
           target: dashboard-api
           push: true
@@ -85,6 +88,8 @@ jobs:
       - id: aggregation_worker
         uses: docker/build-push-action@v6
         with:
+          build-args: |
+            APP_VERSION=${{ github.sha }}
           context: .
           target: aggregation-worker
           push: true
@@ -97,6 +102,8 @@ jobs:
       - id: alert_worker
         uses: docker/build-push-action@v6
         with:
+          build-args: |
+            APP_VERSION=${{ github.sha }}
           context: .
           target: alert-worker
           push: true
@@ -109,6 +116,8 @@ jobs:
       - id: production_migrate
         uses: docker/build-push-action@v6
         with:
+          build-args: |
+            APP_VERSION=${{ github.sha }}
           context: .
           target: production-migrate
           push: true

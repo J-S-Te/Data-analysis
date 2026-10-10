@@ -28,11 +28,19 @@ const (
 
 // Runner 是聚合任务执行器，封装聚合库连接与源系统同步配置。
 type Runner struct {
-	aggDB    *gorm.DB
-	sources  map[string]string // subsystem_code -> 只读 DSN
-	tenantID string
+	LicenseCheck func(context.Context) error
+	aggDB        *gorm.DB
+	sources      map[string]string // subsystem_code -> 只读 DSN
+	tenantID     string
 	// effectiveStatuses 为"已生效"合同状态过滤（字典口径待确认；默认空=不过滤）
 	effectiveStatuses []string
+}
+
+func (r *Runner) checkLicense(ctx context.Context) error {
+	if r.LicenseCheck != nil {
+		return r.LicenseCheck(ctx)
+	}
+	return nil
 }
 
 // NewRunner 使用聚合库 DSN、租户和源系统配置初始化 Runner。
@@ -88,7 +96,13 @@ func (SyncJob) TableName() string { return "sync_job" }
 
 // EnsureSyncSources 幂等登记已配置 DSN 的同步源。
 func (r *Runner) EnsureSyncSources(ctx context.Context) error {
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
 	for code := range r.sources {
+		if err := r.checkLicense(ctx); err != nil {
+			return err
+		}
 		var count int64
 		if err := r.aggDB.WithContext(ctx).Model(&SyncSource{}).Where("tenant_id = ? AND subsystem_code = ?", r.tenantID, code).Count(&count).Error; err != nil {
 			return err
@@ -110,9 +124,15 @@ func (r *Runner) EnsureSyncSources(ctx context.Context) error {
 // RunOnce 执行一轮完整同步 + 预计算（PoC V5 主线）。
 // ctx 用于透传取消信号；返回 errors.Join 聚合错误，多源失败时不短路；全部成功返回 nil。
 func (r *Runner) RunOnce(ctx context.Context) error {
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
 	start := time.Now().UTC()
 	var runErrors []error
 	for code, dsn := range r.sources {
+		if err := r.checkLicense(ctx); err != nil {
+			return err
+		}
 		slog.Info("aggregation sync start", "source", code)
 		r.mark(ctx, code, statusRunning, start, nil)
 		var err error
@@ -146,11 +166,17 @@ func (r *Runner) RunOnce(ctx context.Context) error {
 // 通过条件更新抢占任务，多个 Worker 实例不会重复执行同一任务。
 // ctx 用于控制数据库查询与调度循环；返回值仅在查询/更新失败时为非 nil，其余执行失败会进入作业行级失败快照并继续处理后续行。
 func (r *Runner) RunQueued(ctx context.Context) error {
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
 	var jobs []SyncJob
 	if err := r.aggDB.WithContext(ctx).Where("tenant_id = ? AND status = ?", r.tenantID, "QUEUED").Order("requested_at ASC, id ASC").Limit(10).Find(&jobs).Error; err != nil {
 		return err
 	}
 	for _, job := range jobs {
+		if err := r.checkLicense(ctx); err != nil {
+			return err
+		}
 		now := time.Now().UTC()
 		result := r.aggDB.WithContext(ctx).Model(&SyncJob{}).
 			Where("tenant_id = ? AND id = ? AND status = ?", job.TenantID, job.ID, "QUEUED").
@@ -162,6 +188,16 @@ func (r *Runner) RunQueued(ctx context.Context) error {
 			continue
 		}
 		err := r.runSource(ctx, job.SubsystemCode, r.sources[job.SubsystemCode])
+		if err != nil {
+			if denied := r.checkLicense(ctx); denied != nil {
+				// A mid-pass expiry suspends rather than consumes a queued request.
+				// Already committed idempotent batches are replayed after renewal.
+				if restoreErr := r.aggDB.WithContext(ctx).Model(&SyncJob{}).Where("tenant_id = ? AND id = ? AND status = ?", job.TenantID, job.ID, "RUNNING").Updates(map[string]interface{}{"status": "QUEUED", "started_at": nil, "finished_at": nil, "error_message": nil}).Error; restoreErr != nil {
+					return restoreErr
+				}
+				return denied
+			}
+		}
 		finished := time.Now().UTC()
 		updates := map[string]interface{}{"status": "SUCCESS", "finished_at": finished, "error_message": nil, "active_key": nil}
 		if err != nil {
@@ -177,6 +213,9 @@ func (r *Runner) RunQueued(ctx context.Context) error {
 }
 
 func (r *Runner) runSource(ctx context.Context, code, dsn string) error {
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
 	if dsn == "" {
 		return fmt.Errorf("source %s is not configured", code)
 	}
@@ -307,6 +346,9 @@ func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 					if row.CRMCustomerID != nil {
 						crmID = row.CRMCustomerID
 					}
+					if err := r.checkLicense(ctx); err != nil {
+						return err
+					}
 					if err := r.aggDB.Exec(`INSERT INTO dim_contract
 (tenant_id, contract_id, contract_number, title, contract_type, service_type, status, start_date, end_date, crm_customer_id, opportunity_id, amount_minor, currency, owner_user_id, owner_org_id, owner_identity_id, project_id, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -367,6 +409,9 @@ func (r *Runner) syncCRM(ctx context.Context, dsn string) error {
 					end = len(rows)
 				}
 				for _, row := range rows[i:end] {
+					if err := r.checkLicense(ctx); err != nil {
+						return err
+					}
 					if err := r.aggDB.Exec(`INSERT INTO dim_customer
 (tenant_id, customer_id, customer_no, customer_name, customer_type, industry, region, status, owner_user_id, owner_org_id, deleted_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -414,6 +459,9 @@ ON DUPLICATE KEY UPDATE customer_name=VALUES(customer_name), customer_type=VALUE
 					end = len(rows)
 				}
 				for _, row := range rows[i:end] {
+					if err := r.checkLicense(ctx); err != nil {
+						return err
+					}
 					if err := r.aggDB.Exec(`INSERT INTO dim_opportunity
 (tenant_id, opportunity_id, opportunity_no, name, customer_id, type, source, expected_amount, expected_sign_date, owner_user_id, owner_org_id, current_stage, opp_status, contract_ref, lost_reason, stage_changed_at, deleted_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -436,6 +484,9 @@ ON DUPLICATE KEY UPDATE name=VALUES(name), current_stage=VALUES(current_stage), 
 // PrecomputeContractSigning 预计算 fct_contract_signing（字典 1.1/1.2/1.3；转化率字段为占位）。
 // 口径注记：period_month 取 start_date（"生效日"映射待确认）；状态过滤默认全量（EFFECTIVE_STATUSES env 可配）。
 func (r *Runner) PrecomputeContractSigning(ctx context.Context) error {
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
 	statusFilter := ""
 	args := []interface{}{dictVersion}
 	if len(r.effectiveStatuses) > 0 {
@@ -468,6 +519,9 @@ LEFT JOIN dim_customer cu ON cu.tenant_id = c.tenant_id AND cu.customer_id = c.c
 WHERE c.start_date IS NOT NULL` + statusFilter + `
 GROUP BY c.tenant_id, period_month, region, customer_category, c.owner_user_id
 ON DUPLICATE KEY UPDATE sign_amount_minor=VALUES(sign_amount_minor), contract_count=VALUES(contract_count)`
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
 	if err := r.aggDB.Exec(query, args...).Error; err != nil {
 		return err
 	}
