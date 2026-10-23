@@ -1,5 +1,5 @@
-// Package application implements dashboard query use cases. Its repository is
-// a port owned by this module rather than a cross-subsystem shared abstraction.
+// Package application 实现看板查询用例。仓储是
+// 本模块拥有的端口，不是跨子系统共享抽象。
 package application
 
 import (
@@ -9,19 +9,19 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard/domain"
 )
 
-// ErrInvalidProjectSnapshot identifies a persisted project snapshot whose
-// status-count payload cannot be interpreted. HTTP adapters keep the existing
-// public error code for this condition without depending on GORM details.
+// ErrInvalidProjectSnapshot 标识状态计数载荷无法
+// 解释的持久化项目快照。HTTP 适配器保留该情况的
+// 既有公开错误码，无需依赖 GORM 细节。
 var ErrInvalidProjectSnapshot = errors.New("invalid project dashboard snapshot")
 
-// SnapshotRepository reads tenant-scoped dashboard aggregates.
+// SnapshotRepository 读取租户范围内的看板聚合。
 type SnapshotRepository interface {
 	LatestContract(context.Context, string) (domain.ContractSnapshot, bool, error)
 	LatestProject(context.Context, string) (domain.ProjectSnapshot, bool, error)
 }
 
-// Service coordinates dashboard read use cases without knowing the transport
-// protocol or storage technology.
+// Service 协调看板读取用例，无需了解传输
+// 协议或存储技术。
 type Service struct{ snapshots SnapshotRepository }
 
 type advancedRepository interface {
@@ -45,11 +45,11 @@ func normalizeContractDetailPagination(page, pageSize int) (int, int) {
 	return page, pageSize
 }
 
-// NewService constructs the dashboard application service.
+// NewService 构造看板应用服务。
 func NewService(snapshots SnapshotRepository) *Service { return &Service{snapshots: snapshots} }
 
-// Contract returns the latest tenant contract aggregate. The returned snapshot
-// is intentionally empty-but-valid when aggregation has not run yet.
+// Contract 返回租户最新合同聚合。尚未运行聚合时，返回的快照
+// 有意为空，但仍有效。
 func (service *Service) Contract(ctx context.Context, tenantID string) (domain.ContractSnapshot, error) {
 	snapshot, available, err := service.snapshots.LatestContract(ctx, tenantID)
 	if err != nil {
@@ -63,8 +63,8 @@ func (service *Service) Contract(ctx context.Context, tenantID string) (domain.C
 	return snapshot, nil
 }
 
-// Project returns the latest tenant project aggregate. The returned snapshot
-// is intentionally empty-but-valid when aggregation has not run yet.
+// Project 返回租户最新项目聚合。尚未运行聚合时，返回的快照
+// 有意为空，但仍有效。
 func (service *Service) Project(ctx context.Context, tenantID string) (domain.ProjectSnapshot, error) {
 	snapshot, available, err := service.snapshots.LatestProject(ctx, tenantID)
 	if err != nil {
@@ -94,5 +94,14 @@ func (service *Service) Trend(ctx context.Context, tenantID string, months int) 
 	if !ok {
 		return nil, errors.New("dashboard trend repository is not configured")
 	}
-	return repository.ListTrend(ctx, tenantID, months)
+	points, err := repository.ListTrend(ctx, tenantID, months)
+	if err != nil {
+		return nil, err
+	}
+	// 契约：趋势接口永远返回数组。无数据时返回 []，否则 JSON 会变成 null，
+	// 前端会把"暂无数据"误判为"趋势加载失败"。
+	if points == nil {
+		points = []domain.TrendPoint{}
+	}
+	return points, nil
 }

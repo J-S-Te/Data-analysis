@@ -20,7 +20,10 @@ type Event struct {
 	ActorID, ActorName, Action, ResourceType, ResourceID string
 	RequestID, CorrelationID, Result, ReasonCode         string
 	// RiskLevel 为 LOW/MEDIUM/HIGH/CRITICAL；为空时按 LOW 上报。
-	RiskLevel   string
+	RiskLevel string
+	// 统一审计来源协议（AUD-IP-2026）：登录地址、操作地址与来源标记分开上报。
+	LoginIP, ClientIP, IPSource string
+	// UserLoginIP 是旧协议字段，继续按"登录地址"语义上报以兼容滚动升级。
 	UserLoginIP string
 }
 
@@ -79,8 +82,19 @@ func (c *client) Report(ctx context.Context, event Event) error {
 	if event.ReasonCode != "" {
 		payload["reason_code"] = event.ReasonCode
 	}
-	if event.UserLoginIP != "" {
-		payload["user_login_ip"] = event.UserLoginIP
+	loginIP := event.LoginIP
+	if loginIP == "" {
+		loginIP = event.UserLoginIP
+	}
+	if loginIP != "" {
+		payload["login_ip"] = loginIP
+		payload["user_login_ip"] = loginIP
+	}
+	if event.ClientIP != "" {
+		payload["client_ip"] = event.ClientIP
+	}
+	if event.IPSource != "" {
+		payload["ip_source"] = event.IPSource
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

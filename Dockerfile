@@ -1,5 +1,5 @@
 # 单 Dockerfile 多二进制（对齐 customer_and_opportunity/Dockerfile）
-FROM golang:1.25.4-alpine AS builder
+FROM golang:1.25.4-alpine@sha256:d3f0cf7723f3429e3f9ed846243970b20a2de7bae6a5b66fc5914e228d831bbb AS builder
 
 ARG GOPROXY=https://goproxy.cn|https://proxy.golang.org|direct
 ARG GOSUMDB=sum.golang.google.cn
@@ -27,11 +27,11 @@ COPY migrations/ ./migrations/
 RUN set -eu; \
     for command in \
       dashboard-api aggregation-worker alert-worker authz-catalog \
-      local-migrate production-migrate; do \
+      local-migrate production-migrate sync-job-recover-legacy; do \
       CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o "/out/${command}" "./cmd/${command}"; \
     done
 
-FROM alpine:3.21 AS runtime-base
+FROM alpine:3.21@sha256:bbfcd601d7cd20d35bb0b8b866ad1a8a0d107ca3e1c20870c75c5ce2c1186d30 AS runtime-base
 ARG APP_VERSION
 LABEL org.opencontainers.image.version=${APP_VERSION} com.basic-platform.license.protocol="1"
 
@@ -65,4 +65,5 @@ COPY --from=builder /out/production-migrate /app/production-migrate
 # 发布脚本从本镜像读取内嵌授权目录哈希并原子写回运行配置；
 # 携带 print 工具避免为读取哈希额外构建与分发第五个镜像。
 COPY --from=builder /out/authz-catalog /app/authz-catalog
+COPY --from=builder /out/sync-job-recover-legacy /app/sync-job-recover-legacy
 ENTRYPOINT ["/app/production-migrate"]

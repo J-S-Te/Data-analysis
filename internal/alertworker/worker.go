@@ -27,10 +27,11 @@ type Rule struct {
 
 // ContractExpiryCandidate 是从 dim_contract 筛出的合同到期候选项。
 type ContractExpiryCandidate struct {
-	TenantID  string
-	TargetRef string
-	Title     string
-	DueDate   time.Time
+	TenantID   string
+	OwnerOrgID string
+	TargetRef  string
+	Title      string
+	DueDate    time.Time
 }
 
 // Alert 是写入 alert_item 的标准化预警快照。
@@ -40,6 +41,7 @@ type Alert struct {
 	AlertType   string
 	RuleCode    string
 	Severity    string
+	OwnerOrgID  string
 	TargetRef   string
 	Title       string
 	DueDate     time.Time
@@ -116,6 +118,7 @@ func (w *Worker) evaluateContractExpiry(ctx context.Context, rule Rule, evaluate
 			AlertType:   RuleContractExpiry,
 			RuleCode:    rule.Code,
 			Severity:    normalizedSeverity(rule.Severity),
+			OwnerOrgID:  candidate.OwnerOrgID,
 			TargetRef:   candidate.TargetRef,
 			Title:       candidate.Title,
 			DueDate:     candidate.DueDate,

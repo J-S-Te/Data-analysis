@@ -12,7 +12,7 @@ func TestSnapshotJSONUsesAPIFieldNames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal contract snapshot: %v", err)
 	}
-	if got := string(contract); got != `{"available":true,"tenant_id":"tenant-1","snapshot_at":"","total_amount_minor":0,"total_contracts":2,"approval_contracts":0,"active_contracts":0,"expired_contracts":0,"opportunity_count":0,"won_contract_count":0,"discount_buckets":null}` {
+	if got := string(contract); got != `{"available":true,"tenant_id":"tenant-1","snapshot_at":"","freshness":{"source_updated_at":"","synced_at":"","computed_at":"","sync_status":"","stale":false,"stale_reason":""},"total_amount_minor":0,"currency_totals":null,"total_contracts":2,"approval_contracts":0,"active_contracts":0,"expired_contracts":0,"opportunity_count":0,"won_contract_count":0,"conversion_available":false,"conversion_basis":"","discount_available":false,"discount_unavailable_reason":"","discount_buckets":null}` {
 		t.Fatalf("unexpected contract JSON: %s", got)
 	}
 
@@ -20,7 +20,7 @@ func TestSnapshotJSONUsesAPIFieldNames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal project snapshot: %v", err)
 	}
-	if got := string(project); got != `{"available":true,"tenant_id":"","snapshot_at":"","project_count":3,"in_flight_projects":0,"risk_projects":0,"service_items":0,"status_counts":{"ACTIVE":3}}` {
+	if got := string(project); got != `{"available":true,"tenant_id":"","snapshot_at":"","freshness":{"source_updated_at":"","synced_at":"","computed_at":"","sync_status":"","stale":false,"stale_reason":""},"project_count":3,"in_flight_projects":0,"risk_projects":0,"service_items":0,"status_counts":{"ACTIVE":3}}` {
 		t.Fatalf("unexpected project JSON: %s", got)
 	}
 }

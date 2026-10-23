@@ -1,6 +1,7 @@
 package application
 
 import (
+	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -103,7 +104,7 @@ func builtinMetrics() []domain.Metric {
 func derived(m domain.Metric) domain.Metric {
 	m.CalculationBinding = ""
 	m.CanEnable = false
-	// Project status counts are supplied by the native project snapshot reader.
+	// 项目状态计数由原生项目快照读取器提供。
 	if m.Origin == "BUILTIN" && m.Code == "2.1" && m.Status == "已确认" {
 		for _, b := range publishedMetrics {
 			if b.Code == m.Code && sameCalculation(m, b) {
@@ -290,7 +291,19 @@ func (s *CatalogService) Create(ctx context.Context, tenant, actor string, m dom
 		return m, e
 	}
 	var out domain.Metric
-	e := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error { var e error; out, e = s.create(tx, tenant, actor, m); return e })
+	e := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var e error
+		out, e = s.create(tx, tenant, actor, m)
+		if e != nil {
+			return e
+		}
+		// AUD-IP-2026 / 批次 2：指标字典变更与审计事件同事务落库，
+		// 平台不可用时由投递器重试，不再"业务已提交、审计同步失败返 503"。
+		return auditoutbox.Append(tx, auditoutbox.Entry{
+			TenantID: tenant, ActorID: actor, Action: "DATA_ANALYSIS:METRIC_CREATE",
+			ResourceType: "metric", ResourceID: out.Code, Result: "SUCCESS",
+		})
+	})
 	return out, e
 }
 func (s *CatalogService) update(tx *gorm.DB, tenant, actor, code string, m domain.Metric) (domain.Metric, error) {
@@ -324,7 +337,17 @@ func (s *CatalogService) Update(ctx context.Context, tenant, actor, code string,
 		return m, e
 	}
 	var out domain.Metric
-	e := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error { var e error; out, e = s.update(tx, tenant, actor, code, m); return e })
+	e := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var e error
+		out, e = s.update(tx, tenant, actor, code, m)
+		if e != nil {
+			return e
+		}
+		return auditoutbox.Append(tx, auditoutbox.Entry{
+			TenantID: tenant, ActorID: actor, Action: "DATA_ANALYSIS:METRIC_UPDATE",
+			ResourceType: "metric", ResourceID: code, Result: "SUCCESS",
+		})
+	})
 	return out, e
 }
 func (s *CatalogService) SetEnabled(ctx context.Context, tenant, actor, code string, enabled bool, version uint64) (domain.Metric, error) {
@@ -419,7 +442,7 @@ func (s *CatalogService) History(ctx context.Context, tenant, code string) ([]do
 	return out, nil
 }
 
-// Compatibility bulk writes are atomic upserts, never an implicit delete.
+// 兼容批量写入采用原子 upsert，绝不隐式删除。
 func (s *CatalogService) SaveTenantMetrics(ctx context.Context, tenant, actor string, metrics []domain.Metric) error {
 	if e := s.ready(tenant); e != nil {
 		return e

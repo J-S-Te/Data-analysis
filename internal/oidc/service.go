@@ -130,7 +130,7 @@ func NewService(ctx context.Context, db *gorm.DB, options Options) (*Service, er
 	}, nil
 }
 
-// idTokenClaims 平台 ID Token 携带的声明（对齐 contract：OIDC 只认证身份，
+// idTokenClaims 平台 ID 令牌 携带的声明（对齐 contract：OIDC 只认证身份，
 // 角色/权限/数据范围由平台 authorization-context 在线解析，不读 token claims）。
 type idTokenClaims struct {
 	Sub               string `json:"sub"`
@@ -142,21 +142,29 @@ type idTokenClaims struct {
 }
 
 // AuthorizationContext 平台授权上下文响应（对齐 contract authorization_context.go）。
+type DataScope struct {
+	RoleCode        string `json:"role_code"`
+	ScopeType       string `json:"scope_type"`
+	ScopeID         string `json:"scope_id"`
+	EnvironmentCode string `json:"environment_code"`
+}
+
 type AuthorizationContext struct {
-	Subject                    string   `json:"sub"`
-	SubjectID                  string   `json:"subject_id"`
-	IdentityID                 string   `json:"identity_id"`
-	TenantID                   string   `json:"tenant_id"`
-	ClientID                   string   `json:"client_id"`
-	ApplicationCode            string   `json:"application_code"`
-	EnvironmentCode            string   `json:"environment_code"`
-	Roles                      []string `json:"roles"`
-	Permissions                []string `json:"permissions"`
-	CatalogVersion             string   `json:"catalog_version"`
-	CompatibleCatalogVersions  []string `json:"compatible_catalog_versions"`
-	RoleConfigHash             string   `json:"role_config_hash"`
-	CompatibleRoleConfigHashes []string `json:"compatible_role_config_hashes"`
-	AuthorizationRevision      uint64   `json:"authorization_revision"`
+	Subject                    string      `json:"sub"`
+	SubjectID                  string      `json:"subject_id"`
+	IdentityID                 string      `json:"identity_id"`
+	TenantID                   string      `json:"tenant_id"`
+	ClientID                   string      `json:"client_id"`
+	ApplicationCode            string      `json:"application_code"`
+	EnvironmentCode            string      `json:"environment_code"`
+	Roles                      []string    `json:"roles"`
+	Permissions                []string    `json:"permissions"`
+	CatalogVersion             string      `json:"catalog_version"`
+	CompatibleCatalogVersions  []string    `json:"compatible_catalog_versions"`
+	RoleConfigHash             string      `json:"role_config_hash"`
+	CompatibleRoleConfigHashes []string    `json:"compatible_role_config_hashes"`
+	AuthorizationRevision      uint64      `json:"authorization_revision"`
+	DataScopes                 []DataScope `json:"data_scopes"`
 }
 
 // AuthorizationURL 生成 Keycloak 授权地址（Authorization Code + PKCE S256）。
@@ -165,7 +173,7 @@ func (s *Service) AuthorizationURL(state string, nonce string, codeVerifier stri
 	return s.config.AuthCodeURL(state, oauth2.S256ChallengeOption(codeVerifier), nonceParam)
 }
 
-// ExchangeAndCreateSession 校验回调 code，验证 ID Token，创建服务端会话，返回会话 token 与展示信息。
+// ExchangeAndCreateSession 校验回调 code，验证 ID 令牌，创建服务端会话，返回会话 token 与展示信息。
 func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, codeVerifier string, expectedNonce string, transaction LoginTransaction) (sessionToken string, session Session, err error) {
 	ctx = context.WithValue(ctx, oauth2.HTTPClient, s.httpClient)
 	rawToken, err := s.config.Exchange(ctx, code, oauth2.VerifierOption(codeVerifier))
@@ -206,6 +214,7 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 	}
 	rolesJSON, _ := json.Marshal(authz.Roles)
 	permissionsJSON, _ := json.Marshal(authz.Permissions)
+	dataScopesJSON, _ := json.Marshal(authz.DataScopes)
 	now := time.Now().UTC()
 	sessionToken, err = randomToken(32)
 	if err != nil {
@@ -218,6 +227,7 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 		DisplayName:            claims.Name,
 		RolesJSON:              string(rolesJSON),
 		PermissionsJSON:        string(permissionsJSON),
+		DataScopesJSON:         string(dataScopesJSON),
 		RoleConfigHash:         "",
 		AuthzRevision:          authz.AuthorizationRevision,
 		AccessTokenCipher:      accessTokenCipher,
@@ -295,7 +305,7 @@ func (s *Service) Authenticate(ctx context.Context, cookieValue string) (auth.Pr
 	}
 	if time.Since(session.AuthorizationCheckedAt) > s.checkEvery {
 		// 定期调平台授权上下文在线复核：角色/权限变更后旧会话自动刷新（接入手册 §3.3）。
-		// 复核失败必须 fail-closed，否则已撤销的权限会在旧会话中继续生效。
+		// 复核失败必须 失败时安全拒绝，否则已撤销的权限会在旧会话中继续生效。
 		now := time.Now().UTC()
 		accessToken, decryptErr := s.codec.decrypt(session.AccessTokenCipher)
 		if decryptErr != nil {
@@ -313,9 +323,11 @@ func (s *Service) Authenticate(ctx context.Context, cookieValue string) (auth.Pr
 		}
 		rolesJSON, _ := json.Marshal(authz.Roles)
 		permissionsJSON, _ := json.Marshal(authz.Permissions)
+		dataScopesJSON, _ := json.Marshal(authz.DataScopes)
 		if updateErr := s.db.Model(&Session{}).Where("session_id_hash = ?", session.SessionIDHash).
 			Updates(map[string]interface{}{
 				"roles_json": string(rolesJSON), "permissions_json": string(permissionsJSON),
+				"data_scopes_json":         string(dataScopesJSON),
 				"authz_revision":           authz.AuthorizationRevision,
 				"authorization_checked_at": now, "last_seen_at": now,
 			}).Error; updateErr != nil {
@@ -323,19 +335,24 @@ func (s *Service) Authenticate(ctx context.Context, cookieValue string) (auth.Pr
 		}
 		session.RolesJSON = string(rolesJSON)
 		session.PermissionsJSON = string(permissionsJSON)
+		session.DataScopesJSON = string(dataScopesJSON)
 		session.AuthzRevision = authz.AuthorizationRevision
 		session.AuthorizationCheckedAt = now
 		session.LastSeenAt = now
 	}
+	scopeMode, organizationIDs, teamIDs := principalScope(session.DataScopes(), session.Roles())
 	return auth.Principal{
-		UserID:         session.PlatformUserID,
-		TenantID:       session.TenantID,
-		DisplayName:    session.DisplayName,
-		Roles:          session.Roles(),
-		Permissions:    session.Permissions(),
-		RoleConfigHash: session.RoleConfigHash,
-		AuthzRevision:  session.AuthzRevision,
-		ExpiresAt:      session.ExpiresAt.Unix(),
+		UserID:          session.PlatformUserID,
+		TenantID:        session.TenantID,
+		DisplayName:     session.DisplayName,
+		Roles:           session.Roles(),
+		Permissions:     session.Permissions(),
+		ScopeMode:       scopeMode,
+		OrganizationIDs: organizationIDs,
+		TeamIDs:         teamIDs,
+		RoleConfigHash:  session.RoleConfigHash,
+		AuthzRevision:   session.AuthzRevision,
+		ExpiresAt:       session.ExpiresAt.Unix(),
 	}, nil
 }
 

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -40,13 +41,20 @@ type MachineCredential struct {
 	Scope        string
 }
 
+type contractCurrencyTotal struct {
+	Currency    string `json:"currency"`
+	AmountMinor int64  `json:"amount_minor"`
+	Contracts   int64  `json:"contracts"`
+}
+
 type apiContractDashboard struct {
-	TenantID          string `json:"tenant_id"`
-	TotalAmountMinor  int64  `json:"total_amount_minor"`
-	TotalContracts    int64  `json:"total_contracts"`
-	ApprovalContracts int64  `json:"approval_contracts"`
-	ActiveContracts   int64  `json:"active_contracts"`
-	ExpiredContracts  int64  `json:"expired_contracts"`
+	TenantID          string                  `json:"tenant_id"`
+	TotalAmountMinor  int64                   `json:"total_amount_minor"`
+	CurrencyTotals    []contractCurrencyTotal `json:"currency_totals"`
+	TotalContracts    int64                   `json:"total_contracts"`
+	ApprovalContracts int64                   `json:"approval_contracts"`
+	ActiveContracts   int64                   `json:"active_contracts"`
+	ExpiredContracts  int64                   `json:"expired_contracts"`
 }
 
 // contractDashboardSnapshot 表示经机器接口租户校验后待持久化的合同看板快照。
@@ -55,6 +63,7 @@ type contractDashboardSnapshot struct {
 	TenantID          string
 	SnapshotAt        time.Time
 	TotalAmountMinor  int64
+	CurrencyTotals    []contractCurrencyTotal
 	TotalContracts    int64
 	ApprovalContracts int64
 	ActiveContracts   int64
@@ -65,9 +74,11 @@ type contractSnapshotSink func(context.Context, contractDashboardSnapshot) error
 
 // APISyncRunner 接口同步执行器（写入聚合库快照表，供 Metabase 渲染）。
 type APISyncRunner struct {
-	db      *gorm.DB
-	options APISyncOptions
-	tokens  map[string]cachedMachineToken
+	tokenInit sync.Once
+	tokenGate chan struct{}
+	db        *gorm.DB
+	options   APISyncOptions
+	tokens    map[string]cachedMachineToken
 }
 
 func (r *APISyncRunner) checkLicense(ctx context.Context) error {
@@ -98,6 +109,22 @@ func NewAPISyncRunner(db *gorm.DB, options APISyncOptions) *APISyncRunner {
 // 2）HTTP 请求失败、状态码非 200 或返回体解析失败都会返回错误；
 // 3）成功时返回可复用的 token 并更新本地过期时间。
 func (r *APISyncRunner) machineToken(ctx context.Context, credential MachineCredential) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	// Initialization is memory-only; the gate covers both refresh and map access.
+	// Waiting for an in-flight refresh must obey each caller's own deadline.
+	r.tokenInit.Do(func() { r.tokenGate = make(chan struct{}, 1) })
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case r.tokenGate <- struct{}{}:
+	}
+	defer func() { <-r.tokenGate }()
+	// Both select cases can be ready when cancellation races with gate release.
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := r.checkLicense(ctx); err != nil {
 		return "", err
 	}
@@ -153,10 +180,10 @@ type machineAccessTokenClaims struct {
 	Audience        json.RawMessage `json:"aud"`
 }
 
-// validateMachineTokenContract performs an early configuration-contract check
-// on the token obtained directly from Keycloak. This is diagnostic only; the
-// contract/project APIs remain responsible for cryptographic verification via
-// OIDC discovery/JWKS before accepting the request.
+// validateMachineTokenContract 对直接从 Keycloak 获取的令牌
+// 执行提前配置契约检查，仅用于诊断；
+// 合同和项目 API 仍须在接受请求前通过
+// OIDC 发现及 JWKS 完成密码学校验。
 func validateMachineTokenContract(rawToken string, options APISyncOptions, credential MachineCredential) error {
 	parts := strings.Split(rawToken, ".")
 	if len(parts) != 3 {
@@ -290,6 +317,7 @@ func (r *APISyncRunner) syncContractDashboard(ctx context.Context, sink contract
 		TenantID:          tenantID,
 		SnapshotAt:        time.Now().UTC(),
 		TotalAmountMinor:  envelope.Data.TotalAmountMinor,
+		CurrencyTotals:    envelope.Data.CurrencyTotals,
 		TotalContracts:    envelope.Data.TotalContracts,
 		ApprovalContracts: envelope.Data.ApprovalContracts,
 		ActiveContracts:   envelope.Data.ActiveContracts,
@@ -305,10 +333,14 @@ func (r *APISyncRunner) persistContractDashboard(ctx context.Context, snapshot c
 		return errors.New("aggregation database is not configured")
 	}
 	// 数据库写入失败时返回错误给上层，由调用方统一进行同步重试与告警。
+	currencyTotals, err := json.Marshal(snapshot.CurrencyTotals)
+	if err != nil {
+		return err
+	}
 	if err := r.db.Exec(`INSERT INTO api_contract_dashboard
-(tenant_id, snapshot_at, total_amount_minor, total_contracts, approval_contracts, active_contracts, expired_contracts, source)
-VALUES (?, ?, ?, ?, ?, ?, ?, 'contract-api')`,
-		snapshot.TenantID, snapshot.SnapshotAt, snapshot.TotalAmountMinor, snapshot.TotalContracts,
+(tenant_id, snapshot_at, total_amount_minor, currency_totals_json, total_contracts, approval_contracts, active_contracts, expired_contracts, source)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'contract-api')`,
+		snapshot.TenantID, snapshot.SnapshotAt, snapshot.TotalAmountMinor, string(currencyTotals), snapshot.TotalContracts,
 		snapshot.ApprovalContracts, snapshot.ActiveContracts, snapshot.ExpiredContracts).Error; err != nil {
 		return err
 	}
@@ -379,9 +411,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 'project-api')`,
 	return nil
 }
 
-// errorResponseBody returns a short, control-character-free excerpt of an
-// upstream error body for diagnostics. It deliberately does not echo the full
-// response into logs, avoiding accidental exposure of sensitive upstream content.
+// errorResponseBody 返回上游错误体的简短、无控制字符
+// 片段供诊断。有意不将完整响应
+// 回显到日志，避免意外暴露上游敏感内容。
 func errorResponseBody(reader io.Reader) string {
 	raw, _ := io.ReadAll(io.LimitReader(reader, 256))
 	return strings.TrimSpace(strings.Map(func(ch rune) rune {
@@ -393,3 +425,103 @@ func errorResponseBody(reader io.Reader) string {
 }
 
 var _ = bytes.MinRead
+
+type projectProjectionSink struct {
+	runner  *Runner
+	attempt ProjectionAttempt
+}
+
+func (s projectProjectionSink) Stage(ctx context.Context, rows []ProjectProjection) error {
+	if err := s.runner.stageProjectProjection(ctx, s.attempt, rows); err != nil {
+		return projectStagingError{err}
+	}
+	return nil
+}
+
+type projectStagingError struct{ cause error }
+
+func (e projectStagingError) Error() string { return "project staging failed" }
+func (e projectStagingError) Unwrap() error { return e.cause }
+
+// ValidateProjectProjectionOptions validates explicit limits at process startup.
+func ValidateProjectProjectionOptions(options ProjectProjectionOptions) error {
+	if _, err := options.normalized(); err != nil {
+		return err
+	}
+	if options.URL != "" {
+		parsed, err := url.Parse(options.URL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+			return errors.New("invalid project projection URL")
+		}
+	}
+	return nil
+}
+
+func (r *Runner) syncProjectProjection(parent context.Context) (result error) {
+	if err := ValidateProjectProjectionOptions(r.ProjectProjection); err != nil {
+		return err
+	}
+	options, err := r.ProjectProjection.normalized()
+	if err != nil {
+		return err
+	}
+	if r.ProjectAPI == nil || r.ProjectAPI.options.TenantID != r.tenantID {
+		return errors.New("project machine API tenant configuration mismatch")
+	}
+	ctx, cancel := context.WithTimeout(parent, options.HTTPTimeout)
+	defer cancel()
+	attempt, err := r.beginProjectProjection(ctx)
+	if err != nil {
+		return err
+	}
+	errorCode := "SOURCE_UNAVAILABLE"
+	defer func() {
+		if result == nil {
+			return
+		}
+		var stagingErr projectStagingError
+		if errors.As(result, &stagingErr) {
+			errorCode = "STAGING_FAILED"
+		}
+		if errors.Is(result, context.Canceled) {
+			errorCode = "CANCELED"
+		}
+		if errors.Is(result, context.DeadlineExceeded) {
+			errorCode = "SOURCE_TIMEOUT"
+		}
+		// Retain lease identity, but allow a small bounded failure transaction after
+		// cancellation. aggregationWrite still fences lease, generation and license.
+		failureCtx, stop := context.WithTimeout(context.WithoutCancel(parent), 3*time.Second)
+		defer stop()
+		result = errors.Join(result, r.failProjectProjection(failureCtx, attempt, errorCode))
+	}()
+	if err = r.checkLicense(ctx); err != nil {
+		return err
+	}
+	token, err := r.ProjectAPI.machineToken(ctx, r.ProjectAPI.options.ProjectCredential)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, options.URL, nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Accept", "application/x-ndjson")
+	client := &http.Client{Timeout: options.HTTPTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("project snapshot returned HTTP %d", response.StatusCode)
+	}
+	errorCode = "INVALID_STREAM"
+	summary, err := readProjectSnapshot(ctx, response.Body, r.tenantID, options, projectProjectionSink{r, attempt})
+	if err != nil {
+		return err
+	}
+	errorCode = "PUBLISH_FAILED"
+	return r.publishProjectProjection(ctx, attempt, summary)
+}

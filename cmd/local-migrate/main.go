@@ -1,5 +1,5 @@
-// Command local-migrate applies the embedded data_analysis schema history to a
-// local or integration MySQL database.
+// Command local-migrate 将嵌入的 data_analysis 数据库历史应用到
+// 本地或集成 MySQL 数据库。
 package main
 
 import (

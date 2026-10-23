@@ -12,6 +12,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 
+	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/embedbridge"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/middleware"
@@ -68,6 +69,15 @@ func New(config Config) (*App, error) {
 		return nil, err
 	}
 	auditReporter := platformaudit.NewReporter(config.PlatformBaseURL, config.AuditClientID, config.AuditClientSecret, config.AuditApplicationCode, config.AuditEnvironmentCode)
+	// 批次 2：事务内审计 outbox 的投递循环；平台不可用时事件留在本地重试。
+	if auditReporter != nil {
+		auditDispatcher := &auditoutbox.Dispatcher{
+			Store:    &auditoutbox.GORMStore{DB: db, Lease: 2 * time.Minute, MaxTries: 20},
+			Reporter: auditReporter, WorkerID: "data-analysis-api-audit", Poll: 2 * time.Second,
+			BatchSize: 50, MaxAttempts: 20, MaxBackoff: 5 * time.Minute, Logger: slog.Default(),
+		}
+		go auditDispatcher.Run(ctx)
+	}
 	authService, err := oidc.NewService(ctx, db, oidc.Options{
 		Issuer:                  config.OIDCIssuer,
 		BackchannelIssuer:       config.OIDCBackchannel,
@@ -173,6 +183,8 @@ func New(config Config) (*App, error) {
 	dashboardHandler := dashboardhttp.NewHandler(dashboardapplication.NewService(dashboardinfrastructure.NewGORMRepository(db)))
 	api.GET("/dashboard/contract", middleware.RequirePermission("dashboard.contract.view"), dashboardHandler.Contract)
 	api.GET("/dashboard/project", middleware.RequirePermission("dashboard.project.view"), dashboardHandler.Project)
+	api.GET("/dashboard/report", middleware.RequirePermission("dashboard.report.view"), dashboardHandler.Business("report"))
+	api.GET("/dashboard/finance", middleware.RequirePermission("dashboard.finance.view"), dashboardHandler.Business("finance"))
 	api.GET("/dashboard/contracts", middleware.RequirePermission("dashboard.contract.view"), dashboardHandler.Contracts)
 	api.GET("/dashboard/trend", middleware.RequirePermission("dashboard.overview.view"), dashboardHandler.Trend)
 	api.GET("/admin/sources", middleware.RequirePermission("aggregation.manage"), adminHandler.ListSources)

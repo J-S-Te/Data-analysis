@@ -90,6 +90,8 @@ func TestHTTPPrincipalOwnsTenantAndActor(t *testing.T) {
 	for _, ddl := range []string{
 		`CREATE TABLE metric_definition (id TEXT PRIMARY KEY,tenant_id TEXT,code TEXT,name TEXT,dashboard TEXT,definition TEXT,formula TEXT,source TEXT,period TEXT,status TEXT,version INTEGER,origin TEXT,enabled INTEGER,updated_by TEXT,created_at DATETIME,updated_at DATETIME,deleted_at DATETIME,UNIQUE(tenant_id,code))`,
 		`CREATE TABLE metric_definition_version (id TEXT PRIMARY KEY,tenant_id TEXT,metric_id TEXT,version INTEGER,metric_snapshot TEXT,operation TEXT,actor_id TEXT,created_at DATETIME,UNIQUE(tenant_id,metric_id,version))`,
+		// AUD-IP-2026：业务写与审计同事务，测试库需有同名 outbox 表。
+		`CREATE TABLE bi_audit_outbox (id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,event_id TEXT NOT NULL,actor_id TEXT,action TEXT NOT NULL,resource_type TEXT NOT NULL,resource_id TEXT NOT NULL,login_ip BLOB,client_ip BLOB,ip_source TEXT NOT NULL DEFAULT 'UNKNOWN',result TEXT NOT NULL DEFAULT 'SUCCESS',delivery_status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,next_attempt_at DATETIME NOT NULL,locked_at DATETIME,delivered_at DATETIME,last_error TEXT,created_at DATETIME NOT NULL)`,
 	} {
 		if e = db.Exec(ddl).Error; e != nil {
 			t.Fatal(e)

@@ -70,7 +70,7 @@ func (s *GormStore) FindContractExpiryCandidates(
 	var candidates []ContractExpiryCandidate
 	err := s.db.WithContext(ctx).
 		Table("dim_contract").
-		Select(`tenant_id, contract_id AS target_ref,
+		Select(`tenant_id, owner_org_id, contract_id AS target_ref,
 CONCAT('合同「', title, '」将在 ', DATE_FORMAT(end_date, '%Y-%m-%d'), ' 到期') AS title,
 end_date AS due_date`).
 		Where("end_date IS NOT NULL").
@@ -131,11 +131,12 @@ func (s *GormStore) UpsertAlerts(ctx context.Context, alerts []Alert) error {
 				continue
 			}
 			if err := tx.Exec(`INSERT INTO alert_item
-(id, tenant_id, alert_type, rule_code, severity, target_ref, title, due_date, status, closed_at, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', NULL, ?, ?)
+(id, tenant_id, alert_type, rule_code, severity, owner_org_id, target_ref, title, due_date, status, closed_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', NULL, ?, ?)
 ON DUPLICATE KEY UPDATE
 rule_code = VALUES(rule_code),
 severity = VALUES(severity),
+owner_org_id = VALUES(owner_org_id),
 title = VALUES(title),
 due_date = VALUES(due_date),
 updated_at = VALUES(updated_at)`,
@@ -144,6 +145,7 @@ updated_at = VALUES(updated_at)`,
 				alert.AlertType,
 				alert.RuleCode,
 				alert.Severity,
+				alert.OwnerOrgID,
 				alert.TargetRef,
 				alert.Title,
 				alert.DueDate,

@@ -23,6 +23,16 @@ func testDB(t *testing.T) *gorm.DB {
 	if e != nil {
 		t.Fatal(e)
 	}
+	// 事务内审计 outbox（AUD-IP-2026）：业务写与审计同事务，测试库需有同名表。
+	if e = db.Exec(`CREATE TABLE IF NOT EXISTS bi_audit_outbox (
+		id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, event_id TEXT NOT NULL,
+		actor_id TEXT, action TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL,
+		login_ip BLOB, client_ip BLOB, ip_source TEXT NOT NULL DEFAULT 'UNKNOWN',
+		result TEXT NOT NULL DEFAULT 'SUCCESS', delivery_status TEXT NOT NULL DEFAULT 'pending',
+		attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at DATETIME NOT NULL, locked_at DATETIME,
+		delivered_at DATETIME, last_error TEXT, created_at DATETIME NOT NULL)`).Error; e != nil {
+		t.Fatal(e)
+	}
 	if e = db.AutoMigrate(&metricRow{}, &versionRow{}, &referenceRow{}); e != nil {
 		t.Fatal(e)
 	}

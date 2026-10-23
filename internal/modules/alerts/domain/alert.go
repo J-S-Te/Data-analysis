@@ -1,8 +1,8 @@
-// Package domain contains alert business values owned by the data-analysis
-// alert module. It has no transport or persistence dependency.
+// Package domain 包含数据分析告警模块拥有的
+// 业务值，不依赖传输或持久化。
 package domain
 
-// Item describes one tenant-scoped operational alert.
+// Item 描述一条租户范围内运维告警。
 type Item struct {
 	ID        string  `json:"id"`
 	TenantID  string  `json:"tenant_id"`

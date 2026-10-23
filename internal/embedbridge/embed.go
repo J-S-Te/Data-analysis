@@ -34,7 +34,7 @@ type Options struct {
 	MetabaseBasePath    string // Metabase 服务路径前缀，如 / 或 /mb
 	EmbeddingSecret     string // Metabase Admin 设置中的嵌入密钥
 	TokenTTL            time.Duration
-	DashboardIDs        map[string]string // dashboard_code -> Metabase dashboard ID
+	DashboardIDs        map[string]string // dashboard_code 映射到 Metabase 看板 ID。
 	PathPrefix          string
 	PublicOrigin        string
 	EmbedPublicOrigin   string
@@ -94,8 +94,11 @@ func (b *Bridge) Issue(c *gin.Context, dashboardCode string) {
 		response.Error(c, apperror.New(http.StatusInternalServerError, "EMBED_TOKEN_FAILED", "failed to create embed token"))
 		return
 	}
-	// 行级范围：骨架阶段注入 TENANT（全量）；ORG_SUBTREE/TEAM 参数注入待 OQ-D6 落地（设计方案 §4.3 注记）。
-	scope := map[string]interface{}{"tenant_id": principal.TenantID, "scope_mode": "TENANT"}
+	scope, err := embedScope(principal)
+	if err != nil {
+		response.Error(c, apperror.ErrForbidden)
+		return
+	}
 	scopeJSON, _ := json.Marshal(scope)
 	now := time.Now().UTC()
 	err = b.db.Create(&oidc.EmbedToken{
@@ -148,20 +151,20 @@ func (b *Bridge) Proxy(c *gin.Context, token string) {
 		response.Error(c, apperror.New(http.StatusInternalServerError, "EMBED_SIGN_FAILED", "failed to sign embed url"))
 		return
 	}
-	// Put the signed Metabase route into the iframe URL. Metabase's SPA uses
-	// the browser pathname to decide which dashboard to render; serving the
-	// document at only /embed-proxy/{token} would always open the home page.
-	// The Location carries the signed embed URL: prevent it from being retained
-	// in browser history, intermediate caches or the Referer of later requests,
-	// otherwise the TTL-bounded replay window of H-2 widens.
+	// 将签名 Metabase 路由放入 iframe URL。Metabase SPA 根据
+	// 浏览器路径名决定渲染哪个看板；若仅在
+	// /embed-proxy/{token} 提供文档，会始终打开首页。
+	// Location 携带签名嵌入 URL：禁止将其保留在
+	// 浏览器历史、中间缓存或后续请求的 Referer 中，
+	// 否则会扩大 H-2 的 TTL 有界重放窗口。
 	c.Header("Cache-Control", "no-store")
 	c.Header("Referrer-Policy", "no-referrer")
 	c.Redirect(http.StatusFound, b.resourcePrefix(token)+"embed/dashboard/"+signedURL.token+"?bordered=false&titled=false")
 }
 
-// ProxyResource proxies every follow-up request issued by the Metabase iframe.
-// The token remains in the browser-visible path, so resources are only exposed
-// while the original short-lived embed grant is still valid.
+// ProxyResource 代理 Metabase iframe 发起的全部后续请求。
+// 令牌保留在浏览器可见路径中，因此只有原短期嵌入
+// 授权仍有效时才暴露资源。
 func (b *Bridge) ProxyResource(c *gin.Context, token, resource string) {
 	if !b.requireEmbedHost(c) {
 		return
@@ -190,12 +193,12 @@ func (b *Bridge) ProxyResource(c *gin.Context, token, resource string) {
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
 		stripSensitiveProxyHeaders(req.Header)
-		// Never ask the upstream for compressed bodies: ModifyResponse rewrites
-		// the embed document and needs plain text. Browsers send
-		// Accept-Encoding: gzip, which would otherwise break the rewrite.
+		// 禁止向上游请求压缩响应体：ModifyResponse 重写
+		// 嵌入文档，需要明文。浏览器会发送
+		// Accept-Encoding: gzip，否则将破坏重写。
 		req.Header.Set("Accept-Encoding", "identity")
-		// Metabase serves static assets and API endpoints from its internal root;
-		// the configured base path only applies to the initial embed document.
+		// Metabase 从内部根路径提供静态资源及 API 端点；
+		// 配置的基础路径仅应用于初始嵌入文档。
 		if isDocument {
 			resourcePath = strings.TrimRight(b.options.MetabaseBasePath, "/") + resourcePath
 		}
@@ -211,11 +214,11 @@ func (b *Bridge) modifyProxyResponse(token string, rewriteDocument bool) func(*h
 		// 令牌存在于 iframe URL 中，禁止 Referer 外带并避免代理响应被共享缓存。
 		resp.Header.Set("Referrer-Policy", "no-referrer")
 		resp.Header.Set("Cache-Control", "no-store")
-		// The gateway never delivers upstream cookies to the platform or the
-		// isolated host. Embed SQL uses the signed, tenant-locked capability.
+		// 网关绝不向平台或隔离主机传递上游 Cookie。
+		// 嵌入 SQL 使用签名且锁定租户的能力。
 		resp.Header.Del("Set-Cookie")
-		// The response is already behind the permission-checked, short-lived
-		// embed proxy, so remove only the headers that reject iframe embedding.
+		// 响应已经位于经过权限检查的短期嵌入
+		// 代理之后，因此仅移除拒绝 iframe 嵌入的响应头。
 		resp.Header.Del("X-Frame-Options")
 		if csp := resp.Header.Get("Content-Security-Policy"); csp != "" {
 			resp.Header.Set("Content-Security-Policy", withoutFrameAncestors(csp))
@@ -318,10 +321,10 @@ func rewriteEmbedDocument(body []byte, prefix, metabaseBasePath string) []byte {
 	text := string(body)
 	text = replaceAttributeValue(text, `<base href="`, prefix)
 	text = replaceMetaContent(text, `base-href`, prefix)
-	// The iframe lives at {prefix}/embed/dashboard/{signed} (browser follows
-	// the Proxy 302). Metabase emits uri={basePath}/embed/dashboard/{signed};
-	// strip only the internal service basename so the basename detector
-	// (uri vs window.location.pathname) yields {prefix} as actualRoot.
+	// iframe 位于 {prefix}/embed/dashboard/{signed}，浏览器跟随
+	// 代理 302。Metabase 输出 uri={basePath}/embed/dashboard/{signed}；
+	// 仅移除内部服务基础名称，使基础名称检测器
+	// 比较 uri 与 window.location.pathname 后，得到 {prefix} 作为 actualRoot。
 	if uri, ok := metaContent(text, `uri`); ok {
 		uri = strings.TrimPrefix(uri, strings.TrimRight(metabaseBasePath, "/"))
 		if uri == "" {
@@ -395,6 +398,41 @@ func withoutFrameAncestors(csp string) string {
 }
 
 // signedEmbedURL 生成 Metabase 签名嵌入 URL（HMAC-SHA256）。
+func embedScope(principal auth.Principal) (map[string]interface{}, error) {
+	mode := principal.ScopeMode
+	switch mode {
+	case "TENANT":
+		mode = "TENANT"
+	case "ORG":
+		mode = "ORG_SUBTREE"
+	case "TEAM":
+		mode = "TEAM"
+	default:
+		return nil, apperror.ErrForbidden
+	}
+	scope := map[string]interface{}{"tenant_id": principal.TenantID, "scope_mode": mode}
+	if mode == "ORG_SUBTREE" {
+		if len(principal.OrganizationIDs) == 0 {
+			return nil, apperror.ErrForbidden
+		}
+		scope["org_unit_ids"] = append([]string(nil), principal.OrganizationIDs...)
+		if len(principal.TeamIDs) > 0 {
+			scope["team_ids"] = append([]string(nil), principal.TeamIDs...)
+		}
+	}
+	if mode == "TEAM" {
+		ids := principal.TeamIDs
+		if len(ids) == 0 {
+			ids = principal.OrganizationIDs
+		}
+		if len(ids) == 0 {
+			return nil, apperror.ErrForbidden
+		}
+		scope["team_ids"] = append([]string(nil), ids...)
+	}
+	return scope, nil
+}
+
 func (b *Bridge) signedEmbedURL(dashboardID string, params map[string]interface{}, expires time.Time) (signedEmbed, error) {
 	resource, err := metabaseDashboardResource(dashboardID)
 	if err != nil {
@@ -409,7 +447,7 @@ func (b *Bridge) signedEmbedURL(dashboardID string, params map[string]interface{
 	if err != nil {
 		return signedEmbed{}, err
 	}
-	// Metabase accepts a standard compact HS256 JWT, not payload.signature.
+	// Metabase 接受标准紧凑 HS256 JWT，而非 payload.signature。
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
 	encoded := header + "." + base64.RawURLEncoding.EncodeToString(raw)
 	mac := hmac.New(sha256.New, []byte(b.options.EmbeddingSecret))
@@ -425,7 +463,7 @@ func metabaseDashboardResource(value string) (interface{}, error) {
 	if id, err := strconv.ParseInt(value, 10, 64); err == nil && id > 0 {
 		return id, nil
 	}
-	// Metabase also supports its stable 21-character URL-safe entity IDs.
+	// Metabase 也支持其稳定的 21 字符 URL 安全实体 ID。
 	if len(value) == 21 && strings.IndexFunc(value, func(r rune) bool {
 		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-')
 	}) == -1 {

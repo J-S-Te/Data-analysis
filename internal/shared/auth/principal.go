@@ -11,10 +11,13 @@ type Principal struct {
 	DisplayName            string
 	Roles                  []string
 	Permissions            map[string]struct{}
+	ScopeMode              string
+	OrganizationIDs        []string
+	TeamIDs                []string
 	RoleConfigHash         string
 	AuthzRevision          uint64
-	AuthorizationCheckedAt int64 // unix
-	ExpiresAt              int64 // unix
+	AuthorizationCheckedAt int64 // Unix 时间戳。
+	ExpiresAt              int64 // Unix 时间戳。
 }
 
 func (p Principal) HasPermission(permission string) bool {

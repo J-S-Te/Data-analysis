@@ -9,9 +9,9 @@ import (
 	"golang.org/x/net/publicsuffix"
 )
 
-// Embedded scripts must not share platform storage or a cookie domain. A
-// different port alone does not isolate cookies, and sibling DNS names can
-// overwrite parent-domain cookies. Require different registrable domains.
+// 嵌入脚本不得共享平台存储或 Cookie 域。
+// 仅使用不同端口不能隔离 Cookie，同级 DNS 名还可
+// 覆盖父域 Cookie。必须使用不同可注册域。
 func isolatedEmbedOrigin(parent, embed string) (string, error) {
 	parse := func(raw string) (*url.URL, error) {
 		u, err := url.Parse(raw)

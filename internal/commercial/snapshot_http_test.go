@@ -14,7 +14,7 @@ import (
 )
 
 func TestSignedOfflineSnapshotExpiryControlsRealHTTPPaths(t *testing.T) {
-	// Keys are isolated test fixtures, not distribution trust or vendor secrets.
+	// 密钥为隔离测试夹具，不是分发信任或厂商密钥。
 	pp, ps, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -46,7 +46,7 @@ func TestSignedOfflineSnapshotExpiryControlsRealHTTPPaths(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.Use(Middleware(func(ctx context.Context, op string) error { return rt.Evaluate(ctx, core.Operation(op), now) }))
-	for _, p := range []string{"/api/v1/dashboard/project", "/api/v1/embed/:dashboard", "/api/v1/embed-proxy/:token", "/api/v1/embed-proxy/:token/*resource"} {
+	for _, p := range []string{"/api/v1/dashboard/project", "/api/v1/dashboard/report", "/api/v1/dashboard/finance", "/api/v1/dashboard/unknown", "/api/v1/embed/:dashboard", "/api/v1/embed-proxy/:token", "/api/v1/embed-proxy/:token/*resource"} {
 		r.GET(p, func(c *gin.Context) { c.Status(200) })
 	}
 	request := func(p string, want int) {
@@ -58,13 +58,16 @@ func TestSignedOfflineSnapshotExpiryControlsRealHTTPPaths(t *testing.T) {
 		}
 	}
 	request("/api/v1/embed/contract", 200)
-	// No platform is connected. Offline elapsed time alone causes denial.
+	// 未连接平台，仅凭离线流逝时间即导致拒绝。
 	now = now.Add(60 * time.Second)
 	rt, err = runtime.NewFileRuntime(path, binding, keys, vendors)
 	if err != nil {
 		t.Fatal(err)
 	}
 	request("/api/v1/dashboard/project", 200)
+	request("/api/v1/dashboard/report", 200)
+	request("/api/v1/dashboard/finance", 200)
+	request("/api/v1/dashboard/unknown", 403)
 	request("/api/v1/embed/contract", 403)
 	request("/api/v1/embed-proxy/previously-issued-token", 403)
 	request("/api/v1/embed-proxy/previously-issued-token/app.js", 403)

@@ -18,7 +18,7 @@ func TestExpiryRetainsHistoryButRejectsBusinessAndEmbedding(t *testing.T) {
 	})
 	r := gin.New()
 	r.Use(Middleware(check))
-	for _, p := range []string{"/api/v1/dashboard/project", "/api/v1/embed/:dashboard", "/api/v1/embed-proxy/:token", "/api/v1/embed-proxy/:token/*resource"} {
+	for _, p := range []string{"/api/v1/dashboard/project", "/api/v1/dashboard/report", "/api/v1/dashboard/finance", "/api/v1/dashboard/unknown", "/api/v1/embed/:dashboard", "/api/v1/embed-proxy/:token", "/api/v1/embed-proxy/:token/*resource"} {
 		r.GET(p, func(c *gin.Context) { c.Status(200) })
 	}
 	r.POST("/api/v1/admin/sources/trigger-all", func(c *gin.Context) { c.Status(200) })
@@ -27,6 +27,8 @@ func TestExpiryRetainsHistoryButRejectsBusinessAndEmbedding(t *testing.T) {
 		want         int
 	}{
 		{"GET", "/api/v1/dashboard/project", 200}, {"GET", "/api/v1/embed/contract", 403},
+		{"GET", "/api/v1/dashboard/report", 200}, {"GET", "/api/v1/dashboard/finance", 200},
+		{"GET", "/api/v1/dashboard/unknown", 403},
 		{"GET", "/api/v1/embed-proxy/old-token", 403}, {"GET", "/api/v1/embed-proxy/old-token/api/embed/dashboard/query", 403},
 		{"POST", "/api/v1/admin/sources/trigger-all", 403},
 	} {

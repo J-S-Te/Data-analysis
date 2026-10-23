@@ -27,6 +27,7 @@ type Session struct {
 	DisplayName            string     `gorm:"column:display_name"`
 	RolesJSON              string     `gorm:"column:roles_json"`
 	PermissionsJSON        string     `gorm:"column:permissions_json"`
+	DataScopesJSON         string     `gorm:"column:data_scopes_json"`
 	RoleConfigHash         string     `gorm:"column:role_config_hash"`
 	AuthzRevision          uint64     `gorm:"column:authz_revision"`
 	AccessTokenCipher      []byte     `gorm:"column:access_token_cipher"`
@@ -57,6 +58,12 @@ func (s *Session) Roles() []string {
 	var roles []string
 	_ = json.Unmarshal([]byte(s.RolesJSON), &roles)
 	return roles
+}
+
+func (s *Session) DataScopes() []DataScope {
+	var raw []DataScope
+	_ = json.Unmarshal([]byte(s.DataScopesJSON), &raw)
+	return raw
 }
 
 func (s *Session) Permissions() map[string]struct{} {

@@ -100,7 +100,7 @@ func TestMetabaseDashboardResourceRejectsUnconfiguredAndMalformedIDs(t *testing.
 }
 
 func TestIssueUnconfiguredDashboardDoesNotPersistGrant(t *testing.T) {
-	// A nil database deliberately proves failure occurs before token persistence.
+	// nil 数据库有意证明失败发生在令牌持久化之前。
 	bridge, err := New(nil, Options{MetabaseInternalURL: "http://metabase:3000", EmbeddingSecret: "test-secret"})
 	if err != nil {
 		t.Fatal(err)

@@ -1,4 +1,4 @@
-// Package application exposes metric-dictionary read use cases.
+// Package application 暴露指标字典读取用例。
 package application
 
 import (
@@ -6,11 +6,11 @@ import (
 	"gorm.io/gorm"
 )
 
-// CatalogService owns the versioned dictionary currently published by this
-// subsystem. It is deliberately local rather than a cross-system static-data helper.
+// CatalogService 拥有此子系统当前发布的版本化
+// 字典，有意保持本地，而非跨系统静态数据辅助组件。
 type CatalogService struct{ db *gorm.DB }
 
-// NewCatalogService constructs the metric dictionary application service.
+// NewCatalogService 构造指标字典应用服务。
 func NewCatalogService(dbs ...*gorm.DB) *CatalogService {
 	var db *gorm.DB
 	if len(dbs) > 0 {
@@ -19,7 +19,7 @@ func NewCatalogService(dbs ...*gorm.DB) *CatalogService {
 	return &CatalogService{db: db}
 }
 
-// Get returns the published metric dictionary without exposing mutable storage.
+// Get 返回已发布指标字典，不暴露可变存储。
 func (service *CatalogService) Get() domain.Catalog {
 	return domain.Catalog{
 		Version: "2026-07-28", Source: "Data-analysis/数据看板与统计分析子系统·指标字典（模板）.md",

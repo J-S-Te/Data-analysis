@@ -227,7 +227,7 @@ func TestAuditWritesFlushesSensitiveReadWhenReportSucceedsUnderRequiredAudit(t *
 	}
 }
 
-// AUD-2026-006：响应超过 64KiB 缓冲上限时降级 write-through，业务响应照常完整返回
+// AUD-2026-006：响应超过 64KiB 缓冲上限时降级 直接透传写入，业务响应照常完整返回
 // （即使 Report 失败也无法撤回），并留下含 limit_bytes 的降级告警日志。
 func TestAuditWritesDegradesToWriteThroughWhenResponseExceedsBufferLimit(t *testing.T) {
 	t.Setenv("PLATFORM_AUDIT_REQUIRED", "true")

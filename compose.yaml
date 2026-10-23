@@ -87,6 +87,9 @@ services:
       # 业务库只读 DSN 由 Secret 注入（设计方案 §5.4）
       CONTRACT_READ_DSN: ${CONTRACT_READ_DSN}
       CRM_READ_DSN: ${CRM_READ_DSN}
+      PROJECT_READ_DSN: ${PROJECT_READ_DSN:-}
+      SETTLEMENT_READ_DSN: ${SETTLEMENT_READ_DSN:-}
+      OIDC_TENANT_ID: ${OIDC_TENANT_ID:?required}
       MACHINE_TOKEN_URL: ${MACHINE_TOKEN_URL:-http://platform-api:8080/oauth2/token}
       MACHINE_TOKEN_ISSUER: ${MACHINE_TOKEN_ISSUER:-basic-platform}
       MACHINE_TOKEN_AUDIENCE: ${MACHINE_TOKEN_AUDIENCE:-basic-platform-application}
@@ -98,6 +101,8 @@ services:
       PROJECT_MACHINE_TOKEN_SCOPE: ${PROJECT_MACHINE_TOKEN_SCOPE:-dashboard.project.read}
       CONTRACT_INTERNAL_URL: ${CONTRACT_INTERNAL_URL:-http://contract-api:8081/internal/v1/dashboard}
       PROJECT_INTERNAL_URL: ${PROJECT_INTERNAL_URL:-http://project-api:8082/internal/v1/dashboard}
+      PROJECT_PROJECTION_URL: ${PROJECT_PROJECTION_URL:-http://project-api:8082/internal/v1/dashboard/projects/snapshot}
+      PROJECT_PROJECTION_HTTP_TIMEOUT: ${PROJECT_PROJECTION_HTTP_TIMEOUT:-35s}
       AGGREGATION_ONCE: "true"
     networks:
       - default

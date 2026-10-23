@@ -5,9 +5,11 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -20,12 +22,20 @@ import (
 func main() {
 	once := flag.Bool("once", os.Getenv("AGGREGATION_ONCE") == "true", "run a single sync pass and exit")
 	interval := flag.Duration("interval", 60*time.Second, "loop interval (ignored with --once)")
+	queueLease := flag.Duration("sync-job-lease", 2*time.Minute, "database-clock queue lease; heartbeat renews healthy long tasks")
+	queueHeartbeat := flag.Duration("sync-job-heartbeat", 30*time.Second, "must be at most one third of lease")
+	queueTimeout := flag.Duration("sync-job-timeout", 30*time.Minute, "single queued task timeout; unfinished task is safely requeued")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	projection, err := projectProjectionOptionsFromEnv()
+	if err != nil {
+		logger.Error("project projection configuration invalid", "error", err)
+		os.Exit(1)
+	}
 	licenseCheck, err := commercial.Start(ctx)
 	if err != nil {
 		logger.Error("commercial license configuration invalid")
@@ -39,19 +49,26 @@ func main() {
 		os.Exit(1)
 	}
 	sources := map[string]string{}
-	for _, code := range []string{"contract_management", "customer_and_opportunity"} {
+	for _, code := range []string{"contract_management", "customer_and_opportunity", "project_management", "settlement"} {
 		if dsn := os.Getenv(readDSNEnv(code)); dsn != "" {
 			sources[code] = dsn
 		}
 	}
 	var runner *aggregation.Runner
-	if len(sources) > 0 {
+	if len(sources) > 0 || projection.URL != "" {
 		runner, err = aggregation.NewRunner(aggDSN, os.Getenv("OIDC_TENANT_ID"), sources)
 		if err != nil {
 			logger.Error("aggregation runner failed", "error", err)
 			os.Exit(1)
 		}
 		runner.LicenseCheck = checkBusiness
+		runner.QueueLeaseDuration = *queueLease
+		runner.QueueHeartbeatInterval = *queueHeartbeat
+		runner.QueueTaskTimeout = *queueTimeout
+		if err := runner.ValidateQueueSettings(); err != nil {
+			logger.Error("sync queue lease configuration invalid", "error", err)
+			os.Exit(1)
+		}
 	}
 	aggDB, err := gorm.Open(mysql.Open(aggDSN), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
@@ -75,6 +92,10 @@ func main() {
 		ProjectInternalURL:  os.Getenv("PROJECT_INTERNAL_URL"),
 		TenantID:            os.Getenv("OIDC_TENANT_ID"),
 	})
+	if runner != nil {
+		runner.ProjectProjection = projection
+		runner.ProjectAPI = apiSync
+	}
 	pass := aggregation.Pass{LicenseCheck: checkBusiness}
 	if runner != nil {
 		// 主动跨库同步：从源库（合同/客户）读取并写入聚合库维表，保证看板有数据。
@@ -135,7 +156,40 @@ func readDSNEnv(code string) string {
 		return "CONTRACT_READ_DSN"
 	case "customer_and_opportunity":
 		return "CRM_READ_DSN"
+	case "project_management":
+		return "PROJECT_READ_DSN"
+	case "settlement":
+		return "SETTLEMENT_READ_DSN"
 	default:
 		return code + "_READ_DSN"
 	}
+}
+
+// Explicit zero/negative/overflow limits are configuration errors, not defaults.
+func projectProjectionOptionsFromEnv() (aggregation.ProjectProjectionOptions, error) {
+	options := aggregation.ProjectProjectionOptions{URL: os.Getenv("PROJECT_PROJECTION_URL")}
+	if value, exists := os.LookupEnv("PROJECT_PROJECTION_HTTP_TIMEOUT"); exists {
+		duration, err := time.ParseDuration(value)
+		if err != nil || duration <= 0 {
+			return options, fmt.Errorf("invalid PROJECT_PROJECTION_HTTP_TIMEOUT")
+		}
+		options.HTTPTimeout = duration
+	}
+	for _, item := range []struct {
+		name   string
+		target *int
+	}{
+		{"PROJECT_PROJECTION_MAX_PROJECTS", &options.MaxProjects},
+		{"PROJECT_PROJECTION_MAX_BYTES", &options.MaxBytes},
+		{"PROJECT_PROJECTION_MAX_LINE_BYTES", &options.MaxLineBytes},
+	} {
+		if value, exists := os.LookupEnv(item.name); exists {
+			number, err := strconv.Atoi(value)
+			if err != nil || number <= 0 {
+				return options, fmt.Errorf("invalid %s", item.name)
+			}
+			*item.target = number
+		}
+	}
+	return options, aggregation.ValidateProjectProjectionOptions(options)
 }
