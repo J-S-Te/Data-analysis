@@ -99,6 +99,9 @@ func TestContractExpiryQueryBindsWorkerTenant(t *testing.T) {
 	if !strings.Contains(sql, "tenant_id = ?") {
 		t.Fatalf("candidate SQL lacks tenant predicate: %s", sql)
 	}
+	if !strings.Contains(sql, "owner_org_id") {
+		t.Fatalf("candidate SQL lacks owner_org_id projection: %s", sql)
+	}
 	want := []any{"tenant-a", at, at, 21, "COMPLETED", "ARCHIVED", "TERMINATED"}
 	if !reflect.DeepEqual(vars, want) {
 		t.Fatalf("candidate SQL vars = %#v, want %#v", vars, want)
@@ -198,12 +201,15 @@ func TestUpsertAlertsLocksTenantRuleBeforeWriting(t *testing.T) {
 		if !strings.Contains(tx.Statement.SQL.String(), "INSERT INTO alert_item") || tx.Statement.Vars[1] != "tenant-a" {
 			t.Errorf("unexpected alert SQL = %s, vars = %#v", tx.Statement.SQL.String(), tx.Statement.Vars)
 		}
+		if !strings.Contains(tx.Statement.SQL.String(), "owner_org_id") || tx.Statement.Vars[5] != "org-a" {
+			t.Errorf("alert write does not bind owner_org_id: SQL=%s vars=%#v", tx.Statement.SQL.String(), tx.Statement.Vars)
+		}
 		written = true
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := NewGormStore(db, "tenant-a").UpsertAlerts(context.Background(), []Alert{{
-		TenantID: "tenant-a", RuleCode: RuleContractExpiry, TargetRef: "contract-a",
+		TenantID: "tenant-a", RuleCode: RuleContractExpiry, OwnerOrgID: "org-a", TargetRef: "contract-a",
 	}}); err != nil {
 		t.Fatal(err)
 	}

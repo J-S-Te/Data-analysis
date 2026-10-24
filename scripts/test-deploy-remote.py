@@ -1,4 +1,4 @@
-"""Test the actual remote stdin entrypoint with isolated Docker fixtures."""
+"""使用隔离的 Docker 夹具测试实际远程标准输入入口。"""
 import os
 from pathlib import Path
 import subprocess

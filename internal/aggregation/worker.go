@@ -10,6 +10,7 @@ import (
 
 // Pass 组合一次聚合任务。未配置的同步通道保持为 nil，不会产生误报警。
 type Pass struct {
+	LicenseCheck          func(context.Context) error
 	SyncSources           func(context.Context) error
 	SyncJobs              func(context.Context) error
 	SyncContractDashboard func(context.Context) error
@@ -37,6 +38,11 @@ func (p Pass) RunOnce(ctx context.Context) error {
 	for _, task := range tasks {
 		if task.run == nil {
 			continue
+		}
+		if p.LicenseCheck != nil {
+			if err := p.LicenseCheck(ctx); err != nil {
+				return err
+			}
 		}
 		if err := task.run(ctx); err != nil {
 			runErrors = append(runErrors, fmt.Errorf("sync %s: %w", task.name, err))

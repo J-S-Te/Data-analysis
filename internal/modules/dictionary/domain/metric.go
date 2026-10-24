@@ -1,9 +1,9 @@
-// Package domain defines metric-dictionary values owned by data analysis.
+// Package domain 定义数据分析拥有的指标字典值。
 package domain
 
 import "time"
 
-// Metric documents one published analytical metric definition.
+// Metric 描述一项已发布分析指标定义。
 type Metric struct {
 	ID                 string `json:"id" gorm:"primaryKey"`
 	Version            uint64 `json:"version"`
@@ -28,7 +28,7 @@ type MetricVersion struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// Catalog is the published read-only metric dictionary.
+// Catalog 是已发布只读指标字典。
 type Catalog struct {
 	Version string   `json:"version"`
 	Source  string   `json:"source"`

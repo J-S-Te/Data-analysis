@@ -12,7 +12,7 @@ import (
 
 // maxAuditBufferedResponseBytes 是强制审计模式下单请求响应缓冲上限（对齐 platform
 // maxPlatformAuditBufferedResponseBytes 的 64KiB 口径）：超过即降级为旧行为
-// （write-through）并告警，避免异常大的响应长期占用内存。
+// （直接透传写入）并告警，避免异常大的响应长期占用内存。
 const maxAuditBufferedResponseBytes = 64 << 10
 
 // auditBuffer 缓冲强制审计模式下“将被记录审计事件”请求（不安全方法写请求与敏感读，
@@ -30,9 +30,9 @@ type auditBuffer struct {
 	body    bytes.Buffer
 	status  int
 	size    int
-	// limit 是响应体缓冲上限；超过即降级为旧行为（write-through）并输出告警，
+	// limit 是响应体缓冲上限；超过即降级为旧行为（直接透传写入）并输出告警，
 	// 防止异常大的响应长期占用内存。降级后审计失败无法再撤回响应，属于内存保护
-	// 与拒绝语义之间的显式取舍：宁可对超大响应退回 fail-open，也不给无上限缓冲
+	// 与拒绝语义之间的显式取舍：宁可对超大响应退回 失败时放行，也不给无上限缓冲
 	// 留下 DoS 面，可见性由告警日志兜底。
 	limit      int
 	overflowed bool

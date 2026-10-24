@@ -5,7 +5,7 @@ package migrations
 
 import "embed"
 
-// Files contains every numbered SQL migration in this directory.
+// Files 包含此目录全部带编号 SQL 迁移。
 //
 //go:embed *.sql
 var Files embed.FS

@@ -30,6 +30,7 @@ func TestSyncContractDashboardMapsVerifiedTenantSnapshot(t *testing.T) {
 			"data":{
 				"tenant_id":"tenant-1",
 				"total_amount_minor":880000,
+				"currency_totals":[{"currency":"CNY","amount_minor":100000,"contracts":1},{"currency":"USD","amount_minor":780000,"contracts":7}],
 				"total_contracts":8,
 				"approval_contracts":2,
 				"active_contracts":4,
@@ -59,7 +60,8 @@ func TestSyncContractDashboardMapsVerifiedTenantSnapshot(t *testing.T) {
 	}
 	if captured.TenantID != tenantID || captured.TotalAmountMinor != 880000 ||
 		captured.TotalContracts != 8 || captured.ApprovalContracts != 2 ||
-		captured.ActiveContracts != 4 || captured.ExpiredContracts != 1 {
+		captured.ActiveContracts != 4 || captured.ExpiredContracts != 1 ||
+		len(captured.CurrencyTotals) != 2 || captured.CurrencyTotals[0].Currency != "CNY" || captured.CurrencyTotals[1].Currency != "USD" {
 		t.Fatalf("captured snapshot = %#v", captured)
 	}
 	if captured.SnapshotAt.IsZero() || captured.SnapshotAt.Location() != time.UTC {

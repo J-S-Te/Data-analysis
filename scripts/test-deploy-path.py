@@ -1,4 +1,4 @@
-"""Execute the actual workflow's path resolution, without SSH or credentials."""
+"""执行实际工作流的路径解析逻辑，不使用 SSH 或凭据。"""
 import os
 from pathlib import Path
 import subprocess

@@ -12,6 +12,8 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 
+	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/embedbridge"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/middleware"
 	adminapplication "github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin/application"
@@ -33,15 +35,27 @@ import (
 
 // App 是数据看板服务运行时容器，保存当前启动配置、数据库连接与路由/HTTP 服务实例，供主流程统一关闭或复用。
 type App struct {
-	Config Config
-	DB     *gorm.DB
-	Router *gin.Engine
-	Server *http.Server
+	StopLicense context.CancelFunc
+	Config      Config
+	DB          *gorm.DB
+	Router      *gin.Engine
+	Server      *http.Server
 }
 
 // New 使用给定 Config 创建数据库连接、OIDC 服务、嵌入桥和 API 路由，返回可运行的 App。
 // 参数 config 为必需运行参数；返回 *App 时包含聚合后的配置、DB、Router 与 HTTP Server，返回 error 时表示初始化阶段任一组件装配失败（如数据库 DSN 无效、OIDC 初始化失败）。
 func New(config Config) (*App, error) {
+	licenseContext, stopLicense := context.WithCancel(context.Background())
+	initialized := false
+	defer func() {
+		if !initialized {
+			stopLicense()
+		}
+	}()
+	licenseCheck, err := commercial.Start(licenseContext)
+	if err != nil {
+		return nil, err
+	}
 	db, err := gorm.Open(mysql.Open(config.MySQLDSN), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
 		return nil, err
@@ -55,6 +69,15 @@ func New(config Config) (*App, error) {
 		return nil, err
 	}
 	auditReporter := platformaudit.NewReporter(config.PlatformBaseURL, config.AuditClientID, config.AuditClientSecret, config.AuditApplicationCode, config.AuditEnvironmentCode)
+	// 批次 2：事务内审计 outbox 的投递循环；平台不可用时事件留在本地重试。
+	if auditReporter != nil {
+		auditDispatcher := &auditoutbox.Dispatcher{
+			Store:    &auditoutbox.GORMStore{DB: db, Lease: 2 * time.Minute, MaxTries: 20},
+			Reporter: auditReporter, WorkerID: "data-analysis-api-audit", Poll: 2 * time.Second,
+			BatchSize: 50, MaxAttempts: 20, MaxBackoff: 5 * time.Minute, Logger: slog.Default(),
+		}
+		go auditDispatcher.Run(ctx)
+	}
 	authService, err := oidc.NewService(ctx, db, oidc.Options{
 		Issuer:                  config.OIDCIssuer,
 		BackchannelIssuer:       config.OIDCBackchannel,
@@ -76,11 +99,14 @@ func New(config Config) (*App, error) {
 		return nil, err
 	}
 	bridge, err := embedbridge.New(db, embedbridge.Options{
+		LicenseCheck:        licenseCheck,
 		MetabaseInternalURL: config.MetabaseInternalURL,
 		MetabaseBasePath:    config.MetabaseBasePath,
 		EmbeddingSecret:     config.MetabaseEmbeddingSecret,
 		DashboardIDs:        config.DashboardIDs,
 		PathPrefix:          config.PathPrefix,
+		PublicOrigin:        config.PublicOrigin,
+		EmbedPublicOrigin:   config.EmbedPublicOrigin,
 	})
 	if err != nil {
 		return nil, err
@@ -124,6 +150,7 @@ func New(config Config) (*App, error) {
 	// 即使个别路由忘记单独挂载 RequireSameOriginWrite 也默认受保护；
 	// PublicOrigin 为空时该中间件失败关闭，拒绝全部写请求。
 	api.Use(middleware.RequireSameOriginWrite(config.PublicOrigin))
+	api.Use(commercial.Middleware(licenseCheck))
 	api.GET("/auth/me", authHandler.AuthMe)
 
 	// 嵌入桥（设计方案 §9）
@@ -156,6 +183,8 @@ func New(config Config) (*App, error) {
 	dashboardHandler := dashboardhttp.NewHandler(dashboardapplication.NewService(dashboardinfrastructure.NewGORMRepository(db)))
 	api.GET("/dashboard/contract", middleware.RequirePermission("dashboard.contract.view"), dashboardHandler.Contract)
 	api.GET("/dashboard/project", middleware.RequirePermission("dashboard.project.view"), dashboardHandler.Project)
+	api.GET("/dashboard/report", middleware.RequirePermission("dashboard.report.view"), dashboardHandler.Business("report"))
+	api.GET("/dashboard/finance", middleware.RequirePermission("dashboard.finance.view"), dashboardHandler.Business("finance"))
 	api.GET("/dashboard/contracts", middleware.RequirePermission("dashboard.contract.view"), dashboardHandler.Contracts)
 	api.GET("/dashboard/trend", middleware.RequirePermission("dashboard.overview.view"), dashboardHandler.Trend)
 	api.GET("/admin/sources", middleware.RequirePermission("aggregation.manage"), adminHandler.ListSources)
@@ -166,7 +195,8 @@ func New(config Config) (*App, error) {
 	api.DELETE("/alert-rules/:id", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("alert.manage"), func(c *gin.Context) { adminHandler.DeleteAlertRule(c, c.Param("id")) })
 
 	server := newHTTPServer(config.ListenAddr, router)
-	return &App{Config: config, DB: db, Router: router, Server: server}, nil
+	initialized = true
+	return &App{Config: config, DB: db, Router: router, Server: server, StopLicense: stopLicense}, nil
 }
 
 // newHTTPServer 构造 dashboard-api 的 http.Server。

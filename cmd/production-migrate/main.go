@@ -1,6 +1,6 @@
-// Command production-migrate applies the embedded, checksum-protected schema
-// history. The release orchestrator must complete its backup gate before this
-// binary is started.
+// Command production-migrate 应用嵌入且受校验和保护的数据库
+// 历史。发布编排器必须在此二进制启动前完成
+// 备份门禁。
 package main
 
 import (

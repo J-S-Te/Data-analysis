@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# Remote stdin entrypoint. A parallel dashboard release must not use platform
-# assets until their paired reload and legacy image-pointer upgrade have finished.
+# 通过远程标准输入执行的入口。并行发布看板时，须先完成平台控制面成对重载
+# 与旧版镜像指针升级，再使用平台部署资产。
 [[ $# == 6 ]] || { echo 'expected deploy root, script, and four image references' >&2; exit 2; }
 deploy_root="$1"
 deploy_script="$2"

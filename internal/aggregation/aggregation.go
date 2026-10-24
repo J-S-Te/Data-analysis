@@ -1,6 +1,5 @@
 // Package aggregation 实现跨库同步 + T+1 预计算（设计方案 §5.3）。
-// 骨架实现：dim_customer / dim_contract / dim_opportunity 维表镜像 + fct_contract_signing 预计算；
-// 增量水印、Temporal 调度与其余 fct 表为 TODO（PoC V5 后按源库表结构扩展）。
+// 只读来源同步、租户事实预计算和报告/回款快照。
 package aggregation
 
 import (
@@ -10,6 +9,7 @@ import (
 	"log/slog"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
@@ -28,11 +28,30 @@ const (
 
 // Runner 是聚合任务执行器，封装聚合库连接与源系统同步配置。
 type Runner struct {
-	aggDB    *gorm.DB
-	sources  map[string]string // subsystem_code -> 只读 DSN
-	tenantID string
+	LicenseCheck      func(context.Context) error
+	ProjectProjection ProjectProjectionOptions
+	ProjectAPI        *APISyncRunner
+	aggDB             *gorm.DB
+	sources           map[string]string // subsystem_code -> 只读 DSN
+	tenantID          string
 	// effectiveStatuses 为"已生效"合同状态过滤（字典口径待确认；默认空=不过滤）
-	effectiveStatuses []string
+	effectiveStatuses      []string
+	QueueLeaseDuration     time.Duration
+	QueueHeartbeatInterval time.Duration
+	QueueTaskTimeout       time.Duration
+}
+
+func (r *Runner) checkLicense(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := r.checkQueueLease(ctx, r.aggDB, false); err != nil {
+		return err
+	}
+	if r.LicenseCheck != nil {
+		return r.LicenseCheck(ctx)
+	}
+	return nil
 }
 
 // NewRunner 使用聚合库 DSN、租户和源系统配置初始化 Runner。
@@ -42,7 +61,15 @@ func NewRunner(aggDSN, tenantID string, sources map[string]string) (*Runner, err
 	if tenantID == "" {
 		return nil, errors.New("OIDC_TENANT_ID is required for aggregation source isolation")
 	}
-	db, err := gorm.Open(mysql.Open(aggDSN), &gorm.Config{DisableAutomaticPing: true})
+	// 租约时间戳是 UTC DATETIME 值，否则 MySQL DSN 时区
+	// 会同时改变绑定与扫描时间，破坏共享数据库时钟。
+	dsnConfig, err := mysqldriver.ParseDSN(aggDSN)
+	if err != nil {
+		return nil, errors.New("invalid aggregation database configuration")
+	}
+	dsnConfig.ParseTime = true
+	dsnConfig.Loc = time.UTC
+	db, err := gorm.Open(mysql.Open(dsnConfig.FormatDSN()), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
 		return nil, err
 	}
@@ -71,35 +98,46 @@ func (SyncSource) TableName() string { return "sync_source" }
 
 // SyncJob 是管理员提交的单次同步请求，由 aggregation-worker 异步领取。
 type SyncJob struct {
-	TenantID      string     `gorm:"column:tenant_id"`
-	ID            string     `gorm:"column:id;primaryKey"`
-	SourceID      string     `gorm:"column:source_id"`
-	SubsystemCode string     `gorm:"column:subsystem_code"`
-	Status        string     `gorm:"column:status"`
-	RequestedAt   time.Time  `gorm:"column:requested_at"`
-	StartedAt     *time.Time `gorm:"column:started_at"`
-	FinishedAt    *time.Time `gorm:"column:finished_at"`
-	ErrorMessage  *string    `gorm:"column:error_message"`
-	ActiveKey     *string    `gorm:"column:active_key"`
+	TenantID        string     `gorm:"column:tenant_id"`
+	ID              string     `gorm:"column:id;primaryKey"`
+	SourceID        string     `gorm:"column:source_id"`
+	SubsystemCode   string     `gorm:"column:subsystem_code"`
+	Status          string     `gorm:"column:status"`
+	RequestedAt     time.Time  `gorm:"column:requested_at"`
+	StartedAt       *time.Time `gorm:"column:started_at"`
+	FinishedAt      *time.Time `gorm:"column:finished_at"`
+	ErrorMessage    *string    `gorm:"column:error_message"`
+	ActiveKey       *string    `gorm:"column:active_key"`
+	LeaseOwner      *string    `gorm:"column:lease_owner"`
+	LeaseGeneration uint64     `gorm:"column:lease_generation"`
+	LeaseExpiresAt  *time.Time `gorm:"column:lease_expires_at"`
 }
 
 // TableName 返回 sync_job 表名，供 GORM 映射与同步任务状态更新使用。
 func (SyncJob) TableName() string { return "sync_job" }
 
-// EnsureSyncSources 幂等登记已配置 DSN 的同步源。
+// EnsureSyncSources 幂等登记已配置只读 DSN 或项目投影 API 的同步源。
 func (r *Runner) EnsureSyncSources(ctx context.Context) error {
-	for code := range r.sources {
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
+	for code := range r.configuredSources() {
+		if err := r.checkLicense(ctx); err != nil {
+			return err
+		}
 		var count int64
 		if err := r.aggDB.WithContext(ctx).Model(&SyncSource{}).Where("tenant_id = ? AND subsystem_code = ?", r.tenantID, code).Count(&count).Error; err != nil {
 			return err
 		}
 		if count == 0 {
 			now := time.Now().UTC()
-			if err := r.aggDB.WithContext(ctx).Create(&SyncSource{
-				TenantID: r.tenantID, ID: ulid(), SubsystemCode: code, DBHost: "source-secret", DBSchema: code,
-				ReadAccountRef: code + ".read", Enabled: true,
-				LastStatus: "PENDING", CreatedAt: now, UpdatedAt: now,
-			}).Error; err != nil {
+			if err := r.aggregationWrite(ctx, func(tx *gorm.DB) error {
+				return tx.Create(&SyncSource{
+					TenantID: r.tenantID, ID: ulid(), SubsystemCode: code, DBHost: "source-secret", DBSchema: code,
+					ReadAccountRef: code + ".read", Enabled: true,
+					LastStatus: "PENDING", CreatedAt: now, UpdatedAt: now,
+				}).Error
+			}); err != nil {
 				return err
 			}
 		}
@@ -110,20 +148,20 @@ func (r *Runner) EnsureSyncSources(ctx context.Context) error {
 // RunOnce 执行一轮完整同步 + 预计算（PoC V5 主线）。
 // ctx 用于透传取消信号；返回 errors.Join 聚合错误，多源失败时不短路；全部成功返回 nil。
 func (r *Runner) RunOnce(ctx context.Context) error {
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
 	start := time.Now().UTC()
 	var runErrors []error
-	for code, dsn := range r.sources {
+	sources := r.configuredSources()
+	sourceOK := make(map[string]bool, len(sources))
+	for code, dsn := range sources {
+		if err := r.checkLicense(ctx); err != nil {
+			return err
+		}
 		slog.Info("aggregation sync start", "source", code)
 		r.mark(ctx, code, statusRunning, start, nil)
-		var err error
-		switch code {
-		case "contract_management":
-			err = r.syncContract(ctx, dsn)
-		case "customer_and_opportunity":
-			err = r.syncCRM(ctx, dsn)
-		default:
-			err = fmt.Errorf("unsupported source %s", code)
-		}
+		err := r.runSource(ctx, code, dsn)
 		if err != nil {
 			msg := err.Error()
 			r.mark(ctx, code, statusFailed, start, &msg)
@@ -131,52 +169,50 @@ func (r *Runner) RunOnce(ctx context.Context) error {
 			runErrors = append(runErrors, fmt.Errorf("sync source %s: %w", code, err))
 			continue
 		}
+		sourceOK[code] = true
 		r.mark(ctx, code, statusSuccess, start, nil)
 		slog.Info("aggregation sync done", "source", code)
 	}
-	if err := r.PrecomputeContractSigning(ctx); err != nil {
-		slog.Error("precompute failed", "error", err)
-		runErrors = append(runErrors, fmt.Errorf("precompute contract signing: %w", err))
+	// 从成功的来源预计算每个事实。无关的 CRM 或
+	// 项目故障不得冻结合同签署事实。
+	signing, conversion := precomputeEligibility(sources, sourceOK)
+	if signing {
+		if err := r.PrecomputeContractSigning(ctx); err != nil {
+			slog.Error("precompute failed", "error", err)
+			runErrors = append(runErrors, fmt.Errorf("precompute contract signing: %w", err))
+		}
+	}
+	if conversion {
+		if err := r.PrecomputeConversion(ctx); err != nil {
+			runErrors = append(runErrors, err)
+		}
 	}
 	slog.Info("aggregation run completed", "elapsed", time.Since(start).String())
 	return errors.Join(runErrors...)
+}
+
+func precomputeEligibility(sources map[string]string, sourceOK map[string]bool) (signing, conversion bool) {
+	_, contract := sources["contract_management"]
+	_, crm := sources["customer_and_opportunity"]
+	signing = contract && sourceOK["contract_management"]
+	conversion = signing && crm && sourceOK["customer_and_opportunity"]
+	return
 }
 
 // RunQueued 领取并执行管理员提交的手工同步请求。
 // 通过条件更新抢占任务，多个 Worker 实例不会重复执行同一任务。
 // ctx 用于控制数据库查询与调度循环；返回值仅在查询/更新失败时为非 nil，其余执行失败会进入作业行级失败快照并继续处理后续行。
 func (r *Runner) RunQueued(ctx context.Context) error {
-	var jobs []SyncJob
-	if err := r.aggDB.WithContext(ctx).Where("tenant_id = ? AND status = ?", r.tenantID, "QUEUED").Order("requested_at ASC, id ASC").Limit(10).Find(&jobs).Error; err != nil {
-		return err
-	}
-	for _, job := range jobs {
-		now := time.Now().UTC()
-		result := r.aggDB.WithContext(ctx).Model(&SyncJob{}).
-			Where("tenant_id = ? AND id = ? AND status = ?", job.TenantID, job.ID, "QUEUED").
-			Updates(map[string]interface{}{"status": "RUNNING", "started_at": now, "error_message": nil})
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected == 0 {
-			continue
-		}
-		err := r.runSource(ctx, job.SubsystemCode, r.sources[job.SubsystemCode])
-		finished := time.Now().UTC()
-		updates := map[string]interface{}{"status": "SUCCESS", "finished_at": finished, "error_message": nil, "active_key": nil}
-		if err != nil {
-			message := err.Error()
-			updates["status"] = "FAILED"
-			updates["error_message"] = message
-		}
-		if updateErr := r.aggDB.WithContext(ctx).Model(&SyncJob{}).Where("tenant_id = ? AND id = ?", job.TenantID, job.ID).Updates(updates).Error; updateErr != nil {
-			return updateErr
-		}
-	}
-	return nil
+	return r.runLeasedQueue(ctx)
 }
 
 func (r *Runner) runSource(ctx context.Context, code, dsn string) error {
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
+	if code == "project_management" {
+		return r.syncProject(ctx, dsn)
+	}
 	if dsn == "" {
 		return fmt.Errorf("source %s is not configured", code)
 	}
@@ -185,6 +221,8 @@ func (r *Runner) runSource(ctx context.Context, code, dsn string) error {
 		return r.syncContract(ctx, dsn)
 	case "customer_and_opportunity":
 		return r.syncCRM(ctx, dsn)
+	case "settlement":
+		return r.syncBusiness(ctx, code, dsn)
 	default:
 		return fmt.Errorf("unsupported source %s", code)
 	}
@@ -197,7 +235,9 @@ func (r *Runner) mark(ctx context.Context, code string, status string, runAt tim
 	} else {
 		updates["last_error"] = nil
 	}
-	_ = r.aggDB.WithContext(ctx).Model(&SyncSource{}).Where("tenant_id = ? AND subsystem_code = ?", r.tenantID, code).Updates(updates).Error
+	_ = r.aggregationWrite(ctx, func(tx *gorm.DB) error {
+		return tx.Model(&SyncSource{}).Where("tenant_id = ? AND subsystem_code = ? AND (last_run_at IS NULL OR last_run_at <= ?)", r.tenantID, code, runAt).Updates(updates).Error
+	})
 }
 
 type connectionPoolCloser interface {
@@ -254,6 +294,7 @@ func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 		return fmt.Errorf("get contract source connection pool: %w", err)
 	}
 	defer closeSourceConnectionPool(sqlDB, "contract_management")
+	src = src.WithContext(ctx).Where("tenant_id = ?", r.tenantID)
 
 	type sourceRow struct {
 		TenantID        string
@@ -307,13 +348,16 @@ func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 					if row.CRMCustomerID != nil {
 						crmID = row.CRMCustomerID
 					}
-					if err := r.aggDB.Exec(`INSERT INTO dim_contract
+					if err := r.checkLicense(ctx); err != nil {
+						return err
+					}
+					if err := r.execAggregation(ctx, `INSERT INTO dim_contract
 (tenant_id, contract_id, contract_number, title, contract_type, service_type, status, start_date, end_date, crm_customer_id, opportunity_id, amount_minor, currency, owner_user_id, owner_org_id, owner_identity_id, project_id, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON DUPLICATE KEY UPDATE title=VALUES(title), status=VALUES(status), start_date=VALUES(start_date), end_date=VALUES(end_date), crm_customer_id=VALUES(crm_customer_id), amount_minor=VALUES(amount_minor), owner_org_id=VALUES(owner_org_id), updated_at=VALUES(updated_at)`,
+ON DUPLICATE KEY UPDATE contract_number=VALUES(contract_number), title=VALUES(title), contract_type=VALUES(contract_type), service_type=VALUES(service_type), status=VALUES(status), start_date=VALUES(start_date), end_date=VALUES(end_date), crm_customer_id=VALUES(crm_customer_id), opportunity_id=VALUES(opportunity_id), currency=VALUES(currency), amount_minor=VALUES(amount_minor), owner_user_id=VALUES(owner_user_id), owner_identity_id=VALUES(owner_identity_id), project_id=VALUES(project_id), owner_org_id=VALUES(owner_org_id), updated_at=VALUES(updated_at)`,
 						tenant, row.ID, row.ContractNumber, row.Title, row.ContractType, row.ServiceType, row.Status,
 						row.StartDate, row.EndDate, crmID, row.OpportunityID, row.AmountMinor, row.Currency,
-						row.OwnerUserID, org, identity, project, row.UpdatedAt).Error; err != nil {
+						row.OwnerUserID, org, identity, project, row.UpdatedAt); err != nil {
 						return err
 					}
 				}
@@ -340,6 +384,7 @@ func (r *Runner) syncCRM(ctx context.Context, dsn string) error {
 		return fmt.Errorf("get CRM source connection pool: %w", err)
 	}
 	defer closeSourceConnectionPool(sqlDB, "customer_and_opportunity")
+	src = src.WithContext(ctx).Where("tenant_id = ?", r.tenantID)
 
 	// 客户
 	type customerRow struct {
@@ -367,12 +412,15 @@ func (r *Runner) syncCRM(ctx context.Context, dsn string) error {
 					end = len(rows)
 				}
 				for _, row := range rows[i:end] {
-					if err := r.aggDB.Exec(`INSERT INTO dim_customer
+					if err := r.checkLicense(ctx); err != nil {
+						return err
+					}
+					if err := r.execAggregation(ctx, `INSERT INTO dim_customer
 (tenant_id, customer_id, customer_no, customer_name, customer_type, industry, region, status, owner_user_id, owner_org_id, deleted_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON DUPLICATE KEY UPDATE customer_name=VALUES(customer_name), customer_type=VALUES(customer_type), industry=VALUES(industry), region=VALUES(region), status=VALUES(status), deleted_at=VALUES(deleted_at), updated_at=VALUES(updated_at)`,
+ON DUPLICATE KEY UPDATE customer_name=VALUES(customer_name), customer_type=VALUES(customer_type), industry=VALUES(industry), region=VALUES(region), status=VALUES(status), owner_user_id=VALUES(owner_user_id), owner_org_id=VALUES(owner_org_id), deleted_at=VALUES(deleted_at), updated_at=VALUES(updated_at)`,
 						row.TenantID, row.ID, row.CustomerNo, row.Name, row.CustomerType, row.Industry, row.Region,
-						row.Status, row.OwnerUserID, row.OwnerOrgID, row.DeletedAt, row.UpdatedAt).Error; err != nil {
+						row.Status, row.OwnerUserID, row.OwnerOrgID, row.DeletedAt, row.UpdatedAt); err != nil {
 						return err
 					}
 				}
@@ -398,6 +446,8 @@ ON DUPLICATE KEY UPDATE customer_name=VALUES(customer_name), customer_type=VALUE
 		CurrentStage     string
 		OppStatus        string
 		ContractRef      *string
+		ContractID       *string
+		CreatedAt        time.Time
 		LostReason       *string
 		StageChangedAt   time.Time
 		DeletedAt        *time.Time
@@ -406,7 +456,7 @@ ON DUPLICATE KEY UPDATE customer_name=VALUES(customer_name), customer_type=VALUE
 	// AUD-2026-030：crm_opportunities 全量改为主键（id，自增）游标分批读取，
 	// 每批内沿用既有 200 行 upsert 分块，落库结果与全量读取等价。
 	if err := scanSourceBatches(src, "crm_opportunities",
-		"id, tenant_id, opportunity_no, name, customer_id, type, source, expected_amount, expected_sign_date, owner_user_id, owner_org_id, current_stage, opp_status, contract_ref, lost_reason, stage_changed_at, deleted_at, updated_at",
+		"id, tenant_id, opportunity_no, name, customer_id, type, source, expected_amount, expected_sign_date, owner_user_id, owner_org_id, current_stage, opp_status, contract_ref, contract_id, created_at, lost_reason, stage_changed_at, deleted_at, updated_at",
 		"id", func(row opportunityRow) uint64 { return row.ID }, sourceReadBatchSize, func(rows []opportunityRow) error {
 			for i := 0; i < len(rows); i += upsertChunkSize {
 				end := i + upsertChunkSize
@@ -414,13 +464,16 @@ ON DUPLICATE KEY UPDATE customer_name=VALUES(customer_name), customer_type=VALUE
 					end = len(rows)
 				}
 				for _, row := range rows[i:end] {
-					if err := r.aggDB.Exec(`INSERT INTO dim_opportunity
-(tenant_id, opportunity_id, opportunity_no, name, customer_id, type, source, expected_amount, expected_sign_date, owner_user_id, owner_org_id, current_stage, opp_status, contract_ref, lost_reason, stage_changed_at, deleted_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON DUPLICATE KEY UPDATE name=VALUES(name), current_stage=VALUES(current_stage), opp_status=VALUES(opp_status), contract_ref=VALUES(contract_ref), lost_reason=VALUES(lost_reason), deleted_at=VALUES(deleted_at), updated_at=VALUES(updated_at)`,
+					if err := r.checkLicense(ctx); err != nil {
+						return err
+					}
+					if err := r.execAggregation(ctx, `INSERT INTO dim_opportunity
+(tenant_id, opportunity_id, opportunity_no, name, customer_id, type, source, expected_amount, expected_sign_date, owner_user_id, owner_org_id, current_stage, opp_status, contract_ref, contract_id, created_at, lost_reason, stage_changed_at, deleted_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE name=VALUES(name), customer_id=VALUES(customer_id), type=VALUES(type), source=VALUES(source), expected_amount=VALUES(expected_amount), expected_sign_date=VALUES(expected_sign_date), owner_user_id=VALUES(owner_user_id), owner_org_id=VALUES(owner_org_id), current_stage=VALUES(current_stage), opp_status=VALUES(opp_status), contract_ref=VALUES(contract_ref), contract_id=VALUES(contract_id), created_at=VALUES(created_at), lost_reason=VALUES(lost_reason), stage_changed_at=VALUES(stage_changed_at), deleted_at=VALUES(deleted_at), updated_at=VALUES(updated_at)`,
 						row.TenantID, row.ID, row.OpportunityNo, row.Name, row.CustomerID, row.Type, row.Source,
 						row.ExpectedAmount, row.ExpectedSignDate, row.OwnerUserID, row.OwnerOrgID, row.CurrentStage,
-						row.OppStatus, row.ContractRef, row.LostReason, row.StageChangedAt, row.DeletedAt, row.UpdatedAt).Error; err != nil {
+						row.OppStatus, row.ContractRef, row.ContractID, row.CreatedAt, row.LostReason, row.StageChangedAt, row.DeletedAt, row.UpdatedAt); err != nil {
 						return err
 					}
 				}
@@ -433,14 +486,21 @@ ON DUPLICATE KEY UPDATE name=VALUES(name), current_stage=VALUES(current_stage), 
 	return nil
 }
 
-// PrecomputeContractSigning 预计算 fct_contract_signing（字典 1.1/1.2/1.3；转化率字段为占位）。
-// 口径注记：period_month 取 start_date（"生效日"映射待确认）；状态过滤默认全量（EFFECTIVE_STATUSES env 可配）。
+// 签署仍按既有 start_date 口径分组；漏斗单独
+// 按商机同期群物化，不能被合同或分桶连接倍增。
 func (r *Runner) PrecomputeContractSigning(ctx context.Context) error {
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
 	statusFilter := ""
-	args := []interface{}{dictVersion}
-	if len(r.effectiveStatuses) > 0 {
+	args := []interface{}{dictVersion, r.tenantID}
+	statuses := r.effectiveStatuses
+	if len(statuses) == 0 {
+		statuses = []string{"active", "in_progress", "pending_pay", "completed"}
+	}
+	if len(statuses) > 0 {
 		placeholders := ""
-		for i, s := range r.effectiveStatuses {
+		for i, s := range statuses {
 			if i > 0 {
 				placeholders += ","
 			}
@@ -450,7 +510,7 @@ func (r *Runner) PrecomputeContractSigning(ctx context.Context) error {
 		statusFilter = " AND c.status IN (" + placeholders + ")"
 	}
 	query := `INSERT INTO fct_contract_signing
-(tenant_id, period_month, region, customer_category, sales_director_id, sales_id, sign_amount_minor, contract_count, opportunity_count, won_contract_count, discount_rate_bucket, metric_dict_version)
+(tenant_id, period_month, region, customer_category, sales_director_id, sales_id, sign_amount_minor, currency, contract_count, opportunity_count, won_contract_count, discount_rate_bucket, metric_dict_version)
 SELECT c.tenant_id,
        DATE_FORMAT(c.start_date, '%Y-%m') AS period_month,
        COALESCE(cu.region, '未知') AS region,
@@ -458,6 +518,7 @@ SELECT c.tenant_id,
        '' AS sales_director_id,
        c.owner_user_id AS sales_id,
        SUM(c.amount_minor) AS sign_amount_minor,
+       c.currency AS currency,
        COUNT(*) AS contract_count,
        0 AS opportunity_count,
        0 AS won_contract_count,
@@ -465,14 +526,21 @@ SELECT c.tenant_id,
        ? AS metric_dict_version
 FROM dim_contract c
 LEFT JOIN dim_customer cu ON cu.tenant_id = c.tenant_id AND cu.customer_id = c.crm_customer_id
-WHERE c.start_date IS NOT NULL` + statusFilter + `
-GROUP BY c.tenant_id, period_month, region, customer_category, c.owner_user_id
-ON DUPLICATE KEY UPDATE sign_amount_minor=VALUES(sign_amount_minor), contract_count=VALUES(contract_count)`
-	if err := r.aggDB.Exec(query, args...).Error; err != nil {
+WHERE c.tenant_id = ? AND c.start_date IS NOT NULL` + statusFilter + `
+GROUP BY c.tenant_id, period_month, region, customer_category, c.owner_user_id, c.currency`
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
+	if err := r.aggregationWrite(ctx, func(tx *gorm.DB) error {
+		if err := tx.Exec("DELETE FROM fct_contract_signing WHERE tenant_id = ?", r.tenantID).Error; err != nil {
+			return err
+		}
+		return tx.Exec(query, args...).Error
+	}); err != nil {
 		return err
 	}
 	var count int64
-	if err := r.aggDB.Model(&struct{}{}).Table("fct_contract_signing").Count(&count).Error; err != nil {
+	if err := r.aggDB.WithContext(ctx).Table("fct_contract_signing").Where("tenant_id = ?", r.tenantID).Count(&count).Error; err != nil {
 		return err
 	}
 	slog.Info("fct_contract_signing rows", "count", count)
@@ -489,4 +557,16 @@ func ulid() string {
 		b[i] = alphabet[uint64(seed>>33)%uint64(len(alphabet))]
 	}
 	return string(b)
+}
+
+// configuredSources is the shared registry for scheduled and queued producers.
+func (r *Runner) configuredSources() map[string]string {
+	sources := make(map[string]string, len(r.sources)+1)
+	for code, dsn := range r.sources {
+		sources[code] = dsn
+	}
+	if r.ProjectProjection.URL != "" {
+		sources["project_management"] = r.sources["project_management"]
+	}
+	return sources
 }

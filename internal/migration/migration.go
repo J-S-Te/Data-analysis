@@ -103,9 +103,9 @@ func Load(source fs.FS) ([]Item, error) {
 
 // Run 执行待处理迁移，并校验已执行迁移的摘要。
 //
-// MySQL DDL can commit implicitly, so every migration must be safe to retry.
-// A named lock is held on one physical connection for the entire run, preventing
-// concurrent release jobs from modifying the same schema.
+// MySQL DDL 可能隐式提交，因此每次迁移必须可安全重试。
+// 整个运行期间在同一物理连接持有命名锁，防止
+// 并发发布任务修改同一数据库结构。
 func Run(ctx context.Context, dsn string, source fs.FS) ([]Applied, error) {
 	items, err := Load(source)
 	if err != nil {
@@ -221,7 +221,7 @@ func acquireLock(ctx context.Context, connection *sql.Conn) error {
 }
 
 func releaseLock(connection *sql.Conn) {
-	// Release uses a fresh context because the caller's context may already be cancelled.
+	// Release 使用新上下文，因为调用方上下文可能已取消。
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, _ = connection.ExecContext(ctx, "SELECT RELEASE_LOCK(?)", migrationLockName)

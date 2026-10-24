@@ -16,7 +16,7 @@ func TestEmbedProxyCORSAllowsOnlyOpaqueOrigin(t *testing.T) {
 		c.Status(http.StatusOK)
 	})
 
-	// opaque origin（sandbox 无 allow-same-origin）→ 允许跨源读取。
+	// 不透明源（sandbox 无 allow-same-origin）→ 允许跨源读取。
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/embed-proxy/tok/app/dist/x.js", nil)
 	req.Header.Set("Origin", "null")
 	rec := httptest.NewRecorder()

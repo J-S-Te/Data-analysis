@@ -1,4 +1,4 @@
-// Package http adapts dashboard use cases to the existing Gin API contract.
+// Package http 将看板用例适配到既有 Gin API 契约。
 package http
 
 import (
@@ -16,9 +16,9 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/response"
 )
 
-// dashboardQueryService is the local application boundary consumed by this
-// HTTP adapter. It remains module-local so other subsystems cannot couple to
-// dashboard use cases by importing it.
+// dashboardQueryService 是此 HTTP 适配器使用的本地
+// 应用边界。它仅属于本模块，防止其他子系统
+// 通过导入而耦合到看板用例。
 type dashboardQueryService interface {
 	Contract(context.Context, string) (domain.ContractSnapshot, error)
 	Project(context.Context, string) (domain.ProjectSnapshot, error)
@@ -28,13 +28,13 @@ type advancedDashboardService interface {
 	Trend(context.Context, string, int) ([]domain.TrendPoint, error)
 }
 
-// Handler exposes dashboard read use cases through Gin without importing GORM.
+// Handler 通过 Gin 暴露看板读取用例，不导入 GORM。
 type Handler struct{ service dashboardQueryService }
 
-// NewHandler constructs the dashboard HTTP adapter.
+// NewHandler 构造看板 HTTP 适配器。
 func NewHandler(service dashboardQueryService) *Handler { return &Handler{service: service} }
 
-// Contract returns the current tenant's contract dashboard snapshot.
+// Contract 返回当前租户的合同看板快照。
 func (handler *Handler) Contract(c *gin.Context) {
 	principal, ok := auth.FromContext(c.Request.Context())
 	if !ok {
@@ -49,7 +49,7 @@ func (handler *Handler) Contract(c *gin.Context) {
 	response.OK(c, snapshot)
 }
 
-// Project returns the current tenant's project dashboard snapshot.
+// Project 返回当前租户的项目看板快照。
 func (handler *Handler) Project(c *gin.Context) {
 	principal, ok := auth.FromContext(c.Request.Context())
 	if !ok {

@@ -49,6 +49,30 @@ func TestEmbeddedMigrationsCoverDashboardAPISnapshots(t *testing.T) {
 	}
 }
 
+func TestEmbeddedMigrationsScopeAlerts(t *testing.T) {
+	t.Parallel()
+
+	items, err := Load(migrations.Files)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	var alertScopeMigration string
+	for _, item := range items {
+		if item.Version == 20 {
+			alertScopeMigration = item.SQL
+			break
+		}
+	}
+	for _, expected := range []string{
+		"ALTER TABLE alert_item", "owner_org_id", "idx_alert_scope",
+		"UPDATE alert_item", "JOIN dim_contract",
+	} {
+		if !strings.Contains(alertScopeMigration, expected) {
+			t.Errorf("alert scope migration does not contain %q", expected)
+		}
+	}
+}
+
 func TestEmbeddedMigrationsProtectTenantScopedAdministration(t *testing.T) {
 	t.Parallel()
 

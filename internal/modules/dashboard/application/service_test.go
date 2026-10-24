@@ -66,9 +66,25 @@ func TestContractsNormalizesPaginationBeforeRepositoryCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The application boundary must not pass values that the repository would
-	// silently reinterpret, keeping response metadata and query semantics aligned.
+	// 应用边界不得传递仓储会静默重新解释的值，
+	// 确保响应元数据与查询语义一致。
 	if repository.page != 1 || repository.pageSize != 20 {
 		t.Fatalf("pagination = (%d, %d), want (1, 20)", repository.page, repository.pageSize)
+	}
+}
+
+// 趋势接口在无数据时必须返回空数组而不是 nil：nil 会被序列化成 JSON null，
+// 前端据此显示"趋势加载失败"而不是"暂无数据"。
+func TestTrendReturnsEmptyArrayWhenNoData(t *testing.T) {
+	service := NewService(&advancedSnapshotRepositoryStub{})
+	points, err := service.Trend(context.Background(), "tenant-1", 6)
+	if err != nil {
+		t.Fatalf("trend: %v", err)
+	}
+	if points == nil {
+		t.Fatal("无数据时必须返回空数组，不能返回 nil")
+	}
+	if len(points) != 0 {
+		t.Fatalf("points = %d，want 0", len(points))
 	}
 }

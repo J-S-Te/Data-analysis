@@ -17,17 +17,17 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/response"
 )
 
-// AuditWrites reports every authenticated API write (and sensitive read) after its
-// final status is known. It intentionally excludes request bodies.
+// AuditWrites 在最终状态确定后报告每次已认证 API 写入及敏感读取，
+// 有意排除请求体。
 //
-// 安全理由（SEC-D4b）：原实现对审计管道 fail-open —— reporter 为 nil 直接返回，
+// 安全理由（SEC-D4b）：原实现对审计管道 失败时放行 —— reporter 为 nil 直接返回，
 // 上报失败仅在 logger 非 nil 时记一行（且缺路由），从不拒绝请求；凭据失效或
 // ingest 故障时告警确认/规则变更等所有写入都没有审计且不可见。现在：
 //  1. 上报失败一律 error 日志（含路由与请求 id）；
 //  2. 强制审计模式（PLATFORM_AUDIT_REQUIRED 或 PLATFORM_ENVIRONMENT_CODE=prod）下：
 //     - reporter 缺失 => 在执行业务 handler 之前就拒绝请求（503），不产生无审计的写；
 //     - 写请求与敏感读（AUD-2026-006：如 GET /embed/:dashboard 一次性嵌入令牌签发、
-//     export/download）先缓冲响应（上限 64KiB，超限降级 write-through 并告警），
+//     export/download）先缓冲响应（上限 64KiB，超限降级 直接透传写入 并告警），
 //     Report 成功才提交给客户端；失败则丢弃业务响应并返回 503，保证
 //     “审计写不进去 ⇒ 客户端拿不到成功”。
 //
@@ -79,7 +79,7 @@ func AuditWrites(reporter platformaudit.Reporter, logger *slog.Logger) gin.Handl
 		}
 		principal, _ := auth.FromContext(c.Request.Context())
 		resourceType, resourceID := auditResource(c)
-		event := platformaudit.Event{ActorID: principal.UserID, ActorName: principal.DisplayName, Action: "DATA_ANALYSIS:" + c.Request.Method + ":" + strings.ReplaceAll(strings.Trim(c.FullPath(), "/"), "/", "."), ResourceType: resourceType, ResourceID: resourceID, RequestID: requestID, CorrelationID: requestID, Result: auditResult(status), RiskLevel: auditRiskLevel(c.Request.Method, c.FullPath(), status), ReasonCode: strconv.Itoa(status), UserLoginIP: requestClientIP(c.Request)}
+		event := platformaudit.Event{ActorID: principal.UserID, ActorName: principal.DisplayName, Action: "DATA_ANALYSIS:" + c.Request.Method + ":" + strings.ReplaceAll(strings.Trim(c.FullPath(), "/"), "/", "."), ResourceType: resourceType, ResourceID: resourceID, RequestID: requestID, CorrelationID: requestID, Result: auditResult(status), RiskLevel: auditRiskLevel(c.Request.Method, c.FullPath(), status), ReasonCode: strconv.Itoa(status), ClientIP: requestClientIP(c.Request), IPSource: requestIPSource(c.Request)}
 		if err := reporter.Report(c.Request.Context(), event); err != nil {
 			logger.ErrorContext(c.Request.Context(), "report platform audit failed",
 				"route", route,
@@ -89,7 +89,7 @@ func AuditWrites(reporter platformaudit.Reporter, logger *slog.Logger) gin.Handl
 			)
 			if required && (buffered == nil || !buffered.overflowed) {
 				// 强制审计模式（SEC-D4b/AUD-2026-006）：审计事件写入失败必须拒绝请求，
-				// 不能静默成功。响应超限降级 write-through 后已提交给客户端，事后 503
+				// 不能静默成功。响应超限降级 直接透传写入 后已提交给客户端，事后 503
 				// 无法撤回业务数据，只能保留上面的 error 日志供告警。
 				c.Writer = origWriter
 				response.Error(c, apperror.New(http.StatusServiceUnavailable, "AUDIT_WRITE_REJECTED", "审计记录写入失败，操作未被确认"))
@@ -157,11 +157,11 @@ func sensitiveRead(path string) bool {
 	return containsAnyAudit(lowered, "embed", "download", "export")
 }
 
-// requestClientIP accepts only public addresses from the managed frontend
-// proxy. The right-most XFF value is used to avoid trusting a client-supplied
-// left-most value, and Docker/private addresses are rejected. Forwarding
-// headers are only honoured when the direct peer is the trusted reverse proxy,
-// so a directly reachable service cannot have its audit source address spoofed.
+// requestClientIP 仅接受受管前端代理传入的公开
+// 地址。使用最右 XFF 值，避免信任客户端提供的
+// 最左值，并拒绝 Docker 或私有地址。仅在
+// 直接对端为可信反向代理时信任转发头，
+// 防止可直接访问的服务被伪造审计源地址。
 func requestClientIP(r *http.Request) string {
 	if r == nil {
 		return ""
@@ -187,10 +187,10 @@ func requestClientIP(r *http.Request) string {
 	return ""
 }
 
-// trustedProxyPeer reports whether the direct peer address belongs to the
-// trusted reverse proxy (loopback or private/link-local Docker gateway).
-// A public peer means the service is directly reachable, so client-supplied
-// forwarding headers must not be trusted.
+// trustedProxyPeer 判断直接对端地址是否属于
+// 可信反向代理（回环或私有、链路本地 Docker 网关）。
+// 公网对端表示服务可被直接访问，因此不能信任
+// 客户端提供的转发头。
 func trustedProxyPeer(remoteAddr string) bool {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
 	if err != nil {
@@ -203,12 +203,30 @@ func trustedProxyPeer(remoteAddr string) bool {
 	return addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast()
 }
 
-func publicClientIP(value string) *netip.Addr {
+func publicClientIP(value string) *netip.Addr { return clientIPAddress(value) }
+
+// clientIPAddress 接受任意合法单播地址（含办公网/VPN/回环）。
+// AUD-IP-2026：按地址段过滤会把真实办公网地址丢掉，审计只能显示"未采集"。
+func clientIPAddress(value string) *netip.Addr {
 	addr, err := netip.ParseAddr(strings.TrimSpace(value))
-	if err != nil || !addr.IsGlobalUnicast() || addr.IsPrivate() {
+	if err != nil || addr.IsUnspecified() || addr.IsMulticast() {
 		return nil
 	}
 	return &addr
+}
+
+// requestIPSource 标记操作地址的来源：经可信代理解析还是直连观察。
+func requestIPSource(r *http.Request) string {
+	if r == nil {
+		return "UNKNOWN"
+	}
+	if trustedProxyPeer(r.RemoteAddr) {
+		return "TRUSTED_PROXY"
+	}
+	if requestClientIP(r) != "" {
+		return "DIRECT"
+	}
+	return "UNKNOWN"
 }
 
 func isReadMethod(method string) bool {

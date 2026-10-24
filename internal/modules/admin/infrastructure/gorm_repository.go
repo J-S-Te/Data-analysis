@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"strings"
 	"time"
 
@@ -114,7 +115,17 @@ func (repository *GORMRepository) FindSource(ctx context.Context, tenantID, id s
 func (repository *GORMRepository) CreateSyncJob(ctx context.Context, job domain.SyncJob) (bool, error) {
 	activeKey := "ACTIVE"
 	record := syncJobRecord{TenantID: job.TenantID, ID: job.ID, SourceID: job.SourceID, SubsystemCode: job.SubsystemCode, Status: job.Status, RequestedAt: job.RequestedAt, ActiveKey: &activeKey}
-	if err := repository.db.WithContext(ctx).Create(&record).Error; err != nil {
+	// AUD-IP-2026 / 批次 2：手工同步任务与审计事件同事务；重复请求不产生审计。
+	err := repository.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&record).Error; err != nil {
+			return err
+		}
+		return auditoutbox.Append(tx, auditoutbox.Entry{
+			TenantID: job.TenantID, Action: "DATA_ANALYSIS:SYNC_JOB_CREATE",
+			ResourceType: "sync_job", ResourceID: job.ID, Result: "SUCCESS",
+		})
+	})
+	if err != nil {
 		if isDuplicateKeyError(err) {
 			return false, nil
 		}
@@ -192,6 +203,13 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 				id, tenantID, rule.ID, rule.Version, string(snapshot), rule.UpdatedBy, rule.UpdatedAt).Error; err != nil {
 				return err
 			}
+			// AUD-IP-2026 / 批次 2：规则变更与审计事件同事务，平台不可用时由投递器重试。
+			if err := auditoutbox.Append(tx, auditoutbox.Entry{
+				TenantID: tenantID, ActorID: derefActor(rule.UpdatedBy), Action: "DATA_ANALYSIS:ALERT_RULE_SAVE",
+				ResourceType: "alert_rule", ResourceID: rule.RuleCode, Result: "SUCCESS",
+			}); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -225,4 +243,11 @@ func isDuplicateKeyError(err error) bool {
 func defaultAlertRuleVersionID(tenantID, ruleID string, version int64) string {
 	sum := sha256.Sum256([]byte("data-analysis:alert-rule-version:" + tenantID + ":" + ruleID + ":" + fmt.Sprint(version)))
 	return strings.ToUpper(hex.EncodeToString(sum[:]))[:26]
+}
+
+func derefActor(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }

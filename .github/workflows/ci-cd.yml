@@ -22,6 +22,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
+      - run: sh scripts/license-core-sync.sh --check
       - run: go test ./...
       - run: go vet ./...
       - run: python3 scripts/test-deploy-path.py
@@ -55,9 +56,9 @@ jobs:
           : "${ACR_PULL_REGISTRY:?missing ACR_PULL_REGISTRY}"
           : "${ACR_NAMESPACE:?missing ACR_NAMESPACE}"
           : "${ACR_REPOSITORY:?missing ACR_REPOSITORY}"
-          # ACR/Docker repository references must be lowercase. Normalize user-provided
-          # repository variables here so a value such as Data_analysis cannot produce
-          # an invalid image tag during buildx push.
+          # ACR/Docker 仓库引用须使用小写。在此规范化操作者提供的仓库变量，
+          # 避免 Data_analysis 等值在 buildx push 时
+          # 生成无效镜像标签。
           push_registry="${ACR_PUSH_REGISTRY,,}"
           pull_registry="${ACR_PULL_REGISTRY,,}"
           namespace="${ACR_NAMESPACE,,}"
@@ -73,6 +74,8 @@ jobs:
       - id: dashboard_api
         uses: docker/build-push-action@v6
         with:
+          build-args: |
+            APP_VERSION=${{ github.sha }}
           context: .
           target: dashboard-api
           push: true
@@ -85,6 +88,8 @@ jobs:
       - id: aggregation_worker
         uses: docker/build-push-action@v6
         with:
+          build-args: |
+            APP_VERSION=${{ github.sha }}
           context: .
           target: aggregation-worker
           push: true
@@ -97,6 +102,8 @@ jobs:
       - id: alert_worker
         uses: docker/build-push-action@v6
         with:
+          build-args: |
+            APP_VERSION=${{ github.sha }}
           context: .
           target: alert-worker
           push: true
@@ -109,6 +116,8 @@ jobs:
       - id: production_migrate
         uses: docker/build-push-action@v6
         with:
+          build-args: |
+            APP_VERSION=${{ github.sha }}
           context: .
           target: production-migrate
           push: true
@@ -157,8 +166,8 @@ jobs:
           : "${DEPLOY_SSH_KEY:?missing DEPLOY_SSH_KEY}"
           : "${DEPLOY_KNOWN_HOSTS:?missing DEPLOY_KNOWN_HOSTS}"
           [[ "$DEPLOY_PATH" == /* ]] || { echo "DEPLOY_PATH must be absolute" >&2; exit 1; }
-          # The script default follows DEPLOY_PATH; an independent hard-coded
-          # directory silently selected a missing script on existing servers.
+          # 默认脚本路径随 DEPLOY_PATH 变化；
+          # 独立写死目录会在已有服务器上静默选中不存在的脚本。
           DEPLOY_SCRIPT="${DEPLOY_SCRIPT:-${DEPLOY_PATH%/}/bin/deploy-service.sh}"
           [[ "$DEPLOY_SCRIPT" == /* ]] || { echo "DASHBOARD_DEPLOY_SCRIPT must be absolute" >&2; exit 1; }
           install -m 700 -d "$HOME/.ssh"

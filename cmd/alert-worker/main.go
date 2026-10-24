@@ -16,6 +16,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/alertworker"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 )
 
 func main() {
@@ -24,6 +25,13 @@ func main() {
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	licenseCheck, err := commercial.Start(ctx)
+	if err != nil {
+		logger.Error("commercial license configuration invalid")
+		os.Exit(1)
+	}
 	if envBool("ALERT_WORKER_DISABLED") {
 		logger.Info("alert-worker disabled")
 		return
@@ -44,8 +52,7 @@ func main() {
 		os.Exit(1)
 	}
 	worker := alertworker.New(alertworker.NewGormStore(db, tenantID))
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	worker.LicenseCheck = func(ctx context.Context) error { return licenseCheck.Allow(ctx, commercial.MutateBusiness) }
 
 	if *once {
 		count, runErr := worker.RunOnce(ctx)

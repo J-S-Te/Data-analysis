@@ -27,6 +27,8 @@ func TestRuleLifecyclePersistenceAndHistoryProtection(t *testing.T) {
 		`CREATE TABLE alert_rule (id TEXT PRIMARY KEY, tenant_id TEXT, rule_code TEXT, name TEXT, source_fct TEXT, severity TEXT, enabled BOOLEAN, threshold_json TEXT, updated_by TEXT, created_at DATETIME, updated_at DATETIME, UNIQUE(tenant_id,rule_code))`,
 		`CREATE TABLE alert_rule_version (id TEXT PRIMARY KEY, tenant_id TEXT, rule_id TEXT, version INTEGER, rule_snapshot TEXT, changed_by TEXT, created_at DATETIME, UNIQUE(tenant_id,rule_id,version))`,
 		`CREATE TABLE alert_item (tenant_id TEXT, rule_code TEXT)`,
+		// AUD-IP-2026：规则/同步任务与审计同事务，测试库需有同名 outbox 表。
+		`CREATE TABLE bi_audit_outbox (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, event_id TEXT NOT NULL, actor_id TEXT, action TEXT NOT NULL, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, login_ip BLOB, client_ip BLOB, ip_source TEXT NOT NULL DEFAULT 'UNKNOWN', result TEXT NOT NULL DEFAULT 'SUCCESS', delivery_status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at DATETIME NOT NULL, locked_at DATETIME, delivered_at DATETIME, last_error TEXT, created_at DATETIME NOT NULL)`,
 	} {
 		if err := db.Exec(ddl).Error; err != nil {
 			t.Fatal(err)
