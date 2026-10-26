@@ -1,5 +1,5 @@
 # 单 Dockerfile 多二进制（对齐 customer_and_opportunity/Dockerfile）
-FROM golang:1.25.4-alpine@sha256:d3f0cf7723f3429e3f9ed846243970b20a2de7bae6a5b66fc5914e228d831bbb AS builder
+FROM golang:1.26.10-alpine@sha256:27f2d3b83cfc5803c8078f8e730af0f7c431bf067afaec8f60a36fb763187cba AS builder
 
 ARG GOPROXY=https://goproxy.cn|https://proxy.golang.org|direct
 ARG GOSUMDB=sum.golang.google.cn

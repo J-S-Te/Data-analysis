@@ -37,6 +37,8 @@ type Config struct {
 	AuditEnvironmentCode string
 	AuditWorkerID        string
 	AuditRequired        bool
+	// TrustedProxies 是唯一允许采信 X-Real-IP / X-Forwarded-For 的直接对端集合。
+	TrustedProxies []string
 
 	AuthorizationContextURL string
 	MetabaseInternalURL     string
@@ -91,6 +93,7 @@ func LoadConfig() (Config, error) {
 		AuditApplicationCode: envOr("PLATFORM_APPLICATION_CODE", "data_analysis"),
 		AuditEnvironmentCode: envOr("PLATFORM_ENVIRONMENT_CODE", "dev"),
 		AuditWorkerID:        envOr("AUDIT_WORKER_ID", "dashboard-api"),
+		TrustedProxies:       commaList(envOr("APP_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")),
 		AuditRequired:        envBool("PLATFORM_AUDIT_REQUIRED", strings.EqualFold(envOr("PLATFORM_ENVIRONMENT_CODE", "dev"), "prod")),
 
 		AuthorizationContextURL: envOr("PLATFORM_AUTHORIZATION_CONTEXT_URL", "http://platform-api:8080/oauth2/authorization-context"),
@@ -115,6 +118,17 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// commaList 按逗号拆分并去除空白项，用于显式可信代理列表。
+func commaList(value string) []string {
+	items := make([]string, 0)
+	for _, part := range strings.Split(value, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			items = append(items, trimmed)
+		}
+	}
+	return items
 }
 
 func envOr(key string, fallback string) string {

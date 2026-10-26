@@ -145,7 +145,7 @@ func New(config Config) (*App, error) {
 	base.POST("/auth/backchannel-logout", authService.BackchannelLogout)
 
 	api := base.Group("/api/v1", middleware.SessionAuth(authService, "data_analysis_session"))
-	api.Use(middleware.AuditWrites(auditReporter, slog.Default()))
+	api.Use(middleware.AuditWrites(auditReporter, slog.Default(), config.TrustedProxies))
 	// 组级同源兜底（SEC-D11）：cookie 会话下的所有不安全方法先过 Origin/CSRF 校验，
 	// 即使个别路由忘记单独挂载 RequireSameOriginWrite 也默认受保护；
 	// PublicOrigin 为空时该中间件失败关闭，拒绝全部写请求。

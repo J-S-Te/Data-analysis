@@ -26,7 +26,7 @@ func TestAuditWritesReportsWriteOutcomeAndSkipsReads(t *testing.T) {
 	router.Use(RequestID(), func(c *gin.Context) {
 		c.Request = c.Request.WithContext(auth.WithPrincipal(c.Request.Context(), auth.Principal{UserID: "user-1", DisplayName: "User One"}))
 		c.Next()
-	}, AuditWrites(reporter, nil))
+	}, AuditWrites(reporter, nil, nil))
 	router.POST("/api/v1/alerts/:id/close", func(c *gin.Context) { c.Status(http.StatusForbidden) })
 	router.GET("/api/v1/alerts", func(c *gin.Context) { c.Status(http.StatusOK) })
 	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/v1/alerts/alert-1/close", nil))
@@ -47,7 +47,7 @@ func TestAuditWritesRecordsSensitiveReads(t *testing.T) {
 	router.Use(RequestID(), func(c *gin.Context) {
 		c.Request = c.Request.WithContext(auth.WithPrincipal(c.Request.Context(), auth.Principal{UserID: "user-1", DisplayName: "User One"}))
 		c.Next()
-	}, AuditWrites(reporter, nil))
+	}, AuditWrites(reporter, nil, nil))
 	router.GET("/api/v1/embed/:dashboard", func(c *gin.Context) { c.Status(http.StatusOK) })
 	router.GET("/api/v1/alerts", func(c *gin.Context) { c.Status(http.StatusOK) })
 	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/v1/embed/overview", nil))

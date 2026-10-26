@@ -37,7 +37,7 @@ func newAuditTestRouter(reporter platformaudit.Reporter, logger *slog.Logger, ha
 	router.Use(RequestID(), func(c *gin.Context) {
 		c.Request = c.Request.WithContext(auth.WithPrincipal(c.Request.Context(), auth.Principal{UserID: "user-1", DisplayName: "User One"}))
 		c.Next()
-	}, AuditWrites(reporter, logger))
+	}, AuditWrites(reporter, logger, nil))
 	router.POST("/api/v1/alerts/:id/close", handler)
 	router.GET("/api/v1/embed/:dashboard", handler)
 	return router
