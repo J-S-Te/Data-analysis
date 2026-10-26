@@ -24,6 +24,7 @@ type Session struct {
 	SessionIDHash          string     `gorm:"column:session_id_hash;primaryKey"`
 	TenantID               string     `gorm:"column:tenant_id"`
 	PlatformUserID         string     `gorm:"column:platform_user_id"`
+	Username               string     `gorm:"column:username"`
 	DisplayName            string     `gorm:"column:display_name"`
 	RolesJSON              string     `gorm:"column:roles_json"`
 	PermissionsJSON        string     `gorm:"column:permissions_json"`

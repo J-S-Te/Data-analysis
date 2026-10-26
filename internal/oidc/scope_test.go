@@ -15,4 +15,7 @@ func TestPrincipalScopeRequiresExplicitTenantBinding(t *testing.T) {
 	if mode, _, _ := principalScope([]DataScope{{RoleCode: "boss", ScopeType: "TENANT"}}, []string{"boss"}); mode != ScopeTenant {
 		t.Fatalf("tenant mode=%s", mode)
 	}
+	if mode, _, _ := principalScope([]DataScope{{RoleCode: "boss", ScopeType: "APPLICATION"}}, []string{"boss"}); mode != ScopeTenant {
+		t.Fatalf("application role must be tenant-wide, mode=%s", mode)
+	}
 }

@@ -110,6 +110,7 @@ func (h *Handler) AuthMe(c *gin.Context) {
 		"user_id":          principal.UserID,
 		"tenant_id":        principal.TenantID,
 		"display_name":     principal.DisplayName,
+		"username":         principal.Username,
 		"roles":            principal.Roles,
 		"permissions":      sortedKeys(principal.Permissions),
 		"role_config_hash": principal.RoleConfigHash,

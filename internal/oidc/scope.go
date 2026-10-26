@@ -6,10 +6,11 @@ import (
 )
 
 const (
-	ScopeTenant = "TENANT"
-	ScopeOrg    = "ORG"
-	ScopeTeam   = "TEAM"
-	ScopeNone   = "NONE"
+	ScopeTenant      = "TENANT"
+	ScopeApplication = "APPLICATION"
+	ScopeOrg         = "ORG"
+	ScopeTeam        = "TEAM"
+	ScopeNone        = "NONE"
 )
 
 // principalScope 将平台数据范围转换为看板边界。
@@ -29,7 +30,9 @@ func principalScope(scopes []DataScope, roles []string) (string, []string, []str
 	for _, scope := range scopes {
 		scopeType := strings.ToUpper(strings.TrimSpace(scope.ScopeType))
 		scopeID := strings.TrimSpace(scope.ScopeID)
-		if scopeType == ScopeTenant {
+		// 平台应用角色以 APPLICATION 表示“整个应用/租户范围”。看板把
+		// APPLICATION 与显式 TENANT 都视为全租户边界；ORG/TEAM 仍按明细收窄。
+		if scopeType == ScopeTenant || scopeType == ScopeApplication {
 			return ScopeTenant, nil, nil
 		}
 		if scopeID == "" {

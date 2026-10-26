@@ -195,6 +195,22 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 	if err := validateIDTokenClaims(claims, expectedNonce, s.tenantID, transaction.TenantID); err != nil {
 		return "", Session{}, err
 	}
+
+	if strings.TrimSpace(claims.PreferredUsername) == "" {
+		info, profileErr := s.provider.UserInfo(ctx, oauth2.StaticTokenSource(rawToken))
+		if profileErr != nil {
+			return "", Session{}, profileErr
+		}
+		var profile struct {
+			Subject  string `json:"sub"`
+			Username string `json:"preferred_username"`
+		}
+		if profileErr = info.Claims(&profile); profileErr != nil || profile.Subject != claims.Sub {
+			return "", Session{}, errors.New("OIDC UserInfo subject mismatch")
+		}
+		claims.PreferredUsername = strings.TrimSpace(profile.Username)
+	}
+
 	accessTokenCipher, err := s.codec.encrypt(rawToken.AccessToken)
 	if err != nil {
 		return "", Session{}, err
@@ -225,6 +241,7 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 		TenantID:               authz.TenantID,
 		PlatformUserID:         platformSubjectID,
 		DisplayName:            claims.Name,
+		Username:               strings.TrimSpace(claims.PreferredUsername),
 		RolesJSON:              string(rolesJSON),
 		PermissionsJSON:        string(permissionsJSON),
 		DataScopesJSON:         string(dataScopesJSON),
@@ -345,6 +362,7 @@ func (s *Service) Authenticate(ctx context.Context, cookieValue string) (auth.Pr
 		UserID:          session.PlatformUserID,
 		TenantID:        session.TenantID,
 		DisplayName:     session.DisplayName,
+		Username:        session.Username,
 		Roles:           session.Roles(),
 		Permissions:     session.Permissions(),
 		ScopeMode:       scopeMode,
