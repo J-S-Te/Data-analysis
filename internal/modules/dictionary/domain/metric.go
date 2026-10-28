@@ -11,14 +11,16 @@ type Metric struct {
 	Enabled            bool   `json:"enabled"`
 	CalculationBinding string `json:"calculation_binding" gorm:"-"`
 	CanEnable          bool   `json:"can_enable" gorm:"-"`
-	Code               string `json:"code" gorm:"index:tenant_code,unique"`
-	Name               string `json:"name"`
-	Dashboard          string `json:"dashboard"`
-	Definition         string `json:"definition"`
-	Formula            string `json:"formula"`
-	Source             string `json:"source"`
-	Period             string `json:"period"`
-	Status             string `json:"status"`
+	// EnableBlockReason 是服务端计算的不可启用原因码，仅用于展示；空字符串表示当前可启用。
+	EnableBlockReason string `json:"enable_block_reason" gorm:"-"`
+	Code              string `json:"code" gorm:"index:tenant_code,unique"`
+	Name              string `json:"name"`
+	Dashboard         string `json:"dashboard"`
+	Definition        string `json:"definition"`
+	Formula           string `json:"formula"`
+	Source            string `json:"source"`
+	Period            string `json:"period"`
+	Status            string `json:"status"`
 }
 
 type MetricVersion struct {

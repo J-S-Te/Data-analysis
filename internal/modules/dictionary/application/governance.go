@@ -104,6 +104,7 @@ func builtinMetrics() []domain.Metric {
 func derived(m domain.Metric) domain.Metric {
 	m.CalculationBinding = ""
 	m.CanEnable = false
+	m.EnableBlockReason = ""
 	// 项目状态计数由原生项目快照读取器提供。
 	if m.Origin == "BUILTIN" && m.Code == "2.1" && m.Status == "已确认" {
 		for _, b := range publishedMetrics {
@@ -115,9 +116,23 @@ func derived(m domain.Metric) domain.Metric {
 	}
 	if !m.CanEnable {
 		m.Enabled = false
+		m.EnableBlockReason = enableBlockReason(m)
 	}
 	return m
 }
+
+// enableBlockReason 说明指标为何不能启用：口径未确认、口径偏离发布版本，
+// 或该指标尚未接入受控计算执行器。原因由服务端计算，前端只做展示映射。
+func enableBlockReason(m domain.Metric) string {
+	if m.Origin == "BUILTIN" && m.Code == "2.1" {
+		if m.Status != "已确认" {
+			return "METRIC_STATUS_UNCONFIRMED"
+		}
+		return "CALCULATION_DEFINITION_DRIFT"
+	}
+	return "CALCULATION_BINDING_MISSING"
+}
+
 func sameCalculation(a, b domain.Metric) bool {
 	return a.Dashboard == b.Dashboard && a.Definition == b.Definition && a.Formula == b.Formula && a.Source == b.Source && a.Period == b.Period
 }

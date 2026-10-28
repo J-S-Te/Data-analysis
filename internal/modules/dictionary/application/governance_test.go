@@ -176,6 +176,36 @@ func TestBulkRollbackAndReadOnlyFields(t *testing.T) {
 	expectCode(t, e, "METRIC_VALIDATION_FAILED")
 }
 
+func TestEnableBlockReason(t *testing.T) {
+	b, _ := builtin("2.1")
+	if m := derived(b); m.EnableBlockReason != "" || !m.CanEnable {
+		t.Fatalf("native binding should be enableable: %+v", m)
+	}
+	unconfirmed := b
+	unconfirmed.Status = "待确认"
+	if m := derived(unconfirmed); m.EnableBlockReason != "METRIC_STATUS_UNCONFIRMED" || m.CanEnable {
+		t.Fatalf("unconfirmed reason: %+v", m)
+	}
+	drifted := b
+	drifted.Definition = "另一套产值口径"
+	if m := derived(drifted); m.EnableBlockReason != "CALCULATION_DEFINITION_DRIFT" || m.CanEnable {
+		t.Fatalf("drift reason: %+v", m)
+	}
+	for _, m := range []domain.Metric{
+		metric("1.1", "签约金额", "合同看板", "定义", "公式", "来源", "月", "已确认"),
+		{Code: "custom.kpi", Origin: "CUSTOM", Status: "已确认"},
+		{Code: "custom.pending", Origin: "CUSTOM", Status: "待确认"},
+	} {
+		if got := derived(m); got.EnableBlockReason != "CALCULATION_BINDING_MISSING" {
+			t.Fatalf("%s block reason %+v", m.Code, got)
+		}
+	}
+	enabled := b
+	enabled.Enabled = true
+	if m := derived(enabled); m.EnableBlockReason != "" || !m.Enabled {
+		t.Fatalf("enabled native metric: %+v", m)
+	}
+}
 func TestBindingRequiresConfirmedStatus(t *testing.T) {
 	db := testDB(t)
 	s := NewCatalogService(db)
