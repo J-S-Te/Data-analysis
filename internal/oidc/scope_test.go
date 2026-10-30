@@ -19,3 +19,16 @@ func TestPrincipalScopeRequiresExplicitTenantBinding(t *testing.T) {
 		t.Fatalf("application role must be tenant-wide, mode=%s", mode)
 	}
 }
+
+// TestPrincipalScopeExplicitSelf 使用真实平台授权范围映射，禁止请求指定用户。
+// 参数：t 为测试上下文。
+// 返回值：无，SELF保留为个人边界，未知或缺失范围保持NONE。
+func TestPrincipalScopeExplicitSelf(t *testing.T) {
+	mode, orgs, teams := principalScope([]DataScope{{ScopeType: "SELF"}}, nil)
+	if mode != "SELF" || len(orgs) != 0 || len(teams) != 0 {
+		t.Fatalf("actual SELF mapping: %s %v %v", mode, orgs, teams)
+	}
+	if mode, _, _ := principalScope([]DataScope{{ScopeType: "mystery"}}, nil); mode != ScopeNone {
+		t.Fatal("unknown became tenant")
+	}
+}

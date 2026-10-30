@@ -105,14 +105,17 @@ func TestBusinessSnapshotPersistenceLicenseAndAtomicFailure(t *testing.T) {
 	}
 }
 
+// TestConversionDistinctAuthoritativeLinkAndReplacement 验证ConversionDistinctAuthoritativeLinkAndReplacement的业务约束与回归行为。
+// 参数：t为测试上下文，使用独立夹具。
+// 返回值：无；预期结果或状态不一致时测试失败。
 func TestConversionDistinctAuthoritativeLinkAndReplacement(t *testing.T) {
 	db := newScanTestDB(t)
 	for _, sql := range []string{
 		`CREATE TABLE dim_opportunity (tenant_id TEXT,opportunity_id INTEGER,contract_id TEXT,current_stage TEXT,opp_status TEXT,created_at DATETIME,deleted_at DATETIME)`,
-		`CREATE TABLE dim_contract (tenant_id TEXT,contract_id TEXT,opportunity_id TEXT,status TEXT)`,
+		`CREATE TABLE dim_contract (origin_kind TEXT DEFAULT 'NORMAL',tenant_id TEXT,contract_id TEXT,opportunity_id TEXT,status TEXT)`,
 		`CREATE TABLE fct_opportunity_conversion (tenant_id TEXT,period_month TEXT,opportunity_count INTEGER,won_contract_count INTEGER,snapshot_at DATETIME,PRIMARY KEY(tenant_id,period_month))`,
 		`INSERT INTO dim_opportunity VALUES ('a',1,'c1','已签约','CLOSED','2026-10-01',NULL),('a',2,NULL,'投标','FOLLOWING','2026-10-02',NULL),('a',3,'c3','已签约','CLOSED','2026-10-03',NULL),('a',4,NULL,'已签约','VOID','2026-10-04',NULL),('a',5,NULL,'报价','FOLLOWING','2026-10-04','2026-10-05'),('other',1,'c1','已签约','CLOSED','2026-10-01',NULL)`,
-		`INSERT INTO dim_contract VALUES ('a','c1','1','active'),('a','c2','1','completed'),('a','c3','3','draft'),('other','c3','3','active')`,
+		`INSERT INTO dim_contract (tenant_id,contract_id,opportunity_id,status) VALUES ('a','c1','1','active'),('a','c2','1','completed'),('a','c3','3','draft'),('other','c3','3','active')`,
 	} {
 		if err := db.Exec(sql).Error; err != nil {
 			t.Fatal(err)

@@ -31,12 +31,9 @@ func (r *Runner) PrecomputeConversion(ctx context.Context) error {
 	})
 }
 
-// conversionFactQuery 构造商机转化事实的 INSERT ... SELECT。
-//
-// MySQL 下 dim_contract 与 dim_opportunity 的字符集排序规则可能不同
-// （utf8mb4_unicode_ci vs utf8mb4_0900_ai_ci），两列直接比较会报
-// "Illegal mix of collations"。这里对参与比较的两侧显式指定同一排序规则，
-// 而不是去改数据库/表的默认设置（那会影响其他系统）。
+// conversionFactQuery 构造仅普通合同可佐证的去重商机转化查询。
+// 参数：dialect 为数据库方言，用于安全统一月份和跨表字符比较。
+// 返回值：带快照时间及租户占位符的INSERT SELECT，不修改源表排序规则。
 func conversionFactQuery(dialect string) string {
 	month := "COALESCE(DATE_FORMAT(o.created_at, '%Y-%m'), 'UNKNOWN')"
 	id := "CAST(o.opportunity_id AS CHAR)"
@@ -59,7 +56,7 @@ func conversionFactQuery(dialect string) string {
 		" OR (o.contract_id IS NOT NULL AND o.contract_id <> '' AND " + wrap("c.contract_id") + " = " + wrap("o.contract_id") + "))"
 	return `INSERT INTO fct_opportunity_conversion (tenant_id,period_month,opportunity_count,won_contract_count,snapshot_at)
 SELECT o.tenant_id, ` + month + `, COUNT(*), SUM(CASE WHEN o.current_stage = '已签约' AND EXISTS (
-SELECT 1 FROM dim_contract c WHERE c.tenant_id=o.tenant_id AND c.status IN ('active','in_progress','pending_pay','completed')
+SELECT 1 FROM dim_contract c WHERE c.tenant_id=o.tenant_id AND c.origin_kind = 'NORMAL' AND c.status IN ('active','in_progress','pending_pay','completed')
 AND ` + match + `) THEN 1 ELSE 0 END), ?
 FROM dim_opportunity o WHERE o.tenant_id = ? AND o.deleted_at IS NULL AND o.opp_status <> 'VOID'
 GROUP BY o.tenant_id, ` + month

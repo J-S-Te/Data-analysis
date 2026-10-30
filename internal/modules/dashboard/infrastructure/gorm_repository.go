@@ -124,7 +124,9 @@ func (repository *GORMRepository) LatestProject(ctx context.Context, tenantID st
 	}, true, nil
 }
 
-// ListContracts 返回租户合同脱敏明细，分页参数由应用层约束后再执行。
+// ListContracts 返回范围内普通合同的脱敏分页明细。
+// 参数：ctx 含可信范围，tenantID 为租户，page/pageSize 为受限分页。
+// 返回值：普通合同列表、总数及数据库错误；历史/未知来源被排除。
 func (repository *GORMRepository) ListContracts(ctx context.Context, tenantID string, page, pageSize int) ([]domain.ContractDetail, int64, error) {
 	if page < 1 {
 		page = 1
@@ -132,8 +134,8 @@ func (repository *GORMRepository) ListContracts(ctx context.Context, tenantID st
 	if pageSize < 1 || pageSize > 100 {
 		pageSize = 20
 	}
-	query := repository.db.WithContext(ctx).Table("dim_contract").Where("tenant_id = ?", tenantID)
-	query = applyOrgScope(query, scopeFor(ctx, tenantID), "owner_org_id")
+	query := repository.db.WithContext(ctx).Table("dim_contract").Where("origin_kind = 'NORMAL'").Where("tenant_id = ?", tenantID)
+	query = applyContractScope(query, scopeFor(ctx, tenantID))
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, err
@@ -191,6 +193,19 @@ func (repository *GORMRepository) ListTrend(ctx context.Context, tenantID string
 	return rows, nil
 }
 
+// applyContractScope 对普通合同使用与历史分栏相同的可信个人/组织边界。
+// 参数：query 为租户已限定的查询，scope 为可信主体范围。
+// 返回值：个人仅匹配owner_user_id，其余复用组织策略的安全查询。
+func applyContractScope(query *gorm.DB, scope queryScope) *gorm.DB {
+	if scope.mode == "SELF" {
+		if scope.userID == "" {
+			return query.Where("1=0")
+		}
+		return query.Where("owner_user_id=?", scope.userID)
+	}
+	return applyOrgScope(query, scope, "owner_org_id")
+}
+
 func applyOrgScope(query *gorm.DB, scope queryScope, column string) *gorm.DB {
 	switch scope.mode {
 	case "TENANT":
@@ -205,8 +220,11 @@ func applyOrgScope(query *gorm.DB, scope queryScope, column string) *gorm.DB {
 	}
 }
 
+// scopedContract 按授权组织或团队统计普通合同。
+// 参数：ctx 为读取上下文，scope 为已解析的可信范围。
+// 返回值：范围快照、可用标记及读取错误；历史和未知来源不计入。
 func (repository *GORMRepository) scopedContract(ctx context.Context, scope queryScope) (domain.ContractSnapshot, bool, error) {
-	if len(scope.orgUnitIDs) == 0 {
+	if len(scope.orgUnitIDs) == 0 && (scope.mode != "SELF" || scope.userID == "") {
 		return domain.ContractSnapshot{DiscountBuckets: map[string]int64{}}, false, nil
 	}
 	var row struct {
@@ -218,7 +236,7 @@ func (repository *GORMRepository) scopedContract(ctx context.Context, scope quer
 		// 源业务行 updated_at 的最大值，用于 source_updated_at，不能拿查询时间顶替。
 		SourceUpdatedAt *string `gorm:"column:source_updated_at"`
 	}
-	scoped := applyOrgScope(repository.db.WithContext(ctx).Table("dim_contract").Where("tenant_id = ?", scope.tenantID), scope, "owner_org_id")
+	scoped := applyContractScope(repository.db.WithContext(ctx).Table("dim_contract").Where("origin_kind = 'NORMAL'").Where("tenant_id = ?", scope.tenantID), scope)
 	err := scoped.Select(`COALESCE(SUM(amount_minor),0) AS total_amount_minor, COUNT(*) AS total_contracts,
 			COALESCE(SUM(status IN ('APPROVING','PENDING_APPROVAL','APPROVAL')),0) AS approval_contracts,
 			COALESCE(SUM(status IN ('ACTIVE','EFFECTIVE','SIGNED')),0) AS active_contracts,
@@ -232,7 +250,7 @@ func (repository *GORMRepository) scopedContract(ctx context.Context, scope quer
 		AmountMinor int64
 		Contracts   int64
 	}
-	if err := applyOrgScope(repository.db.WithContext(ctx).Table("dim_contract").Where("tenant_id = ?", scope.tenantID), scope, "owner_org_id").
+	if err := applyContractScope(repository.db.WithContext(ctx).Table("dim_contract").Where("origin_kind = 'NORMAL'").Where("tenant_id = ?", scope.tenantID), scope).
 		Select("currency, COALESCE(SUM(amount_minor),0) AS amount_minor, COUNT(*) AS contracts").Group("currency").Order("currency").Scan(&currencyRows).Error; err != nil {
 		return domain.ContractSnapshot{}, false, err
 	}
@@ -367,8 +385,11 @@ func stringValue(value *string) string {
 	return *value
 }
 
+// scopedTrend 按范围汇总普通合同趋势和项目创建趋势。
+// 参数：ctx 为读取上下文，scope 为可信范围，months 为月份上限。
+// 返回值：分币种趋势及数据库错误；历史/未知来源不计普通合同。
 func (repository *GORMRepository) scopedTrend(ctx context.Context, scope queryScope, months int) ([]domain.TrendPoint, error) {
-	if len(scope.orgUnitIDs) == 0 {
+	if len(scope.orgUnitIDs) == 0 && (scope.mode != "SELF" || scope.userID == "") {
 		return nil, nil
 	}
 	var contractFacts []struct {
@@ -377,7 +398,7 @@ func (repository *GORMRepository) scopedTrend(ctx context.Context, scope querySc
 		Amount   int64
 		Count    int64
 	}
-	err := applyOrgScope(repository.db.WithContext(ctx).Table("dim_contract").Where("tenant_id = ?", scope.tenantID), scope, "owner_org_id").
+	err := applyContractScope(repository.db.WithContext(ctx).Table("dim_contract").Where("origin_kind = 'NORMAL'").Where("tenant_id = ?", scope.tenantID), scope).
 		Select("DATE_FORMAT(COALESCE(start_date, DATE(updated_at)), '%Y-%m') AS period, currency, COALESCE(SUM(amount_minor),0) AS amount, COUNT(*) AS count").
 		Group("period,currency").Order("period DESC").Limit(months * 8).Scan(&contractFacts).Error
 	if err != nil {
