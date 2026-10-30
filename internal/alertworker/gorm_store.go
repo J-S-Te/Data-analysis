@@ -59,6 +59,9 @@ func (s *GormStore) validateTenant() error {
 	return nil
 }
 
+// FindContractExpiryCandidates 仅读取普通合同的租户到期候选。
+// 参数：ctx 为查询上下文，evaluatedAt 为计算基准，days 为提醒窗口天数。
+// 返回值：范围内候选列表；租户缺失或读取失败返回错误。
 func (s *GormStore) FindContractExpiryCandidates(
 	ctx context.Context,
 	evaluatedAt time.Time,
@@ -69,7 +72,7 @@ func (s *GormStore) FindContractExpiryCandidates(
 	}
 	var candidates []ContractExpiryCandidate
 	err := s.db.WithContext(ctx).
-		Table("dim_contract").
+		Table("dim_contract").Where("origin_kind = 'NORMAL'").
 		Select(`tenant_id, owner_org_id, contract_id AS target_ref,
 CONCAT('合同「', title, '」将在 ', DATE_FORMAT(end_date, '%Y-%m-%d'), ' 到期') AS title,
 end_date AS due_date`).

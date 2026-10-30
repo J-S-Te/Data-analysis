@@ -8,23 +8,26 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/unified-identity-auth-platform/data-analysis/internal/importreport"
 )
 
 type Config struct {
-	ListenAddr         string
-	MySQLDSN           string
-	PathPrefix         string
-	PublicOrigin       string
-	OIDCIssuer         string
-	OIDCBackchannel    string
-	OIDCClientID       string
-	OIDCClientSecret   string
-	OIDCRedirectURI    string
-	OIDCTenantID       string
-	OIDCRoleConfigHash string
-	OIDCMaxRoles       int
-	CodecKey           []byte
-	SecureCookie       bool
+	ContractImportStatus importreport.VerifierOptions
+	ListenAddr           string
+	MySQLDSN             string
+	PathPrefix           string
+	PublicOrigin         string
+	OIDCIssuer           string
+	OIDCBackchannel      string
+	OIDCClientID         string
+	OIDCClientSecret     string
+	OIDCRedirectURI      string
+	OIDCTenantID         string
+	OIDCRoleConfigHash   string
+	OIDCMaxRoles         int
+	CodecKey             []byte
+	SecureCookie         bool
 
 	PlatformBaseURL      string
 	CatalogSyncEnabled   bool
@@ -48,6 +51,9 @@ type Config struct {
 	DashboardIDs            map[string]string
 }
 
+// LoadConfig 读取API进程配置及独立报告状态信任绑定。
+// 参数：无，配置来自环境变量。
+// 返回值：配置或必需参数错误；不输出秘密值。
 func LoadConfig() (Config, error) {
 	codecKeyHex := os.Getenv("OIDC_CODEC_KEY")
 	if len(codecKeyHex) != 64 {
@@ -68,6 +74,11 @@ func LoadConfig() (Config, error) {
 	// Secure Cookie，避免生产漏配导致会话凭据以明文 Cookie 传输。
 	secure := envBool("COOKIE_SECURE", strings.HasPrefix(strings.ToLower(publicOrigin), "https://"))
 	return Config{
+		ContractImportStatus: importreport.VerifierOptions{
+			Issuer: os.Getenv("CONTRACT_IMPORT_STATUS_ISSUER"), Audience: os.Getenv("CONTRACT_IMPORT_STATUS_AUDIENCE"),
+			PublicKeyPath: os.Getenv("CONTRACT_IMPORT_STATUS_PUBLIC_KEY_PATH"), ClientID: os.Getenv("CONTRACT_IMPORT_STATUS_CLIENT_ID"),
+			TenantID: os.Getenv("CONTRACT_IMPORT_STATUS_TENANT_ID"), CallerEnvironment: os.Getenv("CONTRACT_IMPORT_STATUS_CALLER_ENVIRONMENT_CODE"),
+		},
 		ListenAddr:         envOr("LISTEN_ADDR", ":8080"),
 		MySQLDSN:           os.Getenv("DASHBOARD_MYSQL_DSN"),
 		PathPrefix:         pathPrefix,

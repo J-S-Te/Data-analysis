@@ -14,6 +14,9 @@ import (
 	"gorm.io/gorm"
 )
 
+// freshnessTestDB 建立隔离的内存统计夹具并补齐来源列。
+// 参数：t为测试上下文。
+// 返回值：供本用例使用的GORM连接，初始化失败终止用例。
 func freshnessTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
@@ -27,7 +30,7 @@ func freshnessTestDB(t *testing.T) *gorm.DB {
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	for _, ddl := range []string{
-		`CREATE TABLE dim_contract (
+		`CREATE TABLE dim_contract (origin_kind TEXT DEFAULT 'NORMAL',
 			tenant_id TEXT, contract_id TEXT, contract_number TEXT, title TEXT, status TEXT,
 			amount_minor INTEGER, currency TEXT, end_date DATE, start_date DATE,
 			owner_org_id TEXT, updated_at DATETIME)`,

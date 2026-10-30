@@ -19,6 +19,9 @@ import (
 	"gorm.io/gorm"
 )
 
+// main 启动受许可保护的聚合执行进程。
+// 参数：无，配置由环境和命令行提供。
+// 返回值：无，初始化或单轮失败时进程非零退出。
 func main() {
 	once := flag.Bool("once", os.Getenv("AGGREGATION_ONCE") == "true", "run a single sync pass and exit")
 	interval := flag.Duration("interval", 60*time.Second, "loop interval (ignored with --once)")
@@ -31,6 +34,11 @@ func main() {
 	slog.SetDefault(logger)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	importOptions, err := importReportOptionsFromEnv()
+	if err != nil {
+		logger.Error("contract import report configuration invalid", "error", err)
+		os.Exit(1)
+	}
 	projection, err := projectProjectionOptionsFromEnv()
 	if err != nil {
 		logger.Error("project projection configuration invalid", "error", err)
@@ -55,7 +63,7 @@ func main() {
 		}
 	}
 	var runner *aggregation.Runner
-	if len(sources) > 0 || projection.URL != "" {
+	if len(sources) > 0 || projection.URL != "" || importOptions.Enabled {
 		runner, err = aggregation.NewRunner(aggDSN, os.Getenv("OIDC_TENANT_ID"), sources)
 		if err != nil {
 			logger.Error("aggregation runner failed", "error", err)
@@ -97,6 +105,15 @@ func main() {
 		runner.ProjectAPI = apiSync
 	}
 	pass := aggregation.Pass{LicenseCheck: checkBusiness}
+	if importOptions.Enabled {
+		importAPI := aggregation.NewAPISyncRunner(aggDB, aggregation.APISyncOptions{
+			LicenseCheck: checkBusiness, MachineTokenURL: importOptions.TokenURL,
+			MachineTokenIssuer:   firstNonEmpty(os.Getenv("MACHINE_TOKEN_ISSUER"), os.Getenv("OIDC_ISSUER")),
+			MachineTokenAudience: firstNonEmpty(os.Getenv("MACHINE_TOKEN_AUDIENCE"), "basic-platform-application"),
+			TenantID:             os.Getenv("OIDC_TENANT_ID"), ContractCredential: importOptions.Credential,
+		})
+		pass.SyncImportReport = func(ctx context.Context) error { return runner.SyncImportReport(ctx, importAPI, importOptions.URL) }
+	}
 	if runner != nil {
 		// 主动跨库同步：从源库（合同/客户）读取并写入聚合库维表，保证看板有数据。
 		pass.SyncSources = func(ctx context.Context) error {

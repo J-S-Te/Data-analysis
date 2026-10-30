@@ -10,9 +10,13 @@ import (
 type queryScope struct {
 	mode       string
 	tenantID   string
+	userID     string
 	orgUnitIDs []string
 }
 
+// scopeFor 从可信会话主体读取查询范围，不接受请求声明的用户ID。
+// 参数：ctx 为主体上下文，tenantID 为上层授权租户。
+// 返回值：模式、组织/团队及个人ID；真实会话未知模式在查询时拒绝。
 func scopeFor(ctx context.Context, tenantID string) queryScope {
 	principal, ok := auth.FromContext(ctx)
 	if !ok {
@@ -43,5 +47,5 @@ func scopeFor(ctx context.Context, tenantID string) queryScope {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	return queryScope{mode: mode, tenantID: tenantID, orgUnitIDs: ids}
+	return queryScope{mode: mode, tenantID: tenantID, orgUnitIDs: ids, userID: principal.UserID}
 }

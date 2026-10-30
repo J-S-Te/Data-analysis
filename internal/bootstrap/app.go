@@ -15,6 +15,7 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/embedbridge"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/importreport"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/middleware"
 	adminapplication "github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin/application"
 	admininfrastructure "github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin/infrastructure"
@@ -43,8 +44,20 @@ type App struct {
 }
 
 // New 使用给定 Config 创建数据库连接、OIDC 服务、嵌入桥和 API 路由，返回可运行的 App。
-// 参数 config 为必需运行参数；返回 *App 时包含聚合后的配置、DB、Router 与 HTTP Server，返回 error 时表示初始化阶段任一组件装配失败（如数据库 DSN 无效、OIDC 初始化失败）。
+// 参数：config 为数据库、认证、许可和机器信任绑定的运行配置。
+// 返回值：可运行的App；配置或初始化失败返回错误。
 func New(config Config) (*App, error) {
+	var reportVerifier *importreport.Verifier
+	if config.ContractImportStatus.ClientID != "" {
+		if config.ContractImportStatus.TenantID != config.OIDCTenantID {
+			return nil, errors.New("report-status trusted tenant mismatch")
+		}
+		var err error
+		reportVerifier, err = importreport.NewVerifier(config.ContractImportStatus)
+		if err != nil {
+			return nil, err
+		}
+	}
 	licenseContext, stopLicense := context.WithCancel(context.Background())
 	initialized := false
 	defer func() {
@@ -115,6 +128,13 @@ func New(config Config) (*App, error) {
 	router := gin.New()
 	router.Use(middleware.RequestID(), gin.Recovery())
 	base := router.Group(strings.TrimRight(config.PathPrefix, "/"))
+	if reportVerifier != nil {
+		status := importreport.StatusHandler(db, reportVerifier, func(ctx context.Context) error { return licenseCheck.Allow(ctx, commercial.ReadHistory) })
+		router.GET("/internal/v1/contract-imports/report-status", status)
+		if strings.TrimRight(config.PathPrefix, "/") != "" {
+			base.GET("/internal/v1/contract-imports/report-status", status)
+		}
+	}
 	base.GET("/livez", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 	base.GET("/readyz", func(c *gin.Context) {
 		sqlDB, pingErr := db.DB()
@@ -181,6 +201,7 @@ func New(config Config) (*App, error) {
 
 	adminHandler := adminhttp.NewHandler(adminapplication.NewService(admininfrastructure.NewGORMRepository(db)))
 	dashboardHandler := dashboardhttp.NewHandler(dashboardapplication.NewService(dashboardinfrastructure.NewGORMRepository(db)))
+	api.GET("/dashboard/contract-import-history", middleware.RequirePermission("dashboard.contract.view"), importreport.HistoryHandler(db))
 	api.GET("/dashboard/contract", middleware.RequirePermission("dashboard.contract.view"), dashboardHandler.Contract)
 	api.GET("/dashboard/project", middleware.RequirePermission("dashboard.project.view"), dashboardHandler.Project)
 	api.GET("/dashboard/report", middleware.RequirePermission("dashboard.report.view"), dashboardHandler.Business("report"))

@@ -283,7 +283,9 @@ func scanSourceBatches[T any, K comparable](src *gorm.DB, table, selectColumns, 
 	}
 }
 
-// syncContract 合同库 → dim_contract（con_contract 全量快照，幂等 upsert）。
+// syncContract 将合同来源及来源类型同步到独立租户维表。
+// 参数：ctx 为许可/取消上下文，dsn 为显式配置的合同只读连接。
+// 返回值：同步成功为nil；源读取或聚合写入失败返回错误。
 func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 	src, err := gorm.Open(mysql.Open(dsn), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
@@ -297,6 +299,7 @@ func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 	src = src.WithContext(ctx).Where("tenant_id = ?", r.tenantID)
 
 	type sourceRow struct {
+		OriginKind      string
 		TenantID        string
 		ID              string
 		ContractNumber  *string
@@ -321,7 +324,7 @@ func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 	// AUD-2026-030：con_contract 全量改为主键（id，字符串业务主键）游标分批读取，
 	// 每批内沿用既有 200 行 upsert 分块，落库结果与全量读取等价。
 	if err := scanSourceBatches(src, "con_contract",
-		"tenant_id, id, contract_number, title, contract_type, service_type, status, start_date, end_date, crm_customer_id, opportunity_id, amount_minor, currency, owner_user_id, owner_org_id, owner_identity_id, project_id, updated_at",
+		"origin_kind, tenant_id, id, contract_number, title, contract_type, service_type, status, start_date, end_date, crm_customer_id, opportunity_id, amount_minor, currency, owner_user_id, owner_org_id, owner_identity_id, project_id, updated_at",
 		"id", func(row sourceRow) string { return row.ID }, sourceReadBatchSize, func(rows []sourceRow) error {
 			total += len(rows)
 			for i := 0; i < len(rows); i += upsertChunkSize {
@@ -352,10 +355,10 @@ func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 						return err
 					}
 					if err := r.execAggregation(ctx, `INSERT INTO dim_contract
-(tenant_id, contract_id, contract_number, title, contract_type, service_type, status, start_date, end_date, crm_customer_id, opportunity_id, amount_minor, currency, owner_user_id, owner_org_id, owner_identity_id, project_id, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON DUPLICATE KEY UPDATE contract_number=VALUES(contract_number), title=VALUES(title), contract_type=VALUES(contract_type), service_type=VALUES(service_type), status=VALUES(status), start_date=VALUES(start_date), end_date=VALUES(end_date), crm_customer_id=VALUES(crm_customer_id), opportunity_id=VALUES(opportunity_id), currency=VALUES(currency), amount_minor=VALUES(amount_minor), owner_user_id=VALUES(owner_user_id), owner_identity_id=VALUES(owner_identity_id), project_id=VALUES(project_id), owner_org_id=VALUES(owner_org_id), updated_at=VALUES(updated_at)`,
-						tenant, row.ID, row.ContractNumber, row.Title, row.ContractType, row.ServiceType, row.Status,
+(origin_kind, tenant_id, contract_id, contract_number, title, contract_type, service_type, status, start_date, end_date, crm_customer_id, opportunity_id, amount_minor, currency, owner_user_id, owner_org_id, owner_identity_id, project_id, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE origin_kind=VALUES(origin_kind), contract_number=VALUES(contract_number), title=VALUES(title), contract_type=VALUES(contract_type), service_type=VALUES(service_type), status=VALUES(status), start_date=VALUES(start_date), end_date=VALUES(end_date), crm_customer_id=VALUES(crm_customer_id), opportunity_id=VALUES(opportunity_id), currency=VALUES(currency), amount_minor=VALUES(amount_minor), owner_user_id=VALUES(owner_user_id), owner_identity_id=VALUES(owner_identity_id), project_id=VALUES(project_id), owner_org_id=VALUES(owner_org_id), updated_at=VALUES(updated_at)`,
+						row.OriginKind, tenant, row.ID, row.ContractNumber, row.Title, row.ContractType, row.ServiceType, row.Status,
 						row.StartDate, row.EndDate, crmID, row.OpportunityID, row.AmountMinor, row.Currency,
 						row.OwnerUserID, org, identity, project, row.UpdatedAt); err != nil {
 						return err
@@ -486,8 +489,9 @@ ON DUPLICATE KEY UPDATE name=VALUES(name), customer_id=VALUES(customer_id), type
 	return nil
 }
 
-// 签署仍按既有 start_date 口径分组；漏斗单独
-// 按商机同期群物化，不能被合同或分桶连接倍增。
+// PrecomputeContractSigning 仅按普通合同原生效日预计算签约事实。
+// 参数：ctx 为许可和取消上下文。
+// 返回值：成功为nil；历史/未知来源不计入，数据库失败返回错误。
 func (r *Runner) PrecomputeContractSigning(ctx context.Context) error {
 	if err := r.checkLicense(ctx); err != nil {
 		return err
@@ -526,7 +530,7 @@ SELECT c.tenant_id,
        ? AS metric_dict_version
 FROM dim_contract c
 LEFT JOIN dim_customer cu ON cu.tenant_id = c.tenant_id AND cu.customer_id = c.crm_customer_id
-WHERE c.tenant_id = ? AND c.start_date IS NOT NULL` + statusFilter + `
+WHERE c.tenant_id = ? AND c.origin_kind = 'NORMAL' AND c.start_date IS NOT NULL` + statusFilter + `
 GROUP BY c.tenant_id, period_month, region, customer_category, c.owner_user_id, c.currency`
 	if err := r.checkLicense(ctx); err != nil {
 		return err

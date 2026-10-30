@@ -12,24 +12,29 @@ import (
 type Pass struct {
 	LicenseCheck          func(context.Context) error
 	SyncSources           func(context.Context) error
+	SyncImportReport      func(context.Context) error
 	SyncJobs              func(context.Context) error
 	SyncContractDashboard func(context.Context) error
 	SyncProjectDashboard  func(context.Context) error
 }
 
-// Configured 判定当前聚合链路是否至少有一个可执行同步入口。
-// 返回 true 表示主循环至少会执行一类任务，返回 false 时应跳过轮询以避免空跑。
+// Configured 判定当前聚合链路是否含可执行同步入口。
+// 参数：无。
+// 返回值：至少一个来源或历史摘要通道已配置时为true。
 func (p Pass) Configured() bool {
-	return p.SyncSources != nil || p.SyncContractDashboard != nil || p.SyncProjectDashboard != nil
+	return p.SyncImportReport != nil || p.SyncSources != nil || p.SyncContractDashboard != nil || p.SyncProjectDashboard != nil
 }
 
-// RunOnce 串行执行已配置通道，并汇总错误，保证单个来源失败时其他来源仍能更新。
+// RunOnce 串行执行已配置通道，并汇总各通道错误。
+// 参数：ctx 为许可和取消上下文。
+// 返回值：全部成功为nil；单源失败不会阻断其余已配置通道。
 func (p Pass) RunOnce(ctx context.Context) error {
 	tasks := []struct {
 		name string
 		run  func(context.Context) error
 	}{
 		{name: "database sources", run: p.SyncSources},
+		{name: "contract import report", run: p.SyncImportReport},
 		{name: "queued sync jobs", run: p.SyncJobs},
 		{name: "contract dashboard API", run: p.SyncContractDashboard},
 		{name: "project dashboard API", run: p.SyncProjectDashboard},
