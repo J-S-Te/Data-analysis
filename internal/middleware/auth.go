@@ -4,6 +4,7 @@ package middleware
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,7 +16,15 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/response"
 )
 
-// SessionAuth 只信任 Cookie 对应的服务端会话；请求头中的用户/角色声明不参与认证。
+// SessionAuth 在业务入口核验服务端会话并保留依赖故障语义。
+//
+//	SessionAuth 只信任 Cookie 对应的服务端会话；请求头中的用户/角色声明不参与认证。
+//
+// 参数：authenticator为本应用服务端会话校验器。
+//
+//	cookieName为当前应用独立Cookie名称。
+//
+// 返回值：执行服务端会话校验并写入可信主体的HTTP中间件。
 func SessionAuth(authenticator auth.Authenticator, cookieName string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		cookie, err := c.Request.Cookie(cookieName)
@@ -26,6 +35,11 @@ func SessionAuth(authenticator auth.Authenticator, cookieName string) gin.Handle
 		}
 		principal, err := authenticator.Authenticate(c.Request.Context(), cookie.Value)
 		if err != nil {
+			if errors.Is(err, auth.ErrSessionUnavailable) {
+				response.Error(c, apperror.New(503, "SESSION_UNAVAILABLE", "会话服务暂不可用，请稍后重试"))
+				c.Abort()
+				return
+			}
 			response.Error(c, apperror.ErrUnauthenticated)
 			c.Abort()
 			return

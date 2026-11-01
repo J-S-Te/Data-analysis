@@ -8,19 +8,26 @@ import (
 
 // LoginTransaction 保存 PKCE verifier 与 nonce（加密），state 单次消费。
 type LoginTransaction struct {
-	StateHash          string    `gorm:"column:state_hash;primaryKey"`
-	TenantID           string    `gorm:"column:tenant_id"`
-	NonceCipher        []byte    `gorm:"column:nonce_cipher"`
-	CodeVerifierCipher []byte    `gorm:"column:code_verifier_cipher"`
-	ReturnPath         string    `gorm:"column:return_path"`
-	ExpiresAt          time.Time `gorm:"column:expires_at"`
-	CreatedAt          time.Time `gorm:"column:created_at"`
+	CentralTicketCipher []byte
+	StateHash           string    `gorm:"column:state_hash;primaryKey"`
+	TenantID            string    `gorm:"column:tenant_id"`
+	NonceCipher         []byte    `gorm:"column:nonce_cipher"`
+	CodeVerifierCipher  []byte    `gorm:"column:code_verifier_cipher"`
+	ReturnPath          string    `gorm:"column:return_path"`
+	ExpiresAt           time.Time `gorm:"column:expires_at"`
+	CreatedAt           time.Time `gorm:"column:created_at"`
 }
 
 func (LoginTransaction) TableName() string { return "da_oidc_login_transactions" }
 
 // Session 是服务端会话（cookie 只存随机 token 的哈希）。
 type Session struct {
+	RefreshTokenCipher     []byte
+	AccessTokenExpiresAt   time.Time
+	CentralBindingCipher   []byte
+	CentralSessionID       string
+	OIDCSubject            string     `gorm:"column:oidc_subject"`
+	OIDCSessionID          string     `gorm:"column:oidc_sid"`
 	SessionIDHash          string     `gorm:"column:session_id_hash;primaryKey"`
 	TenantID               string     `gorm:"column:tenant_id"`
 	PlatformUserID         string     `gorm:"column:platform_user_id"`
