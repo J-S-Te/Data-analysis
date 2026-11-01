@@ -162,9 +162,9 @@ func (b *Bridge) Proxy(c *gin.Context, token string) {
 	c.Redirect(http.StatusFound, b.resourcePrefix(token)+"embed/dashboard/"+signedURL.token+"?bordered=false&titled=false")
 }
 
-// ProxyResource 代理 Metabase iframe 发起的全部后续请求。
-// 令牌保留在浏览器可见路径中，因此只有原短期嵌入
-// 授权仍有效时才暴露资源。
+// ProxyResource 在原短期嵌入授权仍有效时代理看板后续资源及隔离活动桥。
+// 参数：c为HTTP上下文，token为已消费的嵌入能力，resource为资源路径。
+// 返回值：无；令牌、来源或许可无效时拒绝请求。
 func (b *Bridge) ProxyResource(c *gin.Context, token, resource string) {
 	if !b.requireEmbedHost(c) {
 		return
@@ -174,6 +174,13 @@ func (b *Bridge) ProxyResource(c *gin.Context, token, resource string) {
 	}
 	if record, ok := b.embedRecord(c, token, false); !ok || record.ConsumedAt == nil {
 		response.Error(c, apperror.ErrForbidden)
+		return
+	}
+	if resource == "/__platform_session_activity.js" {
+		c.Header("Cache-Control", "no-store")
+		c.Header("Referrer-Policy", "no-referrer")
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", sessionActivityScript)
 		return
 	}
 	resourcePath, ok := allowedMetabaseResource(resource)
@@ -209,6 +216,9 @@ func (b *Bridge) ProxyResource(c *gin.Context, token, resource string) {
 	proxy.ServeHTTP(c.Writer, c.Request)
 }
 
+// modifyProxyResponse 清除上游Cookie并重写隔离看板文档，保留其他CSP限制。
+// 参数：token为嵌入能力，rewriteDocument表示响应是否为看板HTML。
+// 返回值：代理响应处理器；文档读取失败时返回错误。
 func (b *Bridge) modifyProxyResponse(token string, rewriteDocument bool) func(*http.Response) error {
 	return func(resp *http.Response) error {
 		// 令牌存在于 iframe URL 中，禁止 Referer 外带并避免代理响应被共享缓存。
@@ -235,6 +245,7 @@ func (b *Bridge) modifyProxyResponse(token string, rewriteDocument bool) func(*h
 		}
 		_ = resp.Body.Close()
 		body = rewriteEmbedDocument(body, b.resourcePrefix(token), b.options.MetabaseBasePath)
+		body = injectSessionActivity(body, b.resourcePrefix(token), b.options.PublicOrigin)
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		resp.ContentLength = int64(len(body))
 		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))

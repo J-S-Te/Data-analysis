@@ -1,6 +1,7 @@
 package oidc
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -28,7 +29,12 @@ func NewHandler(service *Service, options HTTPOptions) *Handler {
 	return &Handler{service: service, options: options}
 }
 
-// Login 生成 state/nonce/PKCE 并跳转 Keycloak（接入手册 §3.1）。
+// Login 建立原state、nonce和PKCE事务并进入可信登录流程。
+//
+//	Login 生成 state/nonce/PKCE 并跳转 Keycloak（接入手册 §3.1）。
+//
+// 参数：c为当前HTTP请求上下文。
+// 返回值：无。
 func (h *Handler) Login(c *gin.Context) {
 	state, err := GenerateState()
 	if err != nil {
@@ -49,11 +55,48 @@ func (h *Handler) Login(c *gin.Context) {
 		response.Error(c, apperror.Wrap(err, http.StatusInternalServerError, "AUTH_STATE_STORE_FAILED", "failed to persist login state"))
 		return
 	}
+	if h.service.centralClient != nil {
+		http.SetCookie(c.Writer, h.stateCookie(state, 600))
+		c.Redirect(http.StatusFound, h.service.centralClient.BeginURL(state, nonce))
+		return
+	}
 	c.Redirect(http.StatusFound, h.service.AuthorizationURL(state, nonce, verifier))
 }
 
-// Callback 校验 code/state/nonce，创建会话并重定向回原页面。
+// Callback 消费原登录事务，验证身份并创建受中央期限约束的本地会话。
+//
+//	Callback 校验 code/state/nonce，创建会话并重定向回原页面。
+//
+// 参数：c为当前HTTP请求上下文。
+// 返回值：无。
 func (h *Handler) Callback(c *gin.Context) {
+	if h.service.centralClient != nil {
+		cookie, err := c.Request.Cookie(h.options.CookieName + "_oidc_state")
+		if err != nil || cookie.Value == "" || cookie.Value != c.Query("state") {
+			response.Error(c, apperror.ErrUnauthenticated)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.Header("Referrer-Policy", "no-referrer")
+		if ticket := c.Query("session_link_ticket"); ticket != "" {
+			if c.Query("code") != "" {
+				response.Error(c, apperror.ErrUnauthenticated)
+				return
+			}
+			target, err := h.service.attachSessionLink(c.Request.Context(), cookie.Value, ticket)
+			if err != nil {
+				status := 401
+				if errors.Is(err, ErrSessionUnavailable) {
+					status = 503
+				}
+				response.Error(c, apperror.New(status, "SESSION_LINK_FAILED", "登录关联失败，请重试"))
+				return
+			}
+			c.Redirect(http.StatusFound, target)
+			return
+		}
+		http.SetCookie(c.Writer, h.stateCookie("", -1))
+	}
 	state := c.Query("state")
 	code := c.Query("code")
 	if state == "" || code == "" {
@@ -75,12 +118,16 @@ func (h *Handler) Callback(c *gin.Context) {
 		response.Error(c, apperror.New(http.StatusInternalServerError, "AUTH_VERIFIER_DECRYPT", "failed to decrypt verifier"))
 		return
 	}
-	sessionToken, _, err := h.service.ExchangeAndCreateSession(c.Request.Context(), code, verifier, nonce, transaction)
+	sessionToken, session, err := h.service.ExchangeAndCreateSession(c.Request.Context(), code, verifier, nonce, transaction)
 	if err != nil {
-		response.Error(c, apperror.Wrap(err, http.StatusUnauthorized, "AUTH_TOKEN_EXCHANGE_FAILED", "OIDC token exchange failed"))
+		status := http.StatusUnauthorized
+		if errors.Is(err, ErrSessionUnavailable) {
+			status = http.StatusServiceUnavailable
+		}
+		response.Error(c, apperror.Wrap(err, status, "AUTH_TOKEN_EXCHANGE_FAILED", "OIDC token exchange failed"))
 		return
 	}
-	h.setCookie(c, sessionToken, time.Now().UTC().Add(h.service.sessionTTL))
+	h.setCookie(c, sessionToken, session.ExpiresAt)
 	redirect := transaction.ReturnPath
 	if !isSafeReturnPath(redirect, h.service.PathPrefix()) {
 		redirect = h.service.PathPrefix() + "/"
