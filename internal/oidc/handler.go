@@ -29,7 +29,12 @@ func NewHandler(service *Service, options HTTPOptions) *Handler {
 	return &Handler{service: service, options: options}
 }
 
-// Login 生成 state/nonce/PKCE 并跳转 Keycloak（接入手册 §3.1）。
+// Login 建立原state、nonce和PKCE事务并进入可信登录流程。
+//
+//	Login 生成 state/nonce/PKCE 并跳转 Keycloak（接入手册 §3.1）。
+//
+// 参数：c为当前HTTP请求上下文。
+// 返回值：无。
 func (h *Handler) Login(c *gin.Context) {
 	state, err := GenerateState()
 	if err != nil {
@@ -50,11 +55,45 @@ func (h *Handler) Login(c *gin.Context) {
 		response.Error(c, apperror.Wrap(err, http.StatusInternalServerError, "AUTH_STATE_STORE_FAILED", "failed to persist login state"))
 		return
 	}
+	if h.service.centralClient != nil {
+		http.SetCookie(c.Writer, h.stateCookie(state, 600))
+		c.Redirect(http.StatusFound, h.service.centralClient.BeginURL(state, nonce))
+		return
+	}
 	c.Redirect(http.StatusFound, h.service.AuthorizationURL(state, nonce, verifier))
 }
 
-// Callback 校验 code/state/nonce，创建会话并重定向回原页面。
+// Callback 消费原登录事务，验证身份并创建受中央期限约束的本地会话。
+// 参数：c为当前HTTP请求上下文，提供原state、nonce和PKCE回调材料。
+// 返回值：无；身份失败返回401，中央依赖故障返回503，成功写Cookie并重定向。
 func (h *Handler) Callback(c *gin.Context) {
+	if h.service.centralClient != nil {
+		cookie, err := c.Request.Cookie(h.options.CookieName + "_oidc_state")
+		if err != nil || cookie.Value == "" || cookie.Value != c.Query("state") {
+			response.Error(c, apperror.ErrUnauthenticated)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.Header("Referrer-Policy", "no-referrer")
+		if ticket := c.Query("session_link_ticket"); ticket != "" {
+			if c.Query("code") != "" {
+				response.Error(c, apperror.ErrUnauthenticated)
+				return
+			}
+			target, err := h.service.attachSessionLink(c.Request.Context(), cookie.Value, ticket)
+			if err != nil {
+				status := 401
+				if errors.Is(err, ErrSessionUnavailable) {
+					status = 503
+				}
+				response.Error(c, apperror.New(status, "SESSION_LINK_FAILED", "登录关联失败，请重试"))
+				return
+			}
+			c.Redirect(http.StatusFound, target)
+			return
+		}
+		http.SetCookie(c.Writer, h.stateCookie("", -1))
+	}
 	state := c.Query("state")
 	code := c.Query("code")
 	if state == "" || code == "" {
@@ -78,7 +117,11 @@ func (h *Handler) Callback(c *gin.Context) {
 	}
 	sessionToken, session, err := h.service.ExchangeAndCreateSession(c.Request.Context(), code, verifier, nonce, transaction)
 	if err != nil {
-		response.Error(c, apperror.Wrap(err, http.StatusUnauthorized, "AUTH_TOKEN_EXCHANGE_FAILED", "OIDC token exchange failed"))
+		status := http.StatusUnauthorized
+		if errors.Is(err, ErrSessionUnavailable) {
+			status = http.StatusServiceUnavailable
+		}
+		response.Error(c, apperror.Wrap(err, status, "AUTH_TOKEN_EXCHANGE_FAILED", "OIDC token exchange failed"))
 		return
 	}
 	// Cookie 到期与绝对期限一致：活动只在服务端续期空闲计时，不延长绝对期限。
@@ -124,10 +167,14 @@ func (h *Handler) AuthMe(c *gin.Context) {
 	})
 }
 
-// Activity 处理浏览器显式活动续期（POST /api/v1/auth/activity）。
-// 只依赖本地 cookie 会话：无请求体，不读取客户端声明的用户或活动内容；
-// 会话无效/空闲或绝对到期返回 401，且不得复活。
+// Activity 按中央或本地模式处理受同源保护的浏览器显式活动。
+// 参数：c为带服务端会话Cookie的请求上下文，不读取客户端声明的用户或期限。
+// 返回值：无；中央模式返回权威窗口及401/503，本地模式不续活已失效会话。
 func (h *Handler) Activity(c *gin.Context) {
+	if h.service.centralClient != nil {
+		h.lifecycle(c, true)
+		return
+	}
 	cookie, err := c.Request.Cookie(h.options.CookieName)
 	if err != nil || cookie.Value == "" {
 		response.Error(c, apperror.ErrUnauthenticated)

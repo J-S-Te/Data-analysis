@@ -13,16 +13,22 @@ import (
 const backchannelEvent = "http://schemas.openid.net/event/backchannel-logout"
 
 type logoutClaims struct {
-	Subject  string                     `json:"sub"`
-	JTI      string                     `json:"jti"`
-	Issued   int64                      `json:"iat"`
-	Expires  int64                      `json:"exp"`
-	Nonce    string                     `json:"nonce"`
-	Audience interface{}                `json:"aud"`
-	Events   map[string]json.RawMessage `json:"events"`
+	SessionID string                     `json:"sid"`
+	Subject   string                     `json:"sub"`
+	JTI       string                     `json:"jti"`
+	Issued    int64                      `json:"iat"`
+	Expires   int64                      `json:"exp"`
+	Nonce     string                     `json:"nonce"`
+	Audience  interface{}                `json:"aud"`
+	Events    map[string]json.RawMessage `json:"events"`
 }
 
-// BackchannelLogout 接收标准 OIDC logout_token，并在事务中防重放和撤销会话。
+// BackchannelLogout 验证后台注销消息并撤销匹配的本地会话。
+//
+//	BackchannelLogout 接收标准 OIDC logout_token，并在事务中防重放和撤销会话。
+//
+// 参数：c为当前HTTP请求上下文。
+// 返回值：无。
 func (s *Service) BackchannelLogout(c *gin.Context) {
 	if c.Request.Method != http.MethodPost {
 		c.Status(http.StatusMethodNotAllowed)
@@ -62,7 +68,17 @@ func (s *Service) BackchannelLogout(c *gin.Context) {
 		c.Status(http.StatusServiceUnavailable)
 		return
 	}
-	if err := tx.Model(&Session{}).Where("tenant_id=? AND revoked_at IS NULL AND platform_user_id=?", s.tenantID, claims.Subject).Updates(map[string]any{"revoked_at": now}).Error; err != nil {
+	query := tx.Model(&Session{}).Where("tenant_id=? AND revoked_at IS NULL", s.tenantID)
+	if s.centralClient != nil {
+		if claims.SessionID != "" {
+			query = query.Where("oidc_sid = ?", claims.SessionID)
+		} else {
+			query = query.Where("oidc_subject = ?", claims.Subject)
+		}
+	} else {
+		query = query.Where("platform_user_id = ?", claims.Subject)
+	}
+	if err := query.Updates(map[string]any{"revoked_at": now}).Error; err != nil {
 		c.Status(http.StatusServiceUnavailable)
 		return
 	}

@@ -1,4 +1,4 @@
--- 000028_bi_audit_outbox_request_payload.sql
+-- 000029_bi_audit_outbox_request_payload.sql
 -- 审计 outbox 补齐 request_id / payload 列（AUD-IP-2026）：
 -- internal/auditoutbox 的 outboxRow 已声明 request_id 与 payload，但 000016 建表没有
 -- 这两列，也没有任何迁移补过它们。后果分两侧：

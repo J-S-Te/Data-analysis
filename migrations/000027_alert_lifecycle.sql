@@ -1,4 +1,4 @@
--- 000026_alert_lifecycle.sql
+-- 000027_alert_lifecycle.sql
 -- 告警生命周期收敛（BIZ-DATA-07）：记录告警关闭原因，使规则评估可以区分
 -- "条件离开窗口后自动收敛"与"人工关闭"。只有前者会在条件重新命中时被自动重开；
 -- 人工 ACK/CLOSED 不会被规则评估覆盖。默认不启用收敛（见 ALERT_AUTO_RESOLVE），

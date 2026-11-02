@@ -1,4 +1,4 @@
--- 000029_dim_contract_approval.sql
+-- 000030_dim_contract_approval.sql
 -- 合同“审批中”权威投影（BIZ-DATA-06 口径修复）
 --
 -- 背景：看板的 ORG/TEAM/SELF 分支过去用 dim_contract.status='pending' 近似“审批中”。

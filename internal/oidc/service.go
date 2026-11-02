@@ -18,6 +18,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/platformaudit"
+	central "github.com/unified-identity-auth-platform/data-analysis/internal/sessiongovernance"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/auth"
 )
 
@@ -54,6 +55,7 @@ type sessionLifetimes struct {
 
 // Options 是 OIDC 客户端与会话服务的装配参数。
 type Options struct {
+	CentralClient     central.Client
 	Issuer            string // 浏览器可达的 Keycloak Realm 地址
 	BackchannelIssuer string // 容器内 Discovery/JWKS/Token/UserInfo 地址（可空则用 Issuer）
 	ClientID          string
@@ -81,6 +83,7 @@ type Options struct {
 }
 
 type Service struct {
+	centralClient           central.Client
 	provider                *oidc.Provider
 	verifier                *oidc.IDTokenVerifier
 	config                  oauth2.Config
@@ -103,6 +106,13 @@ type Service struct {
 	reporter                platformaudit.Reporter
 }
 
+// NewService 装配会话服务与可选中央权威依赖。
+// 参数：ctx为调用上下文与取消边界。
+//
+//	db为本应用数据库连接。
+//	options为本应用认证及运行选项。
+//
+// 返回值：装配后的应用或认证实例；配置与依赖装配失败时返回错误。
 func NewService(ctx context.Context, db *gorm.DB, options Options) (*Service, error) {
 	// 公网 issuer 必须原样用于 discovery（go-oidc 校验返回的 issuer 一致）；
 	// 容器内通过 backchannel 主机重写实际连接目标（对齐 contract OIDC_BACKCHANNEL_BASE_URL 模式）。
@@ -116,6 +126,7 @@ func NewService(ctx context.Context, db *gorm.DB, options Options) (*Service, er
 		httpClient.Transport = transport
 		providerCtx = oidc.ClientContext(ctx, httpClient)
 	}
+	providerCtx = oidc.ClientContext(ctx, httpClient)
 	provider, err := oidc.NewProvider(providerCtx, options.Issuer)
 	if err != nil {
 		return nil, err
@@ -146,8 +157,9 @@ func NewService(ctx context.Context, db *gorm.DB, options Options) (*Service, er
 		checkEvery = 5 * time.Minute
 	}
 	return &Service{
-		provider: provider,
-		verifier: verifier,
+		centralClient: options.CentralClient,
+		provider:      provider,
+		verifier:      verifier,
 		config: oauth2.Config{
 			ClientID:     options.ClientID,
 			ClientSecret: options.ClientSecret,
@@ -178,6 +190,8 @@ func NewService(ctx context.Context, db *gorm.DB, options Options) (*Service, er
 // idTokenClaims 平台 ID 令牌 携带的声明（对齐 contract：OIDC 只认证身份，
 // 角色/权限/数据范围由平台 authorization-context 在线解析，不读 token claims）。
 type idTokenClaims struct {
+	IdentityID        string `json:"identity_id"`
+	SessionID         string `json:"sid"`
 	Sub               string `json:"sub"`
 	Name              string `json:"name"`
 	PreferredUsername string `json:"preferred_username"`
@@ -212,13 +226,36 @@ type AuthorizationContext struct {
 	DataScopes                 []DataScope `json:"data_scopes"`
 }
 
-// AuthorizationURL 生成 Keycloak 授权地址（Authorization Code + PKCE S256）。
+// AuthorizationURL 保留原登录事务构造提供方授权地址。
+//
+//	AuthorizationURL 生成 Keycloak 授权地址（Authorization Code + PKCE S256）。
+//
+// 参数：state为原始登录事务随机状态。
+//
+//	nonce为原OIDC登录随机校验材料。
+//	codeVerifier为原PKCE秘密。
+//
+// 返回值：绑定原登录事务的授权地址；构造失败按原错误模型返回。
 func (s *Service) AuthorizationURL(state string, nonce string, codeVerifier string) string {
 	nonceParam := oauth2.SetAuthURLParam("nonce", nonce)
+	if s.centralClient != nil {
+		return s.config.AuthCodeURL(state, oauth2.S256ChallengeOption(codeVerifier), nonceParam, oauth2.SetAuthURLParam("claims", `{"id_token":{"auth_time":{"essential":true}}}`))
+	}
 	return s.config.AuthCodeURL(state, oauth2.S256ChallengeOption(codeVerifier), nonceParam)
 }
 
-// ExchangeAndCreateSession 校验回调 code，验证 ID 令牌，创建服务端会话，返回会话 token 与展示信息。
+// ExchangeAndCreateSession 交换原授权码并创建受中央固定期限约束的会话。
+//
+//	ExchangeAndCreateSession 校验回调 code，验证 ID 令牌，创建服务端会话，返回会话 token 与展示信息。
+//
+// 参数：ctx为调用上下文与取消边界。
+//
+//	code为一次性OIDC授权码。
+//	codeVerifier为原PKCE秘密。
+//	expectedNonce为原始登录事务保存的nonce。
+//	transaction为原始一次性登录事务。
+//
+// 返回值：受原始期限约束的登录结果；身份、绑定或依赖失败返回错误。
 func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, codeVerifier string, expectedNonce string, transaction LoginTransaction) (sessionToken string, session Session, err error) {
 	ctx = context.WithValue(ctx, oauth2.HTTPClient, s.httpClient)
 	rawToken, err := s.config.Exchange(ctx, code, oauth2.VerifierOption(codeVerifier))
@@ -239,6 +276,23 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 	}
 	if err := validateIDTokenClaims(claims, expectedNonce, s.tenantID, transaction.TenantID); err != nil {
 		return "", Session{}, err
+	}
+	var binding central.Binding
+	if s.centralClient != nil {
+		ticket, unwrapErr := s.codec.decrypt(transaction.CentralTicketCipher)
+		if unwrapErr != nil || ticket == "" || claims.SessionID == "" || claims.IdentityID == "" || rawToken.RefreshToken == "" {
+			return "", Session{}, ErrUnauthenticated
+		}
+		binding, err = s.centralClient.Complete(ctx, ticket, rawToken.AccessToken, idToken)
+		if errors.Is(err, central.ErrUnavailable) {
+			return "", Session{}, ErrSessionUnavailable
+		}
+		if err != nil {
+			return "", Session{}, ErrUnauthenticated
+		}
+		if err = central.Validate(binding.Context, s.centralExpectation(), claims.IdentityID); err != nil {
+			return "", Session{}, ErrUnauthenticated
+		}
 	}
 
 	if strings.TrimSpace(claims.PreferredUsername) == "" {
@@ -300,7 +354,25 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 		LastSeenAt:             now,
 		LastInteractiveAt:      &lifetimes.LastInteractiveAt,
 	}
-	if err := s.db.Create(&session).Error; err != nil {
+	if s.centralClient != nil {
+		if platformSubjectID != binding.Context.SubjectID {
+			return "", Session{}, ErrUnauthenticated
+		}
+		session.CentralBindingCipher, err = s.codec.encrypt(binding.Token)
+		if err != nil {
+			return "", Session{}, ErrSessionUnavailable
+		}
+		session.RefreshTokenCipher, err = s.codec.encrypt(rawToken.RefreshToken)
+		if err != nil {
+			return "", Session{}, ErrSessionUnavailable
+		}
+		session.CentralSessionID = binding.Context.SessionID
+		session.ExpiresAt = binding.Context.AbsoluteExpiresAt
+		session.AccessTokenExpiresAt = rawToken.Expiry.UTC()
+		session.OIDCSubject = claims.Sub
+		session.OIDCSessionID = claims.SessionID
+	}
+	if err := s.db.WithContext(ctx).Create(&session).Error; err != nil {
 		return "", Session{}, err
 	}
 	s.reportAuth(ctx, platformaudit.Event{ActorID: session.PlatformUserID, ActorName: session.DisplayName, Action: "auth.login", ResourceType: "auth_session", Result: "SUCCESS", RiskLevel: "LOW"})
@@ -323,7 +395,15 @@ func (s *Service) reportAuth(ctx context.Context, event platformaudit.Event) {
 	_ = s.reporter.Report(ctx, event)
 }
 
-// resolveAuthorizationContext 调平台授权上下文端点（Bearer Keycloak access token）解析角色/权限。
+// resolveAuthorizationContext 读取并核验基础平台当前应用的权限快照。
+//
+//	resolveAuthorizationContext 调平台授权上下文端点（Bearer Keycloak access token）解析角色/权限。
+//
+// 参数：ctx为调用上下文与取消边界。
+//
+//	accessToken为服务器端访问令牌。
+//
+// 返回值：与该调用匹配的核验或持久化结果；失败保留原有错误语义。
 func (s *Service) resolveAuthorizationContext(ctx context.Context, accessToken string) (AuthorizationContext, error) {
 	if s.authorizationContextURL == "" {
 		return AuthorizationContext{}, errors.New("authorization context endpoint is not configured")
@@ -346,7 +426,10 @@ func (s *Service) resolveAuthorizationContext(ctx context.Context, accessToken s
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return AuthorizationContext{}, fmt.Errorf("authorization context returned HTTP %d", response.StatusCode)
+		if response.StatusCode == 401 || response.StatusCode == 403 {
+			return AuthorizationContext{}, ErrUnauthenticated
+		}
+		return AuthorizationContext{}, ErrSessionUnavailable
 	}
 	var result AuthorizationContext
 	decoder := json.NewDecoder(io.LimitReader(response.Body, 1<<20))
@@ -362,8 +445,19 @@ func (s *Service) resolveAuthorizationContext(ctx context.Context, accessToken s
 	return result, nil
 }
 
-// Authenticate 由 cookie token 还原 Principal；必要时执行 UserInfo 在线复核。
+// Authenticate 校验当前浏览器会话、中央期限与业务授权。
+//
+//	Authenticate 由 cookie token 还原 Principal；必要时执行 UserInfo 在线复核。
+//
+// 参数：ctx为调用上下文与取消边界。
+//
+//	cookieValue为当前浏览器随机会话材料。
+//
+// 返回值：经过核验的主体或会话；明确失效与暂时依赖错误分别返回。
 func (s *Service) Authenticate(ctx context.Context, cookieValue string) (auth.Principal, error) {
+	if s.centralClient != nil {
+		return s.authenticateCentral(ctx, cookieValue)
+	}
 	if cookieValue == "" {
 		return auth.Principal{}, errors.New("empty session")
 	}
@@ -530,8 +624,19 @@ func (s *Service) SaveLoginTransaction(state string, nonce string, codeVerifier 
 	}).Error
 }
 
-// ConsumeLoginTransaction 读取并删除登录事务（单次消费，防重放）。
+// ConsumeLoginTransaction 原子消费未过期的登录事务，拒绝重复回调。
+//
+//	ConsumeLoginTransaction 读取并删除登录事务（单次消费，防重放）。
+//
+// 参数：ctx为调用上下文与取消边界。
+//
+//	state为原始登录事务随机状态。
+//
+// 返回值：匹配的有效持久记录；不存在、失效或存储失败返回错误。
 func (s *Service) ConsumeLoginTransaction(ctx context.Context, state string) (LoginTransaction, error) {
+	if s.centralClient != nil {
+		return s.consumeCentralLogin(ctx, state)
+	}
 	var transaction LoginTransaction
 	err := s.db.Where("state_hash = ?", tokenHash(state)).First(&transaction).Error
 	if err != nil {

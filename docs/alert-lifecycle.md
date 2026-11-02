@@ -75,8 +75,8 @@
 
 | `closed_reason` | 写入方 | 语义 | 是否可被规则自动复开 |
 | --- | --- | --- | --- |
-| `AUTO_CONDITION_CLEARED` | 本轮起 `ReconcileAlerts`（迁移 `000027` 之下的确认轮数逻辑） | **条件连续 `ALERT_CONFIRM_ROUNDS` 轮未命中**才关闭，是"去抖后确认条件消失" | 是 |
-| `AUTO_WINDOW_EXIT` | 旧版"离开窗口"收敛（迁移 `000026` 语义）写入的历史数据 | 旧口径的"离开窗口即关闭"，可能是单轮抖动；现网存量数据仍在 | 是（保持向后兼容，避免历史自动关闭永久卡住） |
+| `AUTO_CONDITION_CLEARED` | 本轮起 `ReconcileAlerts`（迁移 `000028` 之下的确认轮数逻辑） | **条件连续 `ALERT_CONFIRM_ROUNDS` 轮未命中**才关闭，是"去抖后确认条件消失" | 是 |
+| `AUTO_WINDOW_EXIT` | 旧版"离开窗口"收敛（迁移 `000027` 语义）写入的历史数据 | 旧口径的"离开窗口即关闭"，可能是单轮抖动；现网存量数据仍在 | 是（保持向后兼容，避免历史自动关闭永久卡住） |
 | `MANUAL` | `internal/modules/alerts` 的人工关闭（`UpdateStatus`） | 人的决定 | **否** |
 | `''`（历史空值） | 迁移前的存量行 | 视为人工/历史关闭 | **否** |
 
@@ -121,9 +121,9 @@
 
 ## 迁移与回滚
 
-- `migrations/000026_alert_lifecycle.sql`：新增 `alert_item.closed_reason` 与
+- `migrations/000027_alert_lifecycle.sql`：新增 `alert_item.closed_reason` 与
   `idx_alert_rule_status`；不改写既有状态，已有行 `closed_reason=''`（视为人工/历史关闭）。
-- `migrations/000027_alert_lifecycle_phase.sql`：新增 `miss_streak`/`hit_streak`/`last_hit_at`/
+- `migrations/000028_alert_lifecycle_phase.sql`：新增 `miss_streak`/`hit_streak`/`last_hit_at`/
   `reopen_count`/`acknowledged_at`/`acknowledged_by` 与 `idx_alert_rule_state`；只加列，不回填。
 - 回退首选：把 `ALERT_AUTO_RESOLVE` 置回 `false`（立即恢复旧行为；新增列无破坏性读取依赖）；
   再把 `ALERT_CONFIRM_ROUNDS`/`ALERT_REOPEN_POLICY`/`ALERT_CLOSE_GUARD_RATIO` 恢复默认。

@@ -31,6 +31,7 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/oidc"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/platformaudit"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/platformcatalog"
+	central "github.com/unified-identity-auth-platform/data-analysis/internal/sessiongovernance"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/response"
 )
 
@@ -95,7 +96,16 @@ func New(config Config) (*App, error) {
 		}
 		go auditDispatcher.Run(ctx)
 	}
+	var centralClient central.Client
+	if config.CentralSessionEnabled {
+		client, err := central.NewHTTPClient(config.PlatformBaseURL, config.CentralSessionPublicBaseURL, config.OIDCClientID, config.OIDCRedirectURI)
+		if err != nil {
+			return nil, err
+		}
+		centralClient = client
+	}
 	authService, err := oidc.NewService(ctx, db, oidc.Options{
+		CentralClient:           centralClient,
 		Issuer:                  config.OIDCIssuer,
 		BackchannelIssuer:       config.OIDCBackchannel,
 		ClientID:                config.OIDCClientID,
@@ -167,6 +177,8 @@ func New(config Config) (*App, error) {
 	})
 	base.GET("/auth/login", authHandler.Login)
 	base.GET("/auth/callback", authHandler.Callback)
+	base.GET("/auth/session", middleware.SessionAuth(authService, "data_analysis_session"), authHandler.SessionState)
+	base.POST("/auth/activity", middleware.SessionAuth(authService, "data_analysis_session"), middleware.RequireSameOriginWrite(config.PublicOrigin), authHandler.Activity)
 	base.GET("/auth/logout", authHandler.Logout)
 	base.POST("/auth/backchannel-logout", authService.BackchannelLogout)
 

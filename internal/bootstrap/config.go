@@ -16,19 +16,21 @@ import (
 )
 
 type Config struct {
-	ContractImportStatus importreport.VerifierOptions
-	ListenAddr           string
-	MySQLDSN             string
-	PathPrefix           string
-	PublicOrigin         string
-	OIDCIssuer           string
-	OIDCBackchannel      string
-	OIDCClientID         string
-	OIDCClientSecret     string
-	OIDCRedirectURI      string
-	OIDCTenantID         string
-	OIDCRoleConfigHash   string
-	OIDCMaxRoles         int
+	CentralSessionEnabled       bool
+	CentralSessionPublicBaseURL string
+	ContractImportStatus        importreport.VerifierOptions
+	ListenAddr                  string
+	MySQLDSN                    string
+	PathPrefix                  string
+	PublicOrigin                string
+	OIDCIssuer                  string
+	OIDCBackchannel             string
+	OIDCClientID                string
+	OIDCClientSecret            string
+	OIDCRedirectURI             string
+	OIDCTenantID                string
+	OIDCRoleConfigHash          string
+	OIDCMaxRoles                int
 	// OIDCSessionIdleTTL / OIDCSessionAbsoluteTTL 是浏览器会话的空闲与绝对期限。
 	// 只由显式活动接口（/auth/activity）续期空闲计时；绝对期限不受活动影响。
 	OIDCSessionIdleTTL     time.Duration
@@ -101,6 +103,10 @@ func LoadConfig() (Config, error) {
 	pathPrefix := envOr("APP_PATH_PREFIX", "/data_analysis")
 	// 浏览器 origin（同源/CSRF 校验）与平台 API 地址分离：PLATFORM_BASE_URL 在容器内指向 platform-api。
 	publicOrigin := envOr("APP_PUBLIC_ORIGIN", "http://localhost:8081")
+	centralEnabled, err := strconv.ParseBool(envOr("CENTRAL_SESSION_ENABLED", "false"))
+	if err != nil {
+		return Config{}, errors.New("invalid CENTRAL_SESSION_ENABLED")
+	}
 	// COOKIE_SECURE 默认跟随 PublicOrigin 协议：https 部署未显式配置时仍获得
 	// Secure Cookie，避免生产漏配导致会话凭据以明文 Cookie 传输。
 	secure := envBool("COOKIE_SECURE", strings.HasPrefix(strings.ToLower(publicOrigin), "https://"))
@@ -121,6 +127,7 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 	return Config{
+		CentralSessionEnabled: centralEnabled, CentralSessionPublicBaseURL: envOr("CENTRAL_SESSION_PUBLIC_BASE_URL", publicOrigin),
 		ContractImportStatus: importreport.VerifierOptions{
 			Issuer: os.Getenv("CONTRACT_IMPORT_STATUS_ISSUER"), Audience: os.Getenv("CONTRACT_IMPORT_STATUS_AUDIENCE"),
 			PublicKeyPath: os.Getenv("CONTRACT_IMPORT_STATUS_PUBLIC_KEY_PATH"), ClientID: os.Getenv("CONTRACT_IMPORT_STATUS_CLIENT_ID"),
@@ -172,7 +179,7 @@ func LoadConfig() (Config, error) {
 			"report":   envOr("MB_DASHBOARD_ID_REPORT", ""),
 			"finance":  envOr("MB_DASHBOARD_ID_FINANCE", ""),
 		},
-		DashboardTimezone: dashboardTimezone,
+		DashboardTimezone:       dashboardTimezone,
 		DashboardApprovalSource: approvalSource,
 	}, nil
 }

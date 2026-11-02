@@ -1,4 +1,4 @@
--- 000030_sync_run.sql
+-- 000031_sync_run.sql
 -- 聚合轮次起止记录（BIZ-DATA-08 残项 B）
 --
 -- 目的：滚动升级窗口内可能有两个 aggregation-worker 版本同时跑轮次。来源级

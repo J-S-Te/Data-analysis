@@ -1,5 +1,5 @@
--- 000027_alert_lifecycle_phase.sql
--- 告警生命周期分阶段收敛（BIZ-DATA-07）：在 000026 的"关闭原因"基础上增加连续
+-- 000028_alert_lifecycle_phase.sql
+-- 告警生命周期分阶段收敛（BIZ-DATA-07）：在 000027 的"关闭原因"基础上增加连续
 -- 命中/未命中计数与复开审计列，使规则评估可以按"确认轮数"收敛，而不是一次未命中
 -- 就关闭：
 -- 1) miss_streak 记录连续未命中轮数，达到确认轮数（ALERT_CONFIRM_ROUNDS，默认 2）

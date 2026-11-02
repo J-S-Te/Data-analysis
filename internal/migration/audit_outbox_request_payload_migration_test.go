@@ -7,10 +7,9 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/migrations"
 )
 
-// TestEmbeddedMigrationAddsAuditOutboxRequestIDAndPayload 验证迁移 000028：
-// internal/auditoutbox 的 outboxRow 声明了 request_id/payload，000016 却没有这两列。
-// 缺列时读取侧（SELECT *）静默读成零值、写入侧按列名 INSERT 报 Unknown column，
-// 因此本迁移必须补上这两列，且只能新增可空列、按列存在性重入，不得回填或销毁既有事件。
+// TestEmbeddedMigrationAddsAuditOutboxRequestIDAndPayload 验证审计证据列迁移的顺序与安全边界。
+// 参数：t为测试上下文，迁移需按列存在性重入并保留历史事件。
+// 返回值：无；错版本、缺列、重写事件或缺少受控回滚提示使测试失败。
 func TestEmbeddedMigrationAddsAuditOutboxRequestIDAndPayload(t *testing.T) {
 	t.Parallel()
 
@@ -35,10 +34,10 @@ func TestEmbeddedMigrationAddsAuditOutboxRequestIDAndPayload(t *testing.T) {
 		t.Fatalf("embedded migrations do not contain a %s migration", name)
 	}
 	// 版本必须紧接在已有历史之后，保持 000001..N 连续（Load 已校验连续性，这里固定本迁移的序号）。
-	if foundVersion != 28 {
-		t.Fatalf("migration version = %d, want 28", foundVersion)
+	if foundVersion != 29 {
+		t.Fatalf("migration version = %d, want 29", foundVersion)
 	}
-	if len(previousItems) != 27 || previousItems[len(previousItems)-1].Name != "alert_lifecycle_phase" {
+	if len(previousItems) != 28 || previousItems[len(previousItems)-1].Name != "alert_lifecycle_phase" {
 		t.Fatalf("audit outbox 迁移没有接在既有历史之后：%d 个前置迁移", len(previousItems))
 	}
 

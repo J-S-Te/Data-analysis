@@ -7,11 +7,9 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/migrations"
 )
 
-// TestEmbeddedMigrationsAddContractApprovalProjection 验证 000029：
-// 审批中口径需要一张独立的 dim_contract_approval 投影表（守卫列是来源
-// con_approval_instance.updated_at），不得把审批标志塞进 dim_contract。
-// 参数：t 为测试上下文。
-// 返回值：无；缺表、缺守卫列或出现破坏性语句都视为失败。
+// TestEmbeddedMigrationsAddContractApprovalProjection 验证审批投影迁移的守卫列与安全边界。
+// 参数：t为测试上下文，迁移顺序应衔接已发布中央会话历史。
+// 返回值：无；缺表、缺守卫列、错版本或破坏性语句使测试失败。
 func TestEmbeddedMigrationsAddContractApprovalProjection(t *testing.T) {
 	t.Parallel()
 
@@ -20,8 +18,8 @@ func TestEmbeddedMigrationsAddContractApprovalProjection(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 	migrationSQL, version := embeddedMigrationByName(t, items, "dim_contract_approval")
-	if version != 29 {
-		t.Fatalf("migration version = %d, want 29", version)
+	if version != 30 {
+		t.Fatalf("migration version = %d, want 30", version)
 	}
 	for _, fragment := range []string{
 		"CREATE TABLE IF NOT EXISTS dim_contract_approval",
@@ -56,10 +54,9 @@ func TestEmbeddedMigrationsAddContractApprovalProjection(t *testing.T) {
 	assertNoDestructiveStatements(t, "dim_contract_approval", migrationSQL)
 }
 
-// TestEmbeddedMigrationsAddSyncRun 验证 000030：sync_run 记录轮次起止，
-// 并带“未结束轮次”查询索引；finished_at 必须可空。
-// 参数：t 为测试上下文。
-// 返回值：无。
+// TestEmbeddedMigrationsAddSyncRun 验证同步轮次迁移的索引与可空结束时间。
+// 参数：t为测试上下文，迁移顺序应衔接已发布中央会话历史。
+// 返回值：无；错版本、缺列、缺索引或破坏性语句使测试失败。
 func TestEmbeddedMigrationsAddSyncRun(t *testing.T) {
 	t.Parallel()
 
@@ -68,8 +65,8 @@ func TestEmbeddedMigrationsAddSyncRun(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 	migrationSQL, version := embeddedMigrationByName(t, items, "sync_run")
-	if version != 30 {
-		t.Fatalf("migration version = %d, want 30", version)
+	if version != 31 {
+		t.Fatalf("migration version = %d, want 31", version)
 	}
 	for _, fragment := range []string{
 		"CREATE TABLE IF NOT EXISTS sync_run",
@@ -87,11 +84,9 @@ func TestEmbeddedMigrationsAddSyncRun(t *testing.T) {
 	assertNoDestructiveStatements(t, "sync_run", migrationSQL)
 }
 
-// TestEmbeddedMigrationsAddSyncSourceLastSuccess 验证 000031：
-// “首次 SUCCESS”证据需要 sync_source.last_success_at，且必须用 information_schema
-// 存在性守卫重入，不得回填或重写既有状态。
-// 参数：t 为测试上下文。
-// 返回值：无。
+// TestEmbeddedMigrationsAddSyncSourceLastSuccess 验证首次同步成功证据迁移的重入与安全边界。
+// 参数：t为测试上下文，迁移顺序应衔接已发布中央会话历史。
+// 返回值：无；错版本、缺守卫列或破坏性语句使测试失败。
 func TestEmbeddedMigrationsAddSyncSourceLastSuccess(t *testing.T) {
 	t.Parallel()
 
@@ -100,8 +95,8 @@ func TestEmbeddedMigrationsAddSyncSourceLastSuccess(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 	migrationSQL, version := embeddedMigrationByName(t, items, "sync_source_last_success")
-	if version != 31 {
-		t.Fatalf("migration version = %d, want 31", version)
+	if version != 32 {
+		t.Fatalf("migration version = %d, want 32", version)
 	}
 	for _, fragment := range []string{
 		"information_schema.columns",

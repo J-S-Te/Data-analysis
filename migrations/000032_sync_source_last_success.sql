@@ -1,4 +1,4 @@
--- 000031_sync_source_last_success.sql
+-- 000032_sync_source_last_success.sql
 -- 同步通道“曾经成功”的持久标记（审批中口径切换门禁）
 --
 -- 背景：DASHBOARD_APPROVAL_SOURCE=instances 只在 contract_approval 通道首次 SUCCESS
@@ -6,7 +6,7 @@
 -- last_status/last_run_at，一旦下一轮 FAILED 就丢失“曾经成功”的证据，无法表达
 -- “首次成功即可切换”的语义，因此补一个可空时间戳列。
 --
--- 只新增可空列，旧镜像不读，向后兼容；沿用 000026 的 information_schema 存在性守卫，
+-- 只新增可空列，旧镜像不读，向后兼容；沿用 000027 的 information_schema 存在性守卫，
 -- DDL 中断但元数据未登记时按列存在性重入，不回填、不重写既有状态。
 -- 回滚：回退镜像；列可留（不切换 instances 即无副作用）。
 

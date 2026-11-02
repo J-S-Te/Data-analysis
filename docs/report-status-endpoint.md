@@ -85,7 +85,7 @@ GET /internal/v1/contract-imports/report-status
 | `request_id` | 中间件注入的请求追踪号（无则 NULL），可与平台侧审计对齐 |
 | `payload` | 精确版本三元组 JSON：`{"source_revision":…,"report_release_version":…,"state":…}` |
 
-- `request_id`/`payload` 是迁移 `migrations/000028_bi_audit_outbox_request_payload.sql` 新增的可空列。
+- `request_id`/`payload` 是迁移 `migrations/000029_bi_audit_outbox_request_payload.sql` 新增的可空列。
   未执行该迁移的库上：读取侧（`Claim` 用 `SELECT *`）会把两列静默读成零值，请求追踪号与本地
   证据永远读不回来；写入侧按列名 INSERT 则会报 `Unknown column`（MySQL 1054），把整条业务事务
   一起打回。务必与代码同批发布（`auditoutbox.Append` 在值为空时省略这两列，因此滚动窗口里

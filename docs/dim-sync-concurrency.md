@@ -59,7 +59,7 @@ ON DUPLICATE KEY UPDATE
 ## 轮次起止与 precompute 重叠闸门（已实现，默认 warn）
 
 来源锁只保证“同一租户/来源同时只有一个执行者”，挡不住两个 worker 版本在滚动升级窗口内
-**各自跑不同来源**再把派生预计算写成混代次结果。为此新增 `sync_run`（迁移 `000030`）：
+**各自跑不同来源**再把派生预计算写成混代次结果。为此新增 `sync_run`（迁移 `000031`）：
 
 - `sync_run(tenant_id, subsystem_code, run_started_at, owner, finished_at)`，主键
   `(tenant_id, subsystem_code, run_started_at)`；`finished_at` 为空表示该轮未结束
@@ -80,7 +80,7 @@ ON DUPLICATE KEY UPDATE
 
 ### 滚动升级发布顺序（约束，不能只靠代码）
 
-1. 本次升级先做迁移（`000029`/`000030`/`000031`，均可重入）；
+1. 本次升级先做迁移（`000030`/`000031`/`000032`，均可重入）；
 2. aggregation-worker 先缩到 1 副本（或停旧实例）再起新实例，最后恢复副本数；
    **同一个 release 内不允许新旧两个版本并行跑轮次**——`sync_run` 只能“检测并跳过”，
    不能阻止老镜像（不认识本表）继续写。
@@ -90,7 +90,7 @@ ON DUPLICATE KEY UPDATE
 
 ## 合同审批投影通道（`contract_approval`）
 
-`dim_contract_approval`（迁移 `000029`）是 `con_approval_instance` 的只读投影，
+`dim_contract_approval`（迁移 `000030`）是 `con_approval_instance` 的只读投影，
 供看板在 `DASHBOARD_APPROVAL_SOURCE=instances` 时用 `EXISTS(status='running')` 计数：
 
 - 与合同维表共用 `CONTRACT_READ_DSN`，但使用**独立** `sync_source` 行（`subsystem_code='contract_approval'`），
@@ -98,7 +98,7 @@ ON DUPLICATE KEY UPDATE
 - **守卫列是来源 `con_approval_instance.updated_at`**：审批状态变化不改合同行，把
   `in_approval` 之类标志塞进 `dim_contract` 会被 `con_contract.updated_at` 守卫直接拒绝更新。
 - 切换 `instances` 的硬校验：`contract_approval` 通道必须已至少成功一轮
-  （`sync_source.last_success_at`，迁移 `000031`）；否则 dashboard-api 启动失败/运行期拒绝，
+  （`sync_source.last_success_at`，迁移 `000032`）；否则 dashboard-api 启动失败/运行期拒绝，
   **不会静默从“近似 >0”退化成 0**。
 - 全租户（TENANT）分支仍读 `api_contract_dashboard`（合同机器接口产出），不双写。
 - 部署项：合同库只读账号需 `SELECT con_approval_instance`；`DASHBOARD_APPROVAL_SOURCE`
