@@ -1,6 +1,7 @@
 module github.com/unified-identity-auth-platform/data-analysis
 
 go 1.26.0
+toolchain go1.26.10
 
 replace github.com/J-S-Te/license-core => ./third_party/license-core
 
