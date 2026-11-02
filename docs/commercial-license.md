@@ -14,6 +14,12 @@
 固定持久状态目录不存在或为空的组件；已有状态或绑定残留时会拒绝启动，不会因环境
 文件丢失而静默放开。不可通过删状态卷或修改开关解除既有执行保护。
 
+兼容模式必须显式 opt-in：`COMMERCIAL_LICENSE_ENABLED` 为空或 `false` 时还必须
+`COMMERCIAL_LICENSE_COMPATIBILITY=true`（归一大小写和首尾空白后严格等于 `true`），
+否则启动即 `ErrConfiguration`；`1`、`yes` 等非法取值按未开启处理并同样拒绝启动。
+反过来，生产不得用 `false` 加兼容开关冒充已授权：受控交付一律 `ENABLED=true`，
+该路径不受兼容开关影响。
+
 目录权威为 `license-core/catalog/catalog.go`（工作区路径）；本仓库构建使用审核过的
 `third_party/license-core/catalog/catalog.go` 镜像。组件目录/发布批准与原业务授权均须满足。
 平台操作见[运行时协调与激活](../../sharedDocs/09_商业授权/03_运行时协调与激活说明.md)。
@@ -21,7 +27,11 @@
 
 API, aggregation-worker and alert-worker each run an independent signed snapshot
 consumer. `COMMERCIAL_LICENSE_ENABLED=false` is allowed only for components never
-enrolled, with no other binding fields and no persisted runtime state. Controlled provisioning must set it to `true`; missing credentials,
+enrolled, with no other binding fields and no persisted runtime state, and only
+after explicit opt-in with `COMMERCIAL_LICENSE_COMPATIBILITY=true` (normalized
+exact `true`; empty, `1` or `yes` fail startup). Controlled provisioning must set
+`ENABLED=true`; using the compatibility switch instead is not authorization.
+Missing credentials,
 binding or trust rejects startup, and missing/unverifiable local snapshots deny
 business operations rather than authorizing them. The managed runtime setting
 must not be user-editable through business APIs.
@@ -35,6 +45,9 @@ SERVICE_ID, STATE_PATH, PLATFORM_PUBLIC_KEY_PATH, PLATFORM_BASE_URL, CLIENT_ID,
 CLIENT_SECRET, REGISTRATION_PROTOCOL, CATALOG_VERSION, ALLOW_HTTP. Legacy V1
 also requires COVERAGE_DIGEST and IMAGE_DIGEST; V2 permits them to be absent.
 If provided, digests use `sha256:`.
+`COMPATIBILITY` is not a managed variable: it only marks a never-enrolled
+component as deliberately running without controlled licensing, and is ignored
+when `ENABLED=true`.
 PLATFORM_PUBLIC_KEY_PATH is read-only Ed25519 SPKI PEM. Vendor trust is compiled
 into the reviewed consumer, not supplied by the customer. ENVIRONMENT binds the
 commercial installation (for example `production`), not OAuth's `prod` code.

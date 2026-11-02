@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"gorm.io/gorm"
@@ -102,12 +103,20 @@ func (r *Runner) claimQueueJob(ctx context.Context, job SyncJob, duration time.D
 }
 
 func (r *Runner) checkQueueLease(ctx context.Context, db *gorm.DB, lock bool) error {
+	_, err := r.lockedQueueJob(ctx, db, lock)
+	return err
+}
+
+// lockedQueueJob 校验当前上下文中的租约仍有效，并返回读取到的任务行，
+// 供终态事务复用同一行锁内的来源编码与本轮开始时间。
+// 上下文没有租约时返回零值任务行与 nil 错误（非队列路径）。
+func (r *Runner) lockedQueueJob(ctx context.Context, db *gorm.DB, lock bool) (SyncJob, error) {
 	l, ok := ctx.Value(queueLeaseKey{}).(queueLease)
 	if !ok {
-		return nil
+		return SyncJob{}, nil
 	}
 	if l.tenant != r.tenantID {
-		return ErrSyncLeaseLost
+		return SyncJob{}, ErrSyncLeaseLost
 	}
 	var job SyncJob
 	q := db.WithContext(ctx).Where("tenant_id = ? AND id = ? AND status = 'RUNNING' AND lease_owner = ? AND lease_generation = ?", l.tenant, l.job, l.owner, l.generation)
@@ -116,18 +125,18 @@ func (r *Runner) checkQueueLease(ctx context.Context, db *gorm.DB, lock bool) er
 	}
 	if err := q.First(&job).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return ErrSyncLeaseLost
+			return SyncJob{}, ErrSyncLeaseLost
 		}
-		return err
+		return SyncJob{}, err
 	}
 	now, err := queueDBNow(ctx, db)
 	if err != nil {
-		return err
+		return SyncJob{}, err
 	}
 	if job.LeaseExpiresAt == nil || !job.LeaseExpiresAt.After(now) {
-		return ErrSyncLeaseLost
+		return SyncJob{}, ErrSyncLeaseLost
 	}
-	return nil
+	return job, nil
 }
 
 // 每次队列聚合写入均在租约行锁的同一事务内隔离保护。
@@ -190,10 +199,47 @@ func (r *Runner) renewQueueLease(ctx context.Context, l queueLease, duration tim
 	})
 }
 
+// queueSourceErrorLimit 限制写入 sync_source.last_error 的失败摘要长度（字符），
+// 避免嵌套错误/SQL 片段把水位行撑得过长。
+const queueSourceErrorLimit = 512
+
+// queueSourceError 把失败摘要裁剪到列可接受的长度；超出时保留前缀并显式标注截断。
+func queueSourceError(err error) string {
+	if err == nil {
+		return ""
+	}
+	runes := []rune(err.Error())
+	if len(runes) <= queueSourceErrorLimit {
+		return string(runes)
+	}
+	return string(runes[:queueSourceErrorLimit-3]) + "..."
+}
+
+// markQueueSource 在队列任务终态事务内推进 sync_source 水位（BIZ-DATA-03），
+// 使管理员手工触发（队列）的同步与定时 RunOnce 写同一份状态。
+// 与 Runner.mark 保持同一防回退条件：仅当已有水位不新于本轮开始时间时才覆盖，
+// 迟到的旧工作器不能回退更新一轮的结果。暂停与租约丢失不调用本函数。
+func (r *Runner) markQueueSource(tx *gorm.DB, code string, roundStart time.Time, runErr error) error {
+	if code == "" {
+		return nil
+	}
+	updates := map[string]any{"last_status": statusSuccess, "last_run_at": roundStart, "last_error": nil, "updated_at": time.Now().UTC()}
+	if runErr != nil {
+		updates["last_status"] = statusFailed
+		updates["last_error"] = queueSourceError(runErr)
+	}
+	return tx.Model(&SyncSource{}).
+		Where("tenant_id = ? AND subsystem_code = ? AND (last_run_at IS NULL OR last_run_at <= ?)", r.tenantID, code, roundStart).
+		Updates(updates).Error
+}
+
 func (r *Runner) finishQueueJob(ctx context.Context, l queueLease, runErr error, pause bool) error {
 	return r.aggDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		leaseCtx := context.WithValue(ctx, queueLeaseKey{}, l)
-		if err := r.checkQueueLease(leaseCtx, tx, true); err != nil {
+		// 行锁读取同时提供来源编码与领取时写入的 started_at（数据库时钟），
+		// 使水位与本轮开始时间同源，不依赖宿主机时钟。
+		current, err := r.lockedQueueJob(leaseCtx, tx, true)
+		if err != nil {
 			return err
 		}
 		now, err := queueDBNow(ctx, tx)
@@ -216,6 +262,17 @@ func (r *Runner) finishQueueJob(ctx context.Context, l queueLease, runErr error,
 		}
 		if result.RowsAffected != 1 {
 			return ErrSyncLeaseLost
+		}
+		if pause {
+			// 暂停/取消保留有效槽位等待重放，源水位保持上一次真实结果。
+			return nil
+		}
+		roundStart := now
+		if current.StartedAt != nil {
+			roundStart = *current.StartedAt
+		}
+		if err := r.markQueueSource(tx, current.SubsystemCode, roundStart, runErr); err != nil {
+			return fmt.Errorf("finish queue job: mark source watermark: %w", err)
 		}
 		return nil
 	})
@@ -298,19 +355,39 @@ func (r *Runner) runLeasedQueue(ctx context.Context) error {
 	if err = r.aggDB.WithContext(ctx).Where("tenant_id = ? AND (status = 'QUEUED' OR (status = 'RUNNING' AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))", r.tenantID, now).Order("requested_at ASC, id ASC").Limit(10).Find(&jobs).Error; err != nil {
 		return err
 	}
+	locker := scheduledSyncLockerFor(r.aggDB)
 	for _, job := range jobs {
 		if err = r.checkLicense(ctx); err != nil {
 			return err
 		}
-		l, claimed, e := r.claimQueueJob(ctx, job, duration)
-		if e != nil {
-			return e
+		// 与定时 RunOnce 共用同一租户/来源锁：队列任务不能与定时全量同步并发写维表。
+		// 未获得锁时不领取任务，保持 QUEUED 供下一轮重试，避免认领后长期占用 active_key。
+		release, acquired, lockErr := locker.TryAcquire(ctx, r.tenantID, job.SubsystemCode)
+		if lockErr != nil {
+			return lockErr
 		}
-		if !claimed {
+		if !acquired {
+			slog.Warn("queued sync skipped: source full sync is running in another process", "job", job.ID, "source", job.SubsystemCode)
 			continue
 		}
-		if e = r.executeQueueJob(ctx, job, l, duration, heartbeat, timeout, r.runSource); e != nil {
-			return e
+		func() {
+			defer func() {
+				if releaseErr := release(); releaseErr != nil {
+					slog.Warn("release queued sync source lock failed", "job", job.ID, "source", job.SubsystemCode, "error", releaseErr)
+				}
+			}()
+			l, claimed, e := r.claimQueueJob(ctx, job, duration)
+			if e != nil {
+				err = e
+				return
+			}
+			if !claimed {
+				return
+			}
+			err = r.executeQueueJob(ctx, job, l, duration, heartbeat, timeout, r.runSource)
+		}()
+		if err != nil {
+			return err
 		}
 	}
 	return nil

@@ -48,16 +48,14 @@ type App struct {
 // 参数：config 为数据库、认证、许可和机器信任绑定的运行配置。
 // 返回值：可运行的App；配置或初始化失败返回错误。
 func New(config Config) (*App, error) {
-	var reportVerifier *importreport.Verifier
-	if config.ContractImportStatus.ClientID != "" {
-		if config.ContractImportStatus.TenantID != config.OIDCTenantID {
-			return nil, errors.New("report-status trusted tenant mismatch")
-		}
-		var err error
-		reportVerifier, err = importreport.NewVerifier(config.ContractImportStatus)
-		if err != nil {
-			return nil, err
-		}
+	// 业务日时区先于任何 I/O 校验：非法值必须让启动失败，而不是回退 UTC 改变到期口径。
+	dashboardLocation, err := LoadDashboardLocation(config.DashboardTimezone)
+	if err != nil {
+		return nil, err
+	}
+	reportVerifier, err := reportStatusVerifier(config)
+	if err != nil {
+		return nil, err
 	}
 	licenseContext, stopLicense := context.WithCancel(context.Background())
 	initialized := false
@@ -77,6 +75,12 @@ func New(config Config) (*App, error) {
 	// 表结构由版本化 SQL 迁移创建（migrations/，compose 初始化时执行）；不使用运行时 AutoMigrate。
 
 	ctx := context.Background()
+	// 审批中口径的启动期硬校验：instances 依赖 contract_approval 通道首次成功。
+	// 通道尚未成功时启动失败（而不是运行期静默返回 0）：先迁移并跑通审批投影通道，
+	// 再切 DASHBOARD_APPROVAL_SOURCE。
+	if err := dashboardinfrastructure.ValidateApprovalSource(ctx, db, config.OIDCTenantID, config.DashboardApprovalSource); err != nil {
+		return nil, err
+	}
 	localCatalog := platformcatalog.DataAnalysisManifest()
 	localRoleConfigHash, err := platformcatalog.ClaimsRoleConfigHash(localCatalog)
 	if err != nil {
@@ -113,7 +117,8 @@ func New(config Config) (*App, error) {
 		CatalogVersion:          localCatalog.Version,
 		RoleConfigHash:          localRoleConfigHash,
 		PathPrefix:              config.PathPrefix,
-		SessionTTL:              15 * timeMinute,
+		SessionIdleTTL:          config.OIDCSessionIdleTTL,
+		SessionAbsoluteTTL:      config.OIDCSessionAbsoluteTTL,
 		CodecKey:                config.CodecKey,
 		AuthorizationContextURL: config.AuthorizationContextURL,
 		Reporter:                auditReporter,
@@ -140,10 +145,11 @@ func New(config Config) (*App, error) {
 	base := router.Group(strings.TrimRight(config.PathPrefix, "/"))
 	if reportVerifier != nil {
 		status := importreport.StatusHandler(db, reportVerifier, func(ctx context.Context) error { return licenseCheck.Allow(ctx, commercial.ReadHistory) })
-		router.GET("/internal/v1/contract-imports/report-status", status)
-		if strings.TrimRight(config.PathPrefix, "/") != "" {
-			base.GET("/internal/v1/contract-imports/report-status", status)
-		}
+		// 合同系统把 CONTRACT_IMPORT_REPORT_BASE_URL 当作服务 origin，固定请求
+		// /internal/v1/contract-imports/report-status（不带 APP_PATH_PREFIX）。
+		// 只保留这一个权威挂载；再挂 base 前缀会让同一机器端点出现两个路径，
+		// 与实际调用契约漂移，并绕过按组/前缀设计的访问控制与审计规则。
+		mountInternalReportStatus(router, status)
 	}
 	base.GET("/livez", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 	base.GET("/readyz", func(c *gin.Context) {
@@ -184,12 +190,16 @@ func New(config Config) (*App, error) {
 	api.Use(middleware.RequireSameOriginWrite(config.PublicOrigin))
 	api.Use(commercial.Middleware(licenseCheck))
 	api.GET("/auth/me", authHandler.AuthMe)
+	// 浏览器显式活动续期：组级 RequireSameOriginWrite 已覆盖该 POST 的 Origin/CSRF 校验，
+	// commercial 白名单与审计豁免分别在 gate.go / audit.go 中按 /auth/me 同级处理。
+	api.POST("/auth/activity", authHandler.Activity)
 
 	// 嵌入桥（设计方案 §9）
 	api.GET("/embed/:dashboard", func(c *gin.Context) { bridge.Issue(c, c.Param("dashboard")) })
-	// embed-proxy 以 URL 内的一次性令牌为唯一凭证，允许 sandbox（无 allow-same-origin）
-	// iframe 的跨源读取；CORS 仅放宽到该前缀，会话接口不受影响。
-	embedProxy := base.Group("/api/v1/embed-proxy", middleware.EmbedProxyCORS())
+	// embed-proxy 以 URL 内的一次性令牌为唯一凭证；CORS 只对 BI_EMBED_PUBLIC_ORIGIN
+	// 明确配置的独立嵌入源回显，不透明源（Origin: null）与其他外源一律不设置 ACAO，
+	// 且仅作用于该前缀，会话接口不受影响。
+	embedProxy := base.Group("/api/v1/embed-proxy", middleware.EmbedProxyCORS(config.EmbedPublicOrigin))
 	embedProxy.GET("/:token", func(c *gin.Context) { bridge.Proxy(c, c.Param("token")) })
 	embedProxy.GET("/:token/*resource", func(c *gin.Context) {
 		bridge.ProxyResource(c, c.Param("token"), c.Param("resource"))
@@ -212,7 +222,7 @@ func New(config Config) (*App, error) {
 	api.GET("/dictionary/metrics/:code/versions", middleware.RequirePermission("dictionary.view"), dictHandler.History)
 
 	adminHandler := adminhttp.NewHandler(adminapplication.NewService(admininfrastructure.NewGORMRepository(db)))
-	dashboardHandler := dashboardhttp.NewHandler(dashboardapplication.NewService(dashboardinfrastructure.NewGORMRepository(db)))
+	dashboardHandler := dashboardhttp.NewHandler(dashboardapplication.NewService(dashboardinfrastructure.NewGORMRepositoryWithApprovalSource(db, dashboardLocation, config.DashboardApprovalSource)))
 	api.GET("/dashboard/contract-import-history", middleware.RequirePermission("dashboard.contract.view"), importreport.HistoryHandler(db))
 	api.GET("/dashboard/contract", middleware.RequirePermission("dashboard.contract.view"), dashboardHandler.Contract)
 	api.GET("/dashboard/project", middleware.RequirePermission("dashboard.project.view"), dashboardHandler.Project)
@@ -232,6 +242,37 @@ func New(config Config) (*App, error) {
 	return &App{Config: config, DB: db, Router: router, Server: server, StopLicense: stopLicense}, nil
 }
 
+// InternalReportStatusPath 是合同导入报表状态机器接口的权威调用路径。
+// 合同系统以 CONTRACT_IMPORT_REPORT_BASE_URL（服务 origin）+ 该绝对路径调用，
+// 因此不随 APP_PATH_PREFIX 变化，也不在 base 组下重复挂载。
+const InternalReportStatusPath = "/internal/v1/contract-imports/report-status"
+
+// reportStatusVerifier 按机器信任绑定的完整性决定是否构造报表状态验证器。
+// 参数：config 为当前进程配置。
+// 返回值：验证器；绑定不完整时返回 nil（端点不挂载）；租户不一致或构造失败返回错误。
+//
+// 机器端点默认关闭：CONTRACT_IMPORT_STATUS_CLIENT_ID 或
+// REPORT_STATUS_MACHINE_OAUTH_CLIENT_ID 任一为空都不构造验证器，App.New 因此不挂载
+// /internal/v1/contract-imports/report-status。缺少 OAuth 客户端绑定时宁可不出该端点，
+// 也不能挂一个无法证明“是哪个客户端调的”的匿名读取入口。
+func reportStatusVerifier(config Config) (*importreport.Verifier, error) {
+	status := config.ContractImportStatus
+	if strings.TrimSpace(status.ClientID) == "" || strings.TrimSpace(status.OAuthClientID) == "" {
+		return nil, nil
+	}
+	if status.TenantID != config.OIDCTenantID {
+		return nil, errors.New("report-status trusted tenant mismatch")
+	}
+	return importreport.NewVerifier(status)
+}
+
+// mountInternalReportStatus 只挂载合同契约声明的根路径。
+// 参数：router 为根路由，status 为机器验签处理器。
+// 返回值：无；重复挂载会扩大未审计的入口面，故由该函数集中约束。
+func mountInternalReportStatus(router *gin.Engine, status gin.HandlerFunc) {
+	router.GET(InternalReportStatusPath, status)
+}
+
 // newHTTPServer 构造 dashboard-api 的 http.Server。
 // 安全理由（AUD-2026-031）：四项超时全缺会暴露 slowloris 等慢连接资源耗尽面；
 // 取值对齐 project_management/cmd/api/main.go 的既有配置（5s/15s/45s/60s），
@@ -246,7 +287,5 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 		IdleTimeout:       60 * time.Second,
 	}
 }
-
-const timeMinute = 60 * 1e9 // ns
 
 var _ = slog.Default

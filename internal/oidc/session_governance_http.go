@@ -81,11 +81,6 @@ func (h *Handler) stateCookie(state string, maxAge int) *http.Cookie {
 // 返回值：无；不推进活动或刷新原始绝对截止。
 func (h *Handler) SessionState(c *gin.Context) { h.lifecycle(c, false) }
 
-// Activity 代理通过Origin和CSRF检查的真实交互。
-// 参数：c为已认证且受同源写保护的请求。
-// 返回值：无；失效周期不能复活。
-func (h *Handler) Activity(c *gin.Context) { h.lifecycle(c, true) }
-
 // lifecycle 为同源状态和活动端点执行精确Cookie关联和错误分类。
 // 参数：c为请求，interact表示显式交互。
 // 返回值：无；确定失效返回401，中央或存储故障503，响应不含秘密。

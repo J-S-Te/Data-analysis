@@ -102,9 +102,73 @@ func TestContractExpiryQueryBindsWorkerTenant(t *testing.T) {
 	if !strings.Contains(sql, "owner_org_id") {
 		t.Fatalf("candidate SQL lacks owner_org_id projection: %s", sql)
 	}
-	want := []any{"tenant-a", at, at, 21, "COMPLETED", "ARCHIVED", "TERMINATED"}
+	want := []any{
+		at, at, 21, // SELECT 中的 in_window 判定
+		"tenant-a",
+		at, 21, // 条件集合下界：已到期未续签仍算命中
+		at, 21, // 提醒窗口上界
+		"COMPLETED", "ARCHIVED", "TERMINATED",
+	}
 	if !reflect.DeepEqual(vars, want) {
 		t.Fatalf("candidate SQL vars = %#v, want %#v", vars, want)
+	}
+}
+
+// TestContractExpiryQuerySelectsConditionSetWithWindowFlag 验证候选集合口径：
+// 条件集合 = 到期提醒窗口 + 刚过期未续签（下界回溯 days 天），并单独投影 in_window，
+// 使"已到期但未续签"的合同持续命中而不是滑出窗口被关闭。
+// 参数：t 为测试上下文。
+// 返回值：无。
+func TestContractExpiryQuerySelectsConditionSetWithWindowFlag(t *testing.T) {
+	db := dryRunMySQL(t)
+	var sql string
+	if err := db.Callback().Query().After("gorm:query").Register("capture_condition_set_sql", func(tx *gorm.DB) {
+		sql = tx.Statement.SQL.String()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC)
+	if _, err := NewGormStore(db, "tenant-a").FindContractExpiryCandidates(context.Background(), at, 30); err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{
+		"in_window",
+		"DATE_SUB(DATE(?), INTERVAL ? DAY)",
+		"DATE_ADD(DATE(?), INTERVAL ? DAY)",
+		"end_date IS NOT NULL",
+		"status NOT IN",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("candidate SQL lacks %q: %s", fragment, sql)
+		}
+	}
+}
+
+// TestCountActiveAlertsScopesTenantAndOpenStatuses 验证安全阀基数的查询口径：
+// 只统计同租户、同规则的 OPEN/ACK 告警。
+// 参数：t 为测试上下文。
+// 返回值：无。
+func TestCountActiveAlertsScopesTenantAndOpenStatuses(t *testing.T) {
+	db := dryRunMySQL(t)
+	var sql string
+	var vars []any
+	if err := db.Callback().Query().After("gorm:query").Register("capture_active_count_sql", func(tx *gorm.DB) {
+		sql = tx.Statement.SQL.String()
+		vars = append([]any(nil), tx.Statement.Vars...)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewGormStore(db, "tenant-a").CountActiveAlerts(context.Background(), RuleContractExpiry); err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{"count(*)", "tenant_id = ?", "rule_code = ?", "status IN"} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("active count SQL lacks %q: %s", fragment, sql)
+		}
+	}
+	want := []any{"tenant-a", RuleContractExpiry, "OPEN", "ACK"}
+	if !reflect.DeepEqual(vars, want) {
+		t.Fatalf("active count vars = %#v, want %#v", vars, want)
 	}
 }
 

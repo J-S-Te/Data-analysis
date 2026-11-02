@@ -102,14 +102,22 @@ func TestImportReportRealMySQLPublicationAndSource(t *testing.T) {
 	if err != nil || status.State != "APPLIED" || len(status.AppliedChannels) != 2 {
 		t.Fatalf("actual publication %+v %v", status, err)
 	}
-	// 同轮源数据故障不得沿用上轮SOURCE_FACTS_APPLIED冒充新代次完成。
+	// 源通道本轮不可读取时不得撤销已验证证据，也不得把本轮算作成功：
+	// 运行状态为 BLOCKED，逐项凭据保持上轮 APPLIED 与原始验证代次。
 	gen, _ = r.beginImportReport(ctx)
 	if err = r.publishImportReport(ctx, gen, s, nil, "SOURCE_UNAVAILABLE"); err != nil {
 		t.Fatal(err)
 	}
 	status, _ = ReadImportReportStatus(ctx, db, "t", "i2", 2, 3)
-	if status.State != "BLOCKED" || status.SourceFactsApplied {
-		t.Fatal("previous-round source evidence reused")
+	if status.State != "APPLIED" || !status.SourceFactsApplied {
+		t.Fatalf("source outage revoked verified evidence %+v", status)
+	}
+	var run ImportReportRun
+	if qErr := db.Where("tenant_id=?", "t").Take(&run).Error; qErr != nil {
+		t.Fatal(qErr)
+	}
+	if run.LastStatus != "BLOCKED" || run.PublishedSnapshotID != s.SourceSnapshotID {
+		t.Fatalf("source outage advanced success evidence %+v", run)
 	}
 	gen, _ = r.beginImportReport(ctx)
 	if err = r.publishImportReport(ctx, gen, s, facts, ""); err != nil {

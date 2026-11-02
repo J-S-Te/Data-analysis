@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/auth"
 	"gorm.io/gorm"
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/alerts/application"
@@ -14,19 +15,23 @@ import (
 )
 
 type alertRecord struct {
-	ID         string  `gorm:"column:id;primaryKey"`
-	TenantID   string  `gorm:"column:tenant_id"`
-	AlertType  string  `gorm:"column:alert_type"`
-	RuleCode   string  `gorm:"column:rule_code"`
-	Severity   string  `gorm:"column:severity"`
-	OwnerOrgID string  `gorm:"column:owner_org_id"`
-	TargetRef  string  `gorm:"column:target_ref"`
-	Title      string  `gorm:"column:title"`
-	DueDate    *string `gorm:"column:due_date"`
-	Status     string  `gorm:"column:status"`
-	ClosedAt   *string `gorm:"column:closed_at"`
-	CreatedAt  string  `gorm:"column:created_at"`
-	UpdatedAt  string  `gorm:"column:updated_at"`
+	ID             string  `gorm:"column:id;primaryKey"`
+	TenantID       string  `gorm:"column:tenant_id"`
+	AlertType      string  `gorm:"column:alert_type"`
+	RuleCode       string  `gorm:"column:rule_code"`
+	Severity       string  `gorm:"column:severity"`
+	OwnerOrgID     string  `gorm:"column:owner_org_id"`
+	TargetRef      string  `gorm:"column:target_ref"`
+	Title          string  `gorm:"column:title"`
+	DueDate        *string `gorm:"column:due_date"`
+	Status         string  `gorm:"column:status"`
+	ClosedAt       *string `gorm:"column:closed_at"`
+	ClosedReason   string  `gorm:"column:closed_reason"`
+	ReopenCount    int64   `gorm:"column:reopen_count"`
+	AcknowledgedAt *string `gorm:"column:acknowledged_at"`
+	AcknowledgedBy string  `gorm:"column:acknowledged_by"`
+	CreatedAt      string  `gorm:"column:created_at"`
+	UpdatedAt      string  `gorm:"column:updated_at"`
 }
 
 func (alertRecord) TableName() string { return "alert_item" }
@@ -63,7 +68,9 @@ func applyAlertScope(db *gorm.DB, scope application.AlertScope) *gorm.DB {
 func (record alertRecord) toDomain() domain.Item {
 	return domain.Item{ID: record.ID, TenantID: record.TenantID, AlertType: record.AlertType, RuleCode: record.RuleCode,
 		Severity: record.Severity, TargetRef: record.TargetRef, Title: record.Title, DueDate: record.DueDate,
-		Status: record.Status, ClosedAt: record.ClosedAt, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
+		Status: record.Status, ClosedAt: record.ClosedAt, ClosedReason: record.ClosedReason,
+		ReopenCount: record.ReopenCount, AcknowledgedAt: record.AcknowledgedAt, AcknowledgedBy: record.AcknowledgedBy,
+		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
 }
 
 // GORMRepository 将告警状态持久化到数据分析数据库。
@@ -144,12 +151,24 @@ func (repository *GORMRepository) SummaryByTenant(ctx context.Context, tenantID 
 //
 // AUD-IP-2026 / 批次 2：状态变更与审计事件在同一事务提交；未命中记录时回滚，
 // 不会留下"没改到任何告警却记了一条审计"的事件。
+// 人工关闭写入 closed_reason=MANUAL：规则评估的自动收敛只会复开自动原因
+// （AUTO_WINDOW_EXIT/AUTO_CONDITION_CLEARED），因此人工决定不会被后台规则覆盖。
+// 人工确认（ACK）写入 acknowledged_at/acknowledged_by 作为确认证据，规则自动
+// 复开时原样保留。
 func (repository *GORMRepository) UpdateStatus(ctx context.Context, id, tenantID, status string, scope application.AlertScope, updatedAt time.Time, closedAt *time.Time) (bool, error) {
 	var changed bool
+	updates := map[string]interface{}{"status": status, "updated_at": updatedAt, "closed_at": closedAt, "closed_reason": ""}
+	switch status {
+	case "CLOSED":
+		updates["closed_reason"] = "MANUAL"
+	case "ACK":
+		updates["acknowledged_at"] = updatedAt
+		updates["acknowledged_by"] = alertActorID(ctx)
+	}
 	err := repository.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := applyAlertScope(tx.Model(&alertRecord{}).
 			Where("id = ? AND tenant_id = ?", id, tenantID), scope).
-			Updates(map[string]interface{}{"status": status, "updated_at": updatedAt, "closed_at": closedAt})
+			Updates(updates)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -163,4 +182,27 @@ func (repository *GORMRepository) UpdateStatus(ctx context.Context, id, tenantID
 		})
 	})
 	return changed, err
+}
+
+// acknowledgedByMaxLength 对齐迁移 000027 的 acknowledged_by VARCHAR(64)。
+const acknowledgedByMaxLength = 64
+
+// alertActorID 从已认证上下文提取操作者标识，写入 acknowledged_by。
+// 参数：ctx 为请求上下文，已由认证中间件写入 Principal。
+// 返回值：操作者用户 ID（缺失时退回用户名）；无认证主体时返回空串。
+func alertActorID(ctx context.Context) string {
+	principal, ok := auth.FromContext(ctx)
+	if !ok {
+		return ""
+	}
+	for _, candidate := range []string{principal.UserID, principal.Username} {
+		if actor := strings.TrimSpace(candidate); actor != "" {
+			runes := []rune(actor)
+			if len(runes) > acknowledgedByMaxLength {
+				runes = runes[:acknowledgedByMaxLength]
+			}
+			return string(runes)
+		}
+	}
+	return ""
 }

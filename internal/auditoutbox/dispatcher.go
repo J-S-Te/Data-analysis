@@ -61,6 +61,9 @@ func (d *Dispatcher) deliverOnce(ctx context.Context) {
 		return
 	}
 	for _, entry := range entries {
+		// 只转发平台审计协议已有的字段：platformaudit.Event 没有负载字段，
+		// 因此迁移 000028 的 payload 保持本地证据（不新增平台侧转发字段，
+		// 也不把本地负载拼进 action/resource_id 等既有列充数）。
 		event := platformaudit.Event{
 			ActorID: entry.ActorID, Action: entry.Action,
 			ResourceType: entry.ResourceType, ResourceID: entry.ResourceID,

@@ -35,7 +35,10 @@ func Reject(c *gin.Context, err error) bool {
 
 func Middleware(check Check) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if strings.HasSuffix(c.FullPath(), "/auth/me") {
+		// 会话元数据接口只依赖本地会话 cookie，不属于业务读写：/auth/me 与
+		// /auth/activity 必须绕过商业授权门禁，否则授权到期会先打断活动续期，
+		// 让在线用户在空闲到期前被误登出。
+		if path := c.FullPath(); strings.HasSuffix(path, "/auth/me") || strings.HasSuffix(path, "/auth/activity") {
 			c.Next()
 			return
 		}

@@ -20,7 +20,12 @@ func (r *Runner) PrecomputeConversion(ctx context.Context) error {
 			return err
 		}
 		now := time.Now().UTC()
-		result := tx.Exec(query, now, r.tenantID)
+		// 月份必须按业务时区（DASHBOARD_TIMEZONE，默认 Asia/Shanghai）归集：
+		// period_month 是主键之一且口径为“业务发生日”，按 UTC 归月会把北京时间
+		// 每月首日 00:00-08:00 创建的商机算到上一月。偏移作为绑定参数传入，
+		// 时区可配且不硬编码 +08:00。
+		offset := BusinessUTCOffset(r.businessLocation(), now)
+		result := tx.Exec(query, offset, now, r.tenantID)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -34,12 +39,15 @@ func (r *Runner) PrecomputeConversion(ctx context.Context) error {
 // conversionFactQuery 构造仅普通合同可佐证的去重商机转化查询。
 // 参数：dialect 为数据库方言，用于安全统一月份和跨表字符比较。
 // 返回值：带快照时间及租户占位符的INSERT SELECT，不修改源表排序规则。
+// 占位符顺序：业务时区偏移（月份换算）、快照时间、租户。偏移只出现一次，
+// 分组复用 period_month 别名，避免同一参数重复绑定。
 func conversionFactQuery(dialect string) string {
-	month := "COALESCE(DATE_FORMAT(o.created_at, '%Y-%m'), 'UNKNOWN')"
+	// o.created_at 是 UTC 墙钟 DATETIME，先换算到业务时区再取月前缀。
+	month := "COALESCE(DATE_FORMAT(CONVERT_TZ(o.created_at, '+00:00', ?), '%Y-%m'), 'UNKNOWN')"
 	id := "CAST(o.opportunity_id AS CHAR)"
 	collate := ""
 	if dialect == "sqlite" {
-		month = "COALESCE(strftime('%Y-%m', o.created_at), 'UNKNOWN')"
+		month = "COALESCE(strftime('%Y-%m', o.created_at, ?), 'UNKNOWN')"
 		id = "CAST(o.opportunity_id AS TEXT)"
 	} else {
 		collate = " COLLATE utf8mb4_unicode_ci"
@@ -55,9 +63,9 @@ func conversionFactQuery(dialect string) string {
 	match := "(" + wrap("c.opportunity_id") + " = " + wrap(id) +
 		" OR (o.contract_id IS NOT NULL AND o.contract_id <> '' AND " + wrap("c.contract_id") + " = " + wrap("o.contract_id") + "))"
 	return `INSERT INTO fct_opportunity_conversion (tenant_id,period_month,opportunity_count,won_contract_count,snapshot_at)
-SELECT o.tenant_id, ` + month + `, COUNT(*), SUM(CASE WHEN o.current_stage = '已签约' AND EXISTS (
+SELECT o.tenant_id, ` + month + ` AS period_month, COUNT(*), SUM(CASE WHEN o.current_stage = '已签约' AND EXISTS (
 SELECT 1 FROM dim_contract c WHERE c.tenant_id=o.tenant_id AND c.origin_kind = 'NORMAL' AND c.status IN ('active','in_progress','pending_pay','completed')
 AND ` + match + `) THEN 1 ELSE 0 END), ?
 FROM dim_opportunity o WHERE o.tenant_id = ? AND o.deleted_at IS NULL AND o.opp_status <> 'VOID'
-GROUP BY o.tenant_id, ` + month
+GROUP BY o.tenant_id, period_month`
 }

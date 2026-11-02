@@ -4,12 +4,15 @@ package bootstrap
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/importreport"
+	dashboardinfrastructure "github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard/infrastructure"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/oidc"
 )
 
 type Config struct {
@@ -28,8 +31,12 @@ type Config struct {
 	OIDCTenantID                string
 	OIDCRoleConfigHash          string
 	OIDCMaxRoles                int
-	CodecKey                    []byte
-	SecureCookie                bool
+	// OIDCSessionIdleTTL / OIDCSessionAbsoluteTTL 是浏览器会话的空闲与绝对期限。
+	// 只由显式活动接口（/auth/activity）续期空闲计时；绝对期限不受活动影响。
+	OIDCSessionIdleTTL     time.Duration
+	OIDCSessionAbsoluteTTL time.Duration
+	CodecKey               []byte
+	SecureCookie           bool
 
 	PlatformBaseURL      string
 	CatalogSyncEnabled   bool
@@ -51,6 +58,30 @@ type Config struct {
 	MetabaseEmbeddingSecret string
 	EmbedPublicOrigin       string
 	DashboardIDs            map[string]string
+	// DashboardTimezone 是看板“今天/到期”业务日时区（IANA 名，默认 Asia/Shanghai）。
+	// 仅用于业务日边界，存储与同步口径仍为 UTC；装载时校验，非法值启动失败。
+	DashboardTimezone string
+	// DashboardApprovalSource 是看板“审批中”口径（status 默认 | instances）。
+	// instances 依赖 contract_approval 同步通道，启动期与运行期都做硬校验。
+	DashboardApprovalSource dashboardinfrastructure.ApprovalSource
+}
+
+// DefaultDashboardTimezone 是看板业务日时区的默认值，与 dashboard 仓储默认一致。
+const DefaultDashboardTimezone = "Asia/Shanghai"
+
+// LoadDashboardLocation 解析并校验看板业务日时区。
+// 参数：name 为 IANA 时区名，空值取默认值。
+// 返回值：时区对象或非法时区错误；非法时区必须启动失败（fail-closed），
+// 否则前端“今天/到期”会静默漂移到另一个时区。
+func LoadDashboardLocation(name string) (*time.Location, error) {
+	if strings.TrimSpace(name) == "" {
+		name = DefaultDashboardTimezone
+	}
+	location, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, fmt.Errorf("DASHBOARD_TIMEZONE %q is not a valid IANA time zone", name)
+	}
+	return location, nil
 }
 
 // LoadConfig 读取API进程配置及独立报告状态信任绑定。
@@ -79,27 +110,49 @@ func LoadConfig() (Config, error) {
 	// COOKIE_SECURE 默认跟随 PublicOrigin 协议：https 部署未显式配置时仍获得
 	// Secure Cookie，避免生产漏配导致会话凭据以明文 Cookie 传输。
 	secure := envBool("COOKIE_SECURE", strings.HasPrefix(strings.ToLower(publicOrigin), "https://"))
+	// 业务日时区在装载期即校验：非法 DASHBOARD_TIMEZONE 直接让进程启动失败，
+	// 不把“今天/到期”悄悄退回 UTC。
+	dashboardTimezone := envOr("DASHBOARD_TIMEZONE", DefaultDashboardTimezone)
+	if _, err := LoadDashboardLocation(dashboardTimezone); err != nil {
+		return Config{}, err
+	}
+	// 审批中口径在装载期即校验：非法值启动失败，不让看板静默退回近似口径。
+	approvalSource, err := dashboardinfrastructure.ParseApprovalSource(os.Getenv("DASHBOARD_APPROVAL_SOURCE"))
+	if err != nil {
+		return Config{}, err
+	}
+	// 会话双期限在装载期即校验：空闲 1m~24h、绝对 > 空闲，非法直接启动失败（fail-closed）。
+	sessionIdleTTL, sessionAbsoluteTTL, err := loadSessionTTLs()
+	if err != nil {
+		return Config{}, err
+	}
 	return Config{
 		CentralSessionEnabled: centralEnabled, CentralSessionPublicBaseURL: envOr("CENTRAL_SESSION_PUBLIC_BASE_URL", publicOrigin),
 		ContractImportStatus: importreport.VerifierOptions{
 			Issuer: os.Getenv("CONTRACT_IMPORT_STATUS_ISSUER"), Audience: os.Getenv("CONTRACT_IMPORT_STATUS_AUDIENCE"),
 			PublicKeyPath: os.Getenv("CONTRACT_IMPORT_STATUS_PUBLIC_KEY_PATH"), ClientID: os.Getenv("CONTRACT_IMPORT_STATUS_CLIENT_ID"),
-			TenantID: os.Getenv("CONTRACT_IMPORT_STATUS_TENANT_ID"), CallerEnvironment: os.Getenv("CONTRACT_IMPORT_STATUS_CALLER_ENVIRONMENT_CODE"),
+			OAuthClientID: os.Getenv("REPORT_STATUS_MACHINE_OAUTH_CLIENT_ID"),
+			TenantID:      os.Getenv("CONTRACT_IMPORT_STATUS_TENANT_ID"), CallerEnvironment: os.Getenv("CONTRACT_IMPORT_STATUS_CALLER_ENVIRONMENT_CODE"),
+			// 机器报表状态端点必须能证明“哪个应用、在哪个环境”读取了精确版本，
+			// 因此应用/环境绑定始终要求存在，不提供关闭开关。
+			RequireApplicationID: true, RequireEnvironmentID: true,
 		},
-		ListenAddr:         envOr("LISTEN_ADDR", ":8080"),
-		MySQLDSN:           os.Getenv("DASHBOARD_MYSQL_DSN"),
-		PathPrefix:         pathPrefix,
-		PublicOrigin:       strings.TrimRight(publicOrigin, "/"),
-		OIDCIssuer:         envOr("OIDC_ISSUER", "http://localhost:18090/realms/basic-platform"),
-		OIDCBackchannel:    os.Getenv("OIDC_BACKCHANNEL_BASE_URL"),
-		OIDCClientID:       os.Getenv("OIDC_CLIENT_ID"),
-		OIDCClientSecret:   os.Getenv("OIDC_CLIENT_SECRET"),
-		OIDCRedirectURI:    os.Getenv("OIDC_REDIRECT_URI"),
-		OIDCTenantID:       os.Getenv("OIDC_TENANT_ID"),
-		OIDCRoleConfigHash: os.Getenv("OIDC_ROLE_CONFIG_HASH"),
-		OIDCMaxRoles:       maxRoles,
-		CodecKey:           codecKey,
-		SecureCookie:       secure,
+		ListenAddr:             envOr("LISTEN_ADDR", ":8080"),
+		MySQLDSN:               os.Getenv("DASHBOARD_MYSQL_DSN"),
+		PathPrefix:             pathPrefix,
+		PublicOrigin:           strings.TrimRight(publicOrigin, "/"),
+		OIDCIssuer:             envOr("OIDC_ISSUER", "http://localhost:18090/realms/basic-platform"),
+		OIDCBackchannel:        os.Getenv("OIDC_BACKCHANNEL_BASE_URL"),
+		OIDCClientID:           os.Getenv("OIDC_CLIENT_ID"),
+		OIDCClientSecret:       os.Getenv("OIDC_CLIENT_SECRET"),
+		OIDCRedirectURI:        os.Getenv("OIDC_REDIRECT_URI"),
+		OIDCTenantID:           os.Getenv("OIDC_TENANT_ID"),
+		OIDCRoleConfigHash:     os.Getenv("OIDC_ROLE_CONFIG_HASH"),
+		OIDCMaxRoles:           maxRoles,
+		OIDCSessionIdleTTL:     sessionIdleTTL,
+		OIDCSessionAbsoluteTTL: sessionAbsoluteTTL,
+		CodecKey:               codecKey,
+		SecureCookie:           secure,
 
 		PlatformBaseURL:      strings.TrimRight(envOr("PLATFORM_BASE_URL", publicOrigin), "/"),
 		CatalogSyncEnabled:   envBool("PLATFORM_AUTHORIZATION_CATALOG_SYNC_ENABLED", false),
@@ -126,7 +179,53 @@ func LoadConfig() (Config, error) {
 			"report":   envOr("MB_DASHBOARD_ID_REPORT", ""),
 			"finance":  envOr("MB_DASHBOARD_ID_FINANCE", ""),
 		},
+		DashboardTimezone:       dashboardTimezone,
+		DashboardApprovalSource: approvalSource,
 	}, nil
+}
+
+// loadSessionTTLs 解析会话双期限配置并失败关闭。
+// 参数：无，配置来自环境变量。
+// 返回值：空闲期限、绝对期限或校验错误。
+//
+// 兼容旧键：OIDC_SESSION_TTL 在新绝对期限键缺省时作为本次绝对期限，避免旧环境被静默
+// 放大到新的 8h 默认值。旧值若不大于新的空闲窗口（默认 30m），下面的统一校验会失败
+// 关闭，要求运维显式改新键后再启动，而不是静默改变到期口径。
+func loadSessionTTLs() (time.Duration, time.Duration, error) {
+	idleRaw := strings.TrimSpace(os.Getenv("OIDC_SESSION_IDLE_TTL"))
+	absoluteRaw := strings.TrimSpace(os.Getenv("OIDC_SESSION_ABSOLUTE_TTL"))
+	legacyRaw := strings.TrimSpace(os.Getenv("OIDC_SESSION_TTL"))
+
+	idle := oidc.DefaultSessionIdleTTL
+	if idleRaw != "" {
+		parsed, err := time.ParseDuration(idleRaw)
+		if err != nil {
+			return 0, 0, fmt.Errorf("OIDC_SESSION_IDLE_TTL: %w", err)
+		}
+		idle = parsed
+	}
+
+	absolute := oidc.DefaultSessionAbsoluteTTL
+	switch {
+	case absoluteRaw != "":
+		parsed, err := time.ParseDuration(absoluteRaw)
+		if err != nil {
+			return 0, 0, fmt.Errorf("OIDC_SESSION_ABSOLUTE_TTL: %w", err)
+		}
+		absolute = parsed
+	case legacyRaw != "":
+		// 旧键存在且新绝对期限缺省：旧值作为本次绝对期限，避免被静默放大到 8h 默认值。
+		// 若旧值不大于新的空闲窗口，下面的统一校验会失败关闭，由运维显式改新键。
+		parsed, err := time.ParseDuration(legacyRaw)
+		if err != nil {
+			return 0, 0, fmt.Errorf("OIDC_SESSION_TTL: %w", err)
+		}
+		absolute = parsed
+	}
+	if err := oidc.ValidateSessionTTLs(idle, absolute); err != nil {
+		return 0, 0, err
+	}
+	return idle, absolute, nil
 }
 
 func firstNonEmpty(values ...string) string {

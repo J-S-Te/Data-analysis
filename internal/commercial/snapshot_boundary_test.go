@@ -230,6 +230,16 @@ func (s *biAlertStore) UpsertAlerts(context.Context, []alertworker.Alert) error 
 	return nil
 }
 
+// CountActiveAlerts 供安全阀使用；该假实现只用于授权门禁测试，AutoResolve 默认关闭不会走到此处。
+func (s *biAlertStore) CountActiveAlerts(context.Context, string) (int64, error) {
+	return 0, nil
+}
+
+// ReconcileAlerts 保持默认关闭的生命周期策略不触发收敛；该假实现只用于授权门禁测试。
+func (s *biAlertStore) ReconcileAlerts(context.Context, string, []alertworker.Alert, time.Time, alertworker.ReconcileOptions) error {
+	return nil
+}
+
 func TestSignedPendingExpiryRejectsRealPreviouslyIssuedEmbedTokensWithoutConsumptionOrUpstream(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	f := newSignedBIRuntime(t, lr.Pending)

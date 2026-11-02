@@ -46,6 +46,30 @@ type ImportReportSnapshot struct {
 	Items            []ImportReportItem `json:"items"`
 }
 
+// 导入报告发布状态机：一轮运行只会处于下列之一。
+// RUNNING 由 beginImportReport 在读取来源前写入；SUCCESS/WAITING_SOURCE/BLOCKED 由
+// publishImportReport 在同一事务内按实际逐项结果写入；FAILED 只由 failImportReport
+// 收敛仍未发布的本轮（RUNNING），不得覆盖已验证的成功证据。
+const (
+	importRunRunning = "RUNNING"
+	importRunSuccess = "SUCCESS"
+	importRunWaiting = "WAITING_SOURCE"
+	importRunBlocked = "BLOCKED"
+	importRunFailed  = "FAILED"
+)
+
+// 逐项应用凭据状态：APPLIED 表示所需通道均已实际应用；WITHDRAWN 表示该项已退出
+// 当前权威快照（上游撤回/删除）或该版本已被同一项的重新发布替代，可被重放纠正。
+const (
+	importItemApplied   = "APPLIED"
+	importItemWaiting   = "WAITING_SOURCE"
+	importItemBlocked   = "BLOCKED"
+	importItemWithdrawn = "WITHDRAWN"
+)
+
+// ImportReportRun 是租户级发布栅栏和上次成功证据。
+// LastStatus 是最近一轮实际状态；LastSuccessAt/PublishedSnapshotID/PublishedRunID
+// 只在整轮完全应用（SUCCESS）时推进，失败或部分应用的轮次不得覆盖它们。
 type ImportReportRun struct {
 	TenantID            string `gorm:"primaryKey"`
 	Generation          uint64
@@ -73,7 +97,10 @@ type ImportReportStatus struct {
 	AggregationRunID     string     `json:"aggregation_run_id"`
 	AppliedAt            *time.Time `json:"applied_at"`
 	ErrorCode            string     `json:"error_code"`
+	WithdrawnAt          *time.Time `json:"withdrawn_at,omitempty"`
+	SupersedeCount       uint64     `json:"supersede_count"`
 	PayloadDigest        string     `json:"-"`
+	PriorPayloadDigest   string     `json:"-"`
 	APIApplied           bool       `json:"-"`
 	SourceFactsApplied   bool       `json:"source_facts_connected"`
 	SchemaVersion        int        `gorm:"-" json:"schema_version"`
@@ -186,6 +213,7 @@ func validateImportReport(s ImportReportSnapshot, tenant string) error {
 // beginImportReport 在网络请求前递增发布代次，阻止较早请求迟到覆盖。
 // 参数：ctx 为许可和取消上下文。
 // 返回值：本轮唯一代次；失败时不启动源读取。
+// 只推进代次与本轮尝试状态，不触碰上次成功证据（last_success_at/published_*）。
 func (r *Runner) beginImportReport(ctx context.Context) (uint64, error) {
 	var run ImportReportRun
 	err := r.aggregationWrite(ctx, func(tx *gorm.DB) error {
@@ -196,20 +224,28 @@ func (r *Runner) beginImportReport(ctx context.Context) (uint64, error) {
 			return err
 		}
 		run.Generation++
-		return tx.Model(&ImportReportRun{}).Where("tenant_id=?", r.tenantID).Updates(map[string]any{"generation": run.Generation, "last_status": "RUNNING", "last_error": "", "last_run_at": time.Now().UTC()}).Error
+		return tx.Model(&ImportReportRun{}).Where("tenant_id=?", r.tenantID).Updates(map[string]any{"generation": run.Generation, "last_status": importRunRunning, "last_error": "", "last_run_at": time.Now().UTC()}).Error
 	})
 	return run.Generation, err
 }
 
 // publishImportReport 同事务替换历史投影并保存逐项版本应用凭据。
 // 参数：generation 为本轮代次，s 为API摘要，facts 为本轮源事实，sourceError 为脱敏失败码。
-// 返回值：发布成功为nil；旧代次、同版本异内容及任何数据库失败回滚全部写入。
+// 返回值：发布成功为nil；旧代次及任何数据库失败回滚全部写入。
+//
+// 语义边界：
+//   - 本轮快照仍是权威内容，因此同版本内容变化、修订回退不使整轮永久失败，而是以
+//     审计可追溯的方式重新发布（见 publishImportItem）；
+//   - 快照中已不存在的项被标记 WITHDRAWN，重放出现时重新变为 APPLIED；
+//   - 只有整轮所需通道都实际应用时才推进 last_success_at / published_*。
 func (r *Runner) publishImportReport(ctx context.Context, generation uint64, s ImportReportSnapshot, facts map[string]ImportReportItem, sourceError string) error {
 	if err := validateImportReport(s, r.tenantID); err != nil {
 		return err
 	}
+	now := time.Now().UTC()
 	return r.aggregationWrite(ctx, func(tx *gorm.DB) error {
 		var run ImportReportRun
+		var unverified bool
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=?", r.tenantID).Take(&run).Error; err != nil {
 			return err
 		}
@@ -220,77 +256,125 @@ func (r *Runner) publishImportReport(ctx context.Context, generation uint64, s I
 			return err
 		}
 		for _, item := range s.Items {
-			if err := publishImportItem(tx, r.tenantID, generation, s.SourceSnapshotID, item, facts, sourceError); err != nil {
+			preserved, err := publishImportItem(tx, r.tenantID, generation, s.SourceSnapshotID, item, facts, sourceError)
+			if err != nil {
 				return err
 			}
+			if preserved {
+				// 本轮无法重验但内容未变的项保留了既有证据，因此整轮不能算已验证完成。
+				unverified = true
+			}
+		}
+		if err := withdrawMissingImportItems(tx, r.tenantID, s, now); err != nil {
+			return err
 		}
 		var waiting int64
 		runID := fmt.Sprintf("import-%d", generation)
-		if err := tx.Model(&ImportReportStatus{}).Where("tenant_id=? AND aggregation_run_id=? AND state<>'APPLIED'", r.tenantID, runID).Count(&waiting).Error; err != nil {
+		if err := tx.Model(&ImportReportStatus{}).Where("tenant_id=? AND aggregation_run_id=? AND state<>?", r.tenantID, runID, importItemApplied).Count(&waiting).Error; err != nil {
 			return err
 		}
-		status := "SUCCESS"
-		if waiting > 0 {
-			status = "WAITING_SOURCE"
+		status := importRunSuccess
+		if waiting > 0 || unverified {
+			status = importRunWaiting
 		}
 		if sourceError != "" && sourceError != "SOURCE_NOT_CONFIGURED" {
-			status = "BLOCKED"
+			status = importRunBlocked
 		}
-		return tx.Model(&ImportReportRun{}).Where("tenant_id=? AND generation=?", r.tenantID, generation).Updates(map[string]any{"last_status": status, "last_error": sourceError, "last_success_at": time.Now().UTC(), "published_snapshot_id": s.SourceSnapshotID, "published_run_id": runID}).Error
+		updates := map[string]any{"last_status": status, "last_error": sourceError}
+		if status == importRunSuccess {
+			// 只有本轮所有通道都实际应用才算已验证发布，成功水位才前进。
+			updates["last_success_at"] = now
+			updates["published_snapshot_id"] = s.SourceSnapshotID
+			updates["published_run_id"] = runID
+		}
+		return tx.Model(&ImportReportRun{}).Where("tenant_id=? AND generation=?", r.tenantID, generation).Updates(updates).Error
 	})
+}
+
+// withdrawMissingImportItems 将本轮快照中已不存在的项从应用水位撤回。
+// 参数：tx 为发布事务，tenant 为可信租户，s 为本轮权威快照，now 为撤回时间。
+// 返回值：更新错误；撤回只标记 WITHDRAWN 并保留历史行，重放重新出现时可纠正回 APPLIED。
+func withdrawMissingImportItems(tx *gorm.DB, tenant string, s ImportReportSnapshot, now time.Time) error {
+	query := tx.Model(&ImportReportStatus{}).Where("tenant_id=? AND state<>?", tenant, importItemWithdrawn)
+	if len(s.Items) > 0 {
+		active := make([]string, 0, len(s.Items))
+		for _, item := range s.Items {
+			active = append(active, item.ItemID)
+		}
+		query = query.Where("item_id NOT IN ?", active)
+	}
+	return query.Updates(map[string]any{"state": importItemWithdrawn, "error_code": "ITEM_WITHDRAWN", "withdrawn_at": now}).Error
 }
 
 // publishImportItem 保存单项API投影及匹配的源事实证明。
 // 参数：tx 为发布事务，tenant/generation/snapshot 为发布身份，item/facts 为同轮内容，sourceError 为失败码。
-// 返回值：内容冲突或迟到修订返回错误，其余按实际通道保存状态。
-func publishImportItem(tx *gorm.DB, tenant string, generation uint64, snapshot string, item ImportReportItem, facts map[string]ImportReportItem, sourceError string) error {
+// 返回值：preserved 表示本轮无法重验源事实但保留了既有已验证证据（调用方据此不推进成功水位）；
+// 数据库失败返回错误；同版本异内容按审计方式重发布，修订回退替代较新水位而非卡死整轮。
+func publishImportItem(tx *gorm.DB, tenant string, generation uint64, snapshot string, item ImportReportItem, facts map[string]ImportReportItem, sourceError string) (bool, error) {
 	encoded, _ := json.Marshal(item)
 	sum := sha256.Sum256(encoded)
 	digest := hex.EncodeToString(sum[:])
-	var old ImportReportStatus
-	q := tx.Where("tenant_id=? AND item_id=? AND source_revision=? AND report_release_version=?", tenant, item.ItemID, item.SourceRevision, item.ReportReleaseVersion)
-	err := q.Take(&old).Error
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return err
-	}
-	if err == nil && old.PayloadDigest != digest {
-		return errors.New("import item version content conflict")
-	}
-	var newer int64
-	if err := tx.Model(&ImportReportStatus{}).Where("tenant_id=? AND item_id=? AND (source_revision>? OR report_release_version>?)", tenant, item.ItemID, item.SourceRevision, item.ReportReleaseVersion).Count(&newer).Error; err != nil {
-		return err
-	}
-	if newer > 0 {
-		return errors.New("import report revision regression")
-	}
 	now := time.Now().UTC()
 	runID := fmt.Sprintf("import-%d", generation)
+	var old ImportReportStatus
+	err := tx.Where("tenant_id=? AND item_id=? AND source_revision=? AND report_release_version=?", tenant, item.ItemID, item.SourceRevision, item.ReportReleaseVersion).Take(&old).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, err
+	}
+	exists := err == nil
+	// 上游已回退版本时，较新的水位不再是当前权威内容：标记为被替代而不是让整轮永久失败。
+	if err := retireSupersededImportVersions(tx, tenant, item.ItemID, item.SourceRevision, item.ReportReleaseVersion, now); err != nil {
+		return false, err
+	}
 	st := ImportReportStatus{TenantID: tenant,
 		ItemID:               item.ItemID,
 		SourceRevision:       item.SourceRevision,
 		ReportReleaseVersion: item.ReportReleaseVersion,
 		RequiredChannels:     item.RequiredChannels,
-		State:                "APPLIED",
+		State:                importItemApplied,
 		SourceSnapshotID:     snapshot,
 		AggregationRunID:     runID,
 		AppliedAt:            &now,
 		PayloadDigest:        digest,
 		APIApplied:           true,
 	}
+	if exists {
+		st.SupersedeCount = old.SupersedeCount
+		st.PriorPayloadDigest = old.PriorPayloadDigest
+	}
+	if exists && old.PayloadDigest != digest {
+		// 同版本内容变化：保留上一版摘要和重发布次数，便于审计追踪而不丢失幂等证据。
+		st.SupersedeCount = old.SupersedeCount + 1
+		st.PriorPayloadDigest = old.PayloadDigest
+	}
 	fact, matched := facts[item.ItemID]
 	if matched {
 		matched = importItemsEqual(fact, item)
 	}
-	if item.RequiredChannels == "API_AND_SOURCE_FACTS" {
+	// 内容未变、两通道此前均已验证且本轮源通道不可读取：保留已验证证据，
+	// 但不把本轮算作已验证完成（由调用方写入 WAITING_SOURCE/BLOCKED）。
+	// 源可读但事实不一致属于真实矛盾，必须如实降级，不得沿用旧证据。
+	unreadable := sourceError != "" && !matched
+	preserved := exists && old.PayloadDigest == digest && old.State == importItemApplied && old.APIApplied && old.SourceFactsApplied &&
+		item.RequiredChannels == "API_AND_SOURCE_FACTS" && unreadable
+	if preserved {
+		st.APIApplied = true
+		st.SourceFactsApplied = true
+		st.State = importItemApplied
+		st.ErrorCode = ""
+		st.AppliedAt = old.AppliedAt
+		st.AggregationRunID = old.AggregationRunID
+		st.SourceSnapshotID = old.SourceSnapshotID
+	} else if item.RequiredChannels == "API_AND_SOURCE_FACTS" {
 		st.SourceFactsApplied = matched
 		if !st.SourceFactsApplied {
-			st.State = "WAITING_SOURCE"
+			st.State = importItemWaiting
 			st.ErrorCode = "SOURCE_FACTS_NOT_COVERED"
 			if sourceError != "" {
 				st.ErrorCode = sourceError
 			}
 			if sourceError != "" && sourceError != "SOURCE_NOT_CONFIGURED" {
-				st.State = "BLOCKED"
+				st.State = importItemBlocked
 			}
 		}
 	}
@@ -314,19 +398,42 @@ func publishImportItem(tx *gorm.DB, tenant string, generation uint64, snapshot s
 		SourceFactsApplied:   st.SourceFactsApplied,
 	}
 	if err := tx.Create(&h).Error; err != nil {
-		return err
+		return false, err
 	}
-	return tx.Clauses(clause.OnConflict{UpdateAll: true}).Create(&st).Error
+	if preserved {
+		// 不重写已验证的逐项凭据：applied_at 与聚合代次保持最初验证证据。
+		return true, nil
+	}
+	return false, tx.Clauses(clause.OnConflict{UpdateAll: true}).Create(&st).Error
+}
+
+// retireSupersededImportVersions 将同一项中高于本轮版本的旧水位标记为被替代。
+// 参数：tx 为发布事务，tenant 为可信租户，itemID 为项，revision/version 为本轮权威版本，now 为替代时间。
+// 返回值：更新错误；旧行保留并可被重放纠正，不再阻塞后续任何一轮发布。
+func retireSupersededImportVersions(tx *gorm.DB, tenant, itemID string, revision, version uint64, now time.Time) error {
+	if itemID == "" {
+		return nil
+	}
+	return tx.Model(&ImportReportStatus{}).
+		Where("tenant_id=? AND item_id=? AND state<>? AND (source_revision>? OR report_release_version>?)", tenant, itemID, importItemWithdrawn, revision, version).
+		Updates(map[string]any{"state": importItemWithdrawn, "error_code": "SUPERSEDED_BY_REPUBLISH", "withdrawn_at": now}).Error
 }
 
 // ReadImportReportStatus 读取精确租户、项和版本的真实应用证明。
 // 参数：ctx/db 为读取上下文与聚合库，其余参数为可信租户及请求的精确身份。
 // 返回值：含实际已应用通道的状态；未发布返回记录不存在，不推断最大水位。
+// 已撤回（上游删除或版本被替代）的项不报告已应用通道，调用方不得把它当作当前可用。
 func ReadImportReportStatus(ctx context.Context, db *gorm.DB, tenant, item string, revision, version uint64) (ImportReportStatus, error) {
 	var st ImportReportStatus
 	err := db.WithContext(ctx).Where("tenant_id=? AND item_id=? AND source_revision=? AND report_release_version=?", tenant, item, revision, version).Take(&st).Error
 	st.SchemaVersion = 1
 	st.AppliedChannels = []string{}
+	if st.State == importItemWithdrawn {
+		// 已撤回项不得对外声称当前已应用；历史证据仍保留在库中供审计。
+		st.APIApplied = false
+		st.SourceFactsApplied = false
+		return st, err
+	}
 	if st.APIApplied {
 		st.AppliedChannels = append(st.AppliedChannels, "API_APPLIED")
 	}
@@ -407,9 +514,10 @@ func importItemsEqual(left, right ImportReportItem) bool {
 
 // failImportReport 记录当前代次失败，保留上次成功历史投影与时间。
 // 参数：ctx 为有界失败收尾上下文，generation 为本轮发布栅栏。
-// 返回值：写入错误；旧代次不覆盖新运行状态。
+// 返回值：写入错误；只收敛仍未发布的本轮 RUNNING，不覆盖已验证的成功水位、
+// 已发布快照，也不覆盖 publishImportReport 已写入的 BLOCKED/WAITING_SOURCE 证据。
 func (r *Runner) failImportReport(ctx context.Context, generation uint64) error {
 	return r.aggregationWrite(ctx, func(tx *gorm.DB) error {
-		return tx.Model(&ImportReportRun{}).Where("tenant_id=? AND generation=?", r.tenantID, generation).Updates(map[string]any{"last_status": "FAILED", "last_error": "SUMMARY_OR_SOURCE_UNAVAILABLE"}).Error
+		return tx.Model(&ImportReportRun{}).Where("tenant_id=? AND generation=? AND last_status=?", r.tenantID, generation, importRunRunning).Updates(map[string]any{"last_status": importRunFailed, "last_error": "SUMMARY_OR_SOURCE_UNAVAILABLE"}).Error
 	})
 }

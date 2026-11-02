@@ -69,7 +69,7 @@ func orgScopeContext(tenant, org string) context.Context {
 // synced_at 来自同步水位，computed_at 才是本次查询时间；三者不能混用。
 func TestScopedContractFreshnessSeparatesSourceSyncAndComputedTimes(t *testing.T) {
 	db := freshnessTestDB(t)
-	repository := NewGORMRepository(db)
+	repository := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t))
 	tenant := "tenant-freshness"
 	sourceAt := time.Now().UTC().Add(-30 * time.Hour).Truncate(time.Second)
 	syncedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
@@ -115,7 +115,7 @@ func TestScopedContractFreshnessSeparatesSourceSyncAndComputedTimes(t *testing.T
 // 源同步失败时保留旧数据，但必须标记陈旧并说明原因，且 synced_at 不能拿失败尝试顶替。
 func TestScopedContractFreshnessMarksFailedSourceSyncStale(t *testing.T) {
 	db := freshnessTestDB(t)
-	repository := NewGORMRepository(db)
+	repository := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t))
 	tenant := "tenant-stale"
 	sourceAt := time.Now().UTC().Add(-72 * time.Hour).Truncate(time.Second)
 	if err := db.Exec(`INSERT INTO dim_contract
@@ -146,7 +146,7 @@ func TestScopedContractFreshnessMarksFailedSourceSyncStale(t *testing.T) {
 // 旧维表没有完整发布标记时，项目指标及时间水位不可用。
 func TestScopedProjectFreshnessReportsUnknownSyncWithoutFakingTime(t *testing.T) {
 	db := freshnessTestDB(t)
-	repository := NewGORMRepository(db)
+	repository := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t))
 	tenant := "tenant-project"
 	updatedAt := time.Now().UTC().Add(-10 * time.Hour).Truncate(time.Second)
 	if err := db.Exec(`INSERT INTO dim_project
@@ -173,7 +173,7 @@ func TestScopedProjectFreshnessReportsUnknownSyncWithoutFakingTime(t *testing.T)
 // 全租户持久快照分支不回归：snapshot_at 保持原值，computed_at 单列查询时间。
 func TestTenantSnapshotFreshnessKeepsPersistedSnapshotSemantics(t *testing.T) {
 	db := freshnessTestDB(t)
-	repository := NewGORMRepository(db)
+	repository := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t))
 	tenant := "tenant-snapshot"
 	storedAt := time.Now().UTC().Add(-24 * time.Hour).Format("2006-01-02 15:04:05.000")
 	if err := db.Exec(`INSERT INTO api_contract_dashboard
@@ -217,7 +217,7 @@ func TestTenantSnapshotFreshnessKeepsPersistedSnapshotSemantics(t *testing.T) {
 
 func TestTenantSnapshotFreshnessMarksExpiredDataStale(t *testing.T) {
 	db := freshnessTestDB(t)
-	repository := NewGORMRepository(db)
+	repository := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t))
 	tenant := "tenant-expired-snapshot"
 	storedAt := time.Now().UTC().Add(-49 * time.Hour).Format("2006-01-02 15:04:05.000")
 	if err := db.Exec(`INSERT INTO api_contract_dashboard
@@ -260,7 +260,7 @@ func TestTenantSnapshotFreshnessMarksExpiredDataStale(t *testing.T) {
 }
 
 func TestTenantSnapshotFreshnessDoesNotInventMissingSnapshots(t *testing.T) {
-	repository := NewGORMRepository(freshnessTestDB(t))
+	repository := NewGORMRepositoryWithLocation(freshnessTestDB(t), scopedContractBusinessLocation(t))
 	tenant := "tenant-no-snapshot"
 	ctx := auth.WithPrincipal(context.Background(), auth.Principal{TenantID: tenant, UserID: "boss", ScopeMode: "TENANT"})
 	contract, available, err := repository.LatestContract(ctx, tenant)
@@ -284,7 +284,7 @@ func publishTestProjection(t *testing.T, db *gorm.DB, tenant string, total int) 
 func TestScopedProjectUsesPublishedSourceMetrics(t *testing.T) {
 	db := freshnessTestDB(t)
 	tenant := "metrics"
-	repo := NewGORMRepository(db)
+	repo := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t))
 	publishTestProjection(t, db, tenant, 3)
 	now := time.Now().UTC().Add(-2 * time.Hour)
 	for _, row := range []struct {
@@ -296,8 +296,18 @@ func TestScopedProjectUsesPublishedSourceMetrics(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, mode := range []string{"ORG", "TEAM", "NONE"} {
-		ctx := auth.WithPrincipal(context.Background(), auth.Principal{TenantID: tenant, ScopeMode: mode, OrganizationIDs: []string{"org-a"}, TeamIDs: []string{"org-a"}})
+	// TEAM 只带团队授权：同时携带组织授权会触发命名空间断言并按“范围不可用”
+	// 处理（见 scope_team_test.go），因此每个模式使用各自可信的主体形状。
+	for _, tc := range []struct {
+		mode      string
+		principal auth.Principal
+	}{
+		{"ORG", auth.Principal{TenantID: tenant, ScopeMode: "ORG", OrganizationIDs: []string{"org-a"}, TeamIDs: []string{"org-a"}}},
+		{"TEAM", auth.Principal{TenantID: tenant, ScopeMode: "TEAM", TeamIDs: []string{"org-a"}}},
+		{"NONE", auth.Principal{TenantID: tenant, ScopeMode: "NONE", OrganizationIDs: []string{"org-a"}, TeamIDs: []string{"org-a"}}},
+	} {
+		mode := tc.mode
+		ctx := auth.WithPrincipal(context.Background(), tc.principal)
 		got, ok, err := repo.LatestProject(ctx, tenant)
 		if err != nil {
 			t.Fatal(err)
@@ -337,7 +347,7 @@ func TestScopedProjectUsesPublishedSourceMetrics(t *testing.T) {
 }
 func TestScopedProjectVerifiedEmptyVersusUnknown(t *testing.T) {
 	db := freshnessTestDB(t)
-	repo := NewGORMRepository(db)
+	repo := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t))
 	tenant := "empty"
 	got, ok, err := repo.LatestProject(orgScopeContext(tenant, "org-a"), tenant)
 	if err != nil || ok || got.Freshness.SyncStatus != domain.SyncStatusUnknown {
@@ -372,7 +382,7 @@ func TestScopedProjectVerifiedEmptyVersusUnknown(t *testing.T) {
 
 func TestScopedProjectCreationTrendUsesSourceMonth(t *testing.T) {
 	db := freshnessTestDB(t)
-	repo := NewGORMRepository(db)
+	repo := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t))
 	tenant := "trend-source"
 	publishTestProjection(t, db, tenant, 2)
 	created := time.Date(2026, 2, 3, 0, 0, 0, 0, time.UTC)

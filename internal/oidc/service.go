@@ -22,6 +22,37 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/auth"
 )
 
+// 会话双期限默认值与边界，对应 OIDC_SESSION_IDLE_TTL / OIDC_SESSION_ABSOLUTE_TTL。
+// 配置装载与 NewService 共用同一校验，非法值一律失败关闭。
+const (
+	DefaultSessionIdleTTL     = 30 * time.Minute
+	DefaultSessionAbsoluteTTL = 8 * time.Hour
+	MinSessionIdleTTL         = time.Minute
+	MaxSessionIdleTTL         = 24 * time.Hour
+)
+
+// ErrSessionInactive 表示会话已撤销、空闲到期或绝对到期；这类会话不得通过活动接口复活。
+var ErrSessionInactive = errors.New("session is inactive")
+
+// ValidateSessionTTLs 校验会话双期限：空闲期限必须在 1m~24h，绝对期限必须大于空闲期限。
+// 参数：idle 为空闲期限，absolute 为绝对期限。
+// 返回值：合法返回 nil；非法返回错误（启动失败关闭，避免退化为永久在线或立即过期）。
+func ValidateSessionTTLs(idle, absolute time.Duration) error {
+	if idle < MinSessionIdleTTL || idle > MaxSessionIdleTTL {
+		return errors.New("OIDC_SESSION_IDLE_TTL must be between 1m and 24h")
+	}
+	if absolute <= idle {
+		return errors.New("OIDC_SESSION_ABSOLUTE_TTL must be longer than OIDC_SESSION_IDLE_TTL")
+	}
+	return nil
+}
+
+// sessionLifetimes 是新登录会话的时间边界，单独成结构便于登录装配与单测共用。
+type sessionLifetimes struct {
+	ExpiresAt         time.Time
+	LastInteractiveAt time.Time
+}
+
 // Options 是 OIDC 客户端与会话服务的装配参数。
 type Options struct {
 	CentralClient     central.Client
@@ -36,8 +67,12 @@ type Options struct {
 	CatalogVersion    string
 	RoleConfigHash    string
 	PathPrefix        string
-	SessionTTL        time.Duration
-	CodecKey          []byte // 32 字节
+	// SessionIdleTTL 是浏览器空闲期限：只有显式活动接口（POST /api/v1/auth/activity）续期，
+	// 普通业务请求不续期。
+	SessionIdleTTL time.Duration
+	// SessionAbsoluteTTL 是登录后的绝对期限：不受活动续期影响，Cookie 到期与之一致。
+	SessionAbsoluteTTL time.Duration
+	CodecKey           []byte // 32 字节
 	// AuthorizationContextURL 平台授权上下文端点（对齐 contract：OIDC 只认证身份，
 	// 角色/权限由平台 /oauth2/authorization-context 在线解析，不读 token claims）。
 	AuthorizationContextURL string
@@ -62,7 +97,8 @@ type Service struct {
 	catalogVersion          string
 	roleConfigHash          string
 	pathPrefix              string
-	sessionTTL              time.Duration
+	sessionIdleTTL          time.Duration
+	sessionAbsoluteTTL      time.Duration
 	codec                   *secretCodec
 	db                      *gorm.DB
 	checkEvery              time.Duration
@@ -104,9 +140,17 @@ func NewService(ctx context.Context, db *gorm.DB, options Options) (*Service, er
 	if redirect == "" {
 		redirect = strings.TrimSuffix(options.Issuer, "/") + "/auth/callback"
 	}
-	sessionTTL := options.SessionTTL
-	if sessionTTL <= 0 {
-		sessionTTL = 15 * time.Minute
+	sessionIdleTTL := options.SessionIdleTTL
+	if sessionIdleTTL <= 0 {
+		sessionIdleTTL = DefaultSessionIdleTTL
+	}
+	sessionAbsoluteTTL := options.SessionAbsoluteTTL
+	if sessionAbsoluteTTL <= 0 {
+		sessionAbsoluteTTL = DefaultSessionAbsoluteTTL
+	}
+	// 失败关闭：绝对期限必须大于空闲期限，否则“活动续期”语义不成立。
+	if err := ValidateSessionTTLs(sessionIdleTTL, sessionAbsoluteTTL); err != nil {
+		return nil, err
 	}
 	checkEvery := options.AuthorizationCheckInterval
 	if checkEvery <= 0 {
@@ -132,7 +176,8 @@ func NewService(ctx context.Context, db *gorm.DB, options Options) (*Service, er
 		catalogVersion:          strings.TrimSpace(options.CatalogVersion),
 		roleConfigHash:          strings.TrimSpace(options.RoleConfigHash),
 		pathPrefix:              options.PathPrefix,
-		sessionTTL:              sessionTTL,
+		sessionIdleTTL:          sessionIdleTTL,
+		sessionAbsoluteTTL:      sessionAbsoluteTTL,
 		codec:                   codec,
 		db:                      db,
 		checkEvery:              checkEvery,
@@ -290,6 +335,7 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 	if err != nil {
 		return "", Session{}, err
 	}
+	lifetimes := s.newSessionLifetimes(now)
 	session = Session{
 		SessionIDHash:          tokenHash(sessionToken),
 		TenantID:               authz.TenantID,
@@ -302,10 +348,11 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 		RoleConfigHash:         "",
 		AuthzRevision:          authz.AuthorizationRevision,
 		AccessTokenCipher:      accessTokenCipher,
-		ExpiresAt:              now.Add(s.sessionTTL),
+		ExpiresAt:              lifetimes.ExpiresAt,
 		AuthorizationCheckedAt: now,
 		CreatedAt:              now,
 		LastSeenAt:             now,
+		LastInteractiveAt:      &lifetimes.LastInteractiveAt,
 	}
 	if s.centralClient != nil {
 		if platformSubjectID != binding.Context.SubjectID {
@@ -330,6 +377,14 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 	}
 	s.reportAuth(ctx, platformaudit.Event{ActorID: session.PlatformUserID, ActorName: session.DisplayName, Action: "auth.login", ResourceType: "auth_session", Result: "SUCCESS", RiskLevel: "LOW"})
 	return sessionToken, session, nil
+}
+
+// newSessionLifetimes 返回新登录会话的时间边界：绝对到期 = now + absolute，
+// 空闲计时从登录时刻起算；此后只有显式活动接口会推进空闲计时。
+// 参数：now 为登录成功时间。
+// 返回值：绝对到期与最近显式活动时间。
+func (s *Service) newSessionLifetimes(now time.Time) sessionLifetimes {
+	return sessionLifetimes{ExpiresAt: now.Add(s.sessionAbsoluteTTL), LastInteractiveAt: now}
 }
 
 // reportAuth 向平台审计上报登录/登出事件；审计未配置或上报失败均不影响认证流程。
@@ -411,13 +466,15 @@ func (s *Service) Authenticate(ctx context.Context, cookieValue string) (auth.Pr
 	if err != nil {
 		return auth.Principal{}, errors.New("session not found")
 	}
-	if session.RevokedAt != nil || time.Now().UTC().After(session.ExpiresAt) {
-		return auth.Principal{}, errors.New("session revoked or expired")
+	now := time.Now().UTC()
+	if !session.ValidAt(now, s.sessionIdleTTL) {
+		// 撤销、空闲到期与绝对到期一律拒绝：不得刷新任何时间字段（不能复活）。
+		return auth.Principal{}, errors.New("session revoked, idle or expired")
 	}
 	if time.Since(session.AuthorizationCheckedAt) > s.checkEvery {
 		// 定期调平台授权上下文在线复核：角色/权限变更后旧会话自动刷新（接入手册 §3.3）。
 		// 复核失败必须 失败时安全拒绝，否则已撤销的权限会在旧会话中继续生效。
-		now := time.Now().UTC()
+		refreshAt := time.Now().UTC()
 		accessToken, decryptErr := s.codec.decrypt(session.AccessTokenCipher)
 		if decryptErr != nil {
 			return auth.Principal{}, errors.New("session access token is invalid")
@@ -440,7 +497,7 @@ func (s *Service) Authenticate(ctx context.Context, cookieValue string) (auth.Pr
 				"roles_json": string(rolesJSON), "permissions_json": string(permissionsJSON),
 				"data_scopes_json":         string(dataScopesJSON),
 				"authz_revision":           authz.AuthorizationRevision,
-				"authorization_checked_at": now, "last_seen_at": now,
+				"authorization_checked_at": refreshAt, "last_seen_at": refreshAt,
 			}).Error; updateErr != nil {
 			return auth.Principal{}, fmt.Errorf("persist refreshed authorization: %w", updateErr)
 		}
@@ -448,7 +505,12 @@ func (s *Service) Authenticate(ctx context.Context, cookieValue string) (auth.Pr
 		session.PermissionsJSON = string(permissionsJSON)
 		session.DataScopesJSON = string(dataScopesJSON)
 		session.AuthzRevision = authz.AuthorizationRevision
-		session.AuthorizationCheckedAt = now
+		session.AuthorizationCheckedAt = refreshAt
+		session.LastSeenAt = refreshAt
+	} else {
+		// 普通已认证请求只刷新 last_seen_at（在线状态与审计辅助），绝不续期空闲计时；
+		// 写失败不阻断业务请求，本次会话有效性以刚完成的读取与判定为准。
+		_ = s.db.Model(&Session{}).Where("session_id_hash = ?", session.SessionIDHash).Update("last_seen_at", now).Error
 		session.LastSeenAt = now
 	}
 	scopeMode, organizationIDs, teamIDs := principalScope(session.DataScopes(), session.Roles())
@@ -465,7 +527,65 @@ func (s *Service) Authenticate(ctx context.Context, cookieValue string) (auth.Pr
 		RoleConfigHash:  session.RoleConfigHash,
 		AuthzRevision:   session.AuthzRevision,
 		ExpiresAt:       session.ExpiresAt.Unix(),
+		// 空闲剩余取 min(空闲截止, 绝对截止) - now，前端据此在到期前回本子系统登录。
+		IdleTimeoutSeconds: int64(s.sessionIdleTTL / time.Second),
+		IdleRemainingMS:    session.IdleRemaining(now, s.sessionIdleTTL).Milliseconds(),
 	}, nil
+}
+
+// ActivityResult 是显式活动续期的结果：空闲期限与续期后的剩余可用时长。
+type ActivityResult struct {
+	IdleTimeout   time.Duration
+	IdleRemaining time.Duration
+}
+
+// TouchActivity 用浏览器显式活动（鼠标/键盘）续期会话的空闲计时。
+// 仅当会话当前有效（未撤销、绝对未到期、空闲未到期）时更新 last_interactive_at 与
+// last_seen_at；已失效会话返回 ErrSessionInactive，且不刷新任何字段（不得复活）。
+// 参数：ctx 为请求上下文，cookieValue 为浏览器会话 cookie 原值。
+// 返回值：续期结果或 ErrSessionInactive/数据库错误。
+func (s *Service) TouchActivity(ctx context.Context, cookieValue string) (ActivityResult, error) {
+	if strings.TrimSpace(cookieValue) == "" {
+		return ActivityResult{}, ErrSessionInactive
+	}
+	now := time.Now().UTC()
+	hash := tokenHash(cookieValue)
+	var session Session
+	if err := s.db.WithContext(ctx).Where("session_id_hash = ?", hash).First(&session).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ActivityResult{}, ErrSessionInactive
+		}
+		// 存储故障不能伪装成“会话失效”，否则前端会无谓重登；交给上层按 500 处理。
+		return ActivityResult{}, err
+	}
+	if !session.ValidAt(now, s.sessionIdleTTL) {
+		return ActivityResult{}, ErrSessionInactive
+	}
+	updated := s.db.WithContext(ctx).Model(&Session{}).
+		Where("session_id_hash = ? AND revoked_at IS NULL AND expires_at > ?", hash, now).
+		Updates(map[string]interface{}{"last_interactive_at": now, "last_seen_at": now})
+	if updated.Error != nil {
+		return ActivityResult{}, updated.Error
+	}
+	if updated.RowsAffected == 0 {
+		// MySQL DATETIME(3) 只有毫秒精度：并发活动续期可能写入同一毫秒，MySQL 因值未变化
+		// 报告 0 行。此时按权威有效条件复核，不能把合法并发请求误判为会话失效。
+		var current Session
+		if err := s.db.WithContext(ctx).Where("session_id_hash = ?", hash).First(&current).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ActivityResult{}, ErrSessionInactive
+			}
+			return ActivityResult{}, err
+		}
+		if !current.ValidAt(now, s.sessionIdleTTL) {
+			return ActivityResult{}, ErrSessionInactive
+		}
+		session = current
+	} else {
+		session.LastInteractiveAt = &now
+		session.LastSeenAt = now
+	}
+	return ActivityResult{IdleTimeout: s.sessionIdleTTL, IdleRemaining: session.IdleRemaining(now, s.sessionIdleTTL)}, nil
 }
 
 // RevokeSession 登出撤销服务端会话。

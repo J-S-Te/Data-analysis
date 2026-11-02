@@ -89,8 +89,12 @@ func TestImportReportReleaseWatermark(t *testing.T) {
 	}
 	gen, _ = r.beginImportReport(ctx)
 	s.Items[1].AmountMinor++
-	if err = r.publishImportReport(ctx, gen, s, nil, ""); err == nil {
-		t.Fatal("同版本异内容被覆盖")
+	if err = r.publishImportReport(ctx, gen, s, nil, ""); err != nil {
+		t.Fatalf("同版本异内容未被审计重发布: %v", err)
+	}
+	b, _ = ReadImportReportStatus(ctx, r.aggDB, "t", "i2", 2, 3)
+	if b.SupersedeCount != 1 || b.PriorPayloadDigest == "" {
+		t.Fatalf("同版本异内容缺少重发布审计 %+v", b)
 	}
 }
 

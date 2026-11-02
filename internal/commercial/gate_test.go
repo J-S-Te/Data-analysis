@@ -18,14 +18,17 @@ func TestExpiryRetainsHistoryButRejectsBusinessAndEmbedding(t *testing.T) {
 	})
 	r := gin.New()
 	r.Use(Middleware(check))
-	for _, p := range []string{"/api/v1/dashboard/project", "/api/v1/dashboard/report", "/api/v1/dashboard/finance", "/api/v1/dashboard/unknown", "/api/v1/embed/:dashboard", "/api/v1/embed-proxy/:token", "/api/v1/embed-proxy/:token/*resource"} {
+	for _, p := range []string{"/api/v1/auth/me", "/api/v1/dashboard/project", "/api/v1/dashboard/report", "/api/v1/dashboard/finance", "/api/v1/dashboard/unknown", "/api/v1/embed/:dashboard", "/api/v1/embed-proxy/:token", "/api/v1/embed-proxy/:token/*resource"} {
 		r.GET(p, func(c *gin.Context) { c.Status(200) })
 	}
 	r.POST("/api/v1/admin/sources/trigger-all", func(c *gin.Context) { c.Status(200) })
+	// 会话活动续期与 /auth/me 同级：商业授权到期/缺失不得打断浏览器活动续期。
+	r.POST("/api/v1/auth/activity", func(c *gin.Context) { c.Status(200) })
 	for _, tc := range []struct {
 		method, path string
 		want         int
 	}{
+		{"GET", "/api/v1/auth/me", 200}, {"POST", "/api/v1/auth/activity", 200},
 		{"GET", "/api/v1/dashboard/project", 200}, {"GET", "/api/v1/embed/contract", 403},
 		{"GET", "/api/v1/dashboard/report", 200}, {"GET", "/api/v1/dashboard/finance", 200},
 		{"GET", "/api/v1/dashboard/unknown", 403},

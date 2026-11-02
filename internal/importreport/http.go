@@ -3,7 +3,9 @@ package importreport
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,9 +13,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/aggregation"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/apperror"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/auth"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/response"
+	sharedscope "github.com/unified-identity-auth-platform/data-analysis/internal/shared/scope"
 	"gorm.io/gorm"
 )
 
@@ -61,6 +65,9 @@ func History(ctx context.Context, db *gorm.DB) (HistoryResult, error) {
 		if result.SyncStatus == "" {
 			result.SyncStatus = "UNKNOWN"
 		}
+		// SyncedAt/SourceSnapshotID/AggregationRunID 只报告"已验证发布"的证据：
+		// 失败或部分应用（WAITING_SOURCE/BLOCKED/FAILED）的轮次不推进它们，
+		// 因此界面显示的是最近一次完全应用的快照与时间，不会被失败轮次覆盖。
 		result.SyncedAt = run.LastSuccessAt
 		result.SourceSnapshotID = run.PublishedSnapshotID
 		result.AggregationRunID = run.PublishedRunID
@@ -135,38 +142,80 @@ func StatusHandler(db *gorm.DB, verifier *Verifier, license func(context.Context
 			response.Error(c, apperror.New(400, "INVALID_REPORT_STATUS_QUERY", "需要有效的项、修订和发布版本"))
 			return
 		}
-		status, err := aggregation.ReadImportReportStatus(c.Request.Context(), db, tenant, item, revision, version)
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			response.Error(c, apperror.New(http.StatusNotFound, "REPORT_STATUS_NOT_FOUND", "当前精确版本尚未应用"))
-			return
-		}
-		if err != nil {
+		// 读取证明与机器读取审计同事务：审计写失败不影响只读响应，
+		// 但绝不留下“读了却没有审计”的提交。
+		var status aggregation.ImportReportStatus
+		read := false
+		txErr := db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
+			value, readErr := aggregation.ReadImportReportStatus(c.Request.Context(), tx, tenant, item, revision, version)
+			if readErr != nil {
+				return readErr
+			}
+			status, read = value, true
+			// 审计只记录可判定行为的标识：机器身份读了哪个租户的哪个项。
+			// request_id 取中间件注入的追踪号；payload 只放"精确版本三元组"，
+			// 不写令牌、不写授权明细、也不写查询串原文。
+			return auditoutbox.Append(tx, auditoutbox.Entry{
+				TenantID: tenant, Action: "DATA_ANALYSIS:REPORT_STATUS_READ",
+				ResourceType: "contract_import_item", ResourceID: item, Result: "SUCCESS",
+				RequestID: c.GetString("request_id"),
+				Payload:   statusReadPayload(revision, version, status.State),
+			})
+		})
+		if !read {
+			if errors.Is(txErr, gorm.ErrRecordNotFound) {
+				response.Error(c, apperror.New(http.StatusNotFound, "REPORT_STATUS_NOT_FOUND", "当前精确版本尚未应用"))
+				return
+			}
 			response.Error(c, apperror.New(503, "REPORT_STATUS_UNAVAILABLE", "统计应用状态暂不可用"))
 			return
+		}
+		if txErr != nil {
+			// 审计库不可用不阻断已获得的只读证明；只留一条告警，
+			// 内容不含令牌、查询串或授权明细。
+			slog.Warn("report status read audit unavailable; response unaffected",
+				"tenant_id", tenant, "source_revision", revision, "report_release_version", version)
 		}
 		response.OK(c, status)
 	}
 }
 
+// statusReadPayload 生成机器读取审计的本地证据负载（迁移 000028 的 payload JSON 列）：
+// 只含"精确版本三元组"，不含令牌、授权明细或查询串原文。
+// 参数：revision 为源修订，reportReleaseVersion 为报表发布版本，state 为投影状态。
+// 返回值：紧凑 JSON；序列化异常时返回空串（由 Append 落 NULL）。
+func statusReadPayload(revision, reportReleaseVersion uint64, state string) string {
+	evidence := struct {
+		SourceRevision       uint64 `json:"source_revision"`
+		ReportReleaseVersion uint64 `json:"report_release_version"`
+		State                string `json:"state"`
+	}{SourceRevision: revision, ReportReleaseVersion: reportReleaseVersion, State: state}
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
 // historyScopeQuery 将可信个人或组织范围应用于历史投影查询。
 // 参数：db 为读取事务，p 为已校验的会话主体。
-// 返回值：范围内查询；缺少范围身份或未知模式返回拒绝错误。
+// 返回值：范围内查询；缺少范围身份、未知模式或命名空间断言失败返回 ErrScope。
 func historyScopeQuery(db *gorm.DB, p auth.Principal) (*gorm.DB, error) {
 	q := db.Table("contract_import_history").Where("tenant_id=?", p.TenantID)
 	switch p.ScopeMode {
 	case "TENANT":
 	case "ORG", "TEAM":
-		ids := append(append([]string{}, p.OrganizationIDs...), p.TeamIDs...)
-		valid := []string{}
-		for _, id := range ids {
-			if id != "" {
-				valid = append(valid, id)
-			}
-		}
-		if len(valid) == 0 {
+		// 与看板、告警共用同一范围映射：ORG 取组织与团队并集，TEAM 只取 TeamIDs。
+		ids, err := sharedscope.OwnerOrgUnitIDs(p.ScopeMode, p)
+		if err != nil {
+			// 命名空间断言失败：无法判定 TeamIDs 的命名空间，按范围不可用拒绝。
+			sharedscope.WarnNamespaceViolation(p.ScopeMode, len(p.OrganizationIDs), len(p.TeamIDs))
 			return nil, ErrScope
 		}
-		q = q.Where("owner_org_id IN ?", valid)
+		if len(ids) == 0 {
+			return nil, ErrScope
+		}
+		q = q.Where("owner_org_id IN ?", ids)
 	case "SELF":
 		if p.UserID == "" {
 			return nil, ErrScope

@@ -64,11 +64,8 @@ func (h *Handler) Login(c *gin.Context) {
 }
 
 // Callback 消费原登录事务，验证身份并创建受中央期限约束的本地会话。
-//
-//	Callback 校验 code/state/nonce，创建会话并重定向回原页面。
-//
-// 参数：c为当前HTTP请求上下文。
-// 返回值：无。
+// 参数：c为当前HTTP请求上下文，提供原state、nonce和PKCE回调材料。
+// 返回值：无；身份失败返回401，中央依赖故障返回503，成功写Cookie并重定向。
 func (h *Handler) Callback(c *gin.Context) {
 	if h.service.centralClient != nil {
 		cookie, err := c.Request.Cookie(h.options.CookieName + "_oidc_state")
@@ -127,6 +124,7 @@ func (h *Handler) Callback(c *gin.Context) {
 		response.Error(c, apperror.Wrap(err, status, "AUTH_TOKEN_EXCHANGE_FAILED", "OIDC token exchange failed"))
 		return
 	}
+	// Cookie 到期与绝对期限一致：活动只在服务端续期空闲计时，不延长绝对期限。
 	h.setCookie(c, sessionToken, session.ExpiresAt)
 	redirect := transaction.ReturnPath
 	if !isSafeReturnPath(redirect, h.service.PathPrefix()) {
@@ -162,7 +160,39 @@ func (h *Handler) AuthMe(c *gin.Context) {
 		"permissions":      sortedKeys(principal.Permissions),
 		"role_config_hash": principal.RoleConfigHash,
 		"authz_revision":   principal.AuthzRevision,
-		"expires_at":       principal.ExpiresAt,
+		// 绝对到期（既有字段）；空闲相关字段为向后兼容的追加字段。
+		"expires_at":           principal.ExpiresAt,
+		"idle_timeout_seconds": principal.IdleTimeoutSeconds,
+		"idle_remaining_ms":    principal.IdleRemainingMS,
+	})
+}
+
+// Activity 按中央或本地模式处理受同源保护的浏览器显式活动。
+// 参数：c为带服务端会话Cookie的请求上下文，不读取客户端声明的用户或期限。
+// 返回值：无；中央模式返回权威窗口及401/503，本地模式不续活已失效会话。
+func (h *Handler) Activity(c *gin.Context) {
+	if h.service.centralClient != nil {
+		h.lifecycle(c, true)
+		return
+	}
+	cookie, err := c.Request.Cookie(h.options.CookieName)
+	if err != nil || cookie.Value == "" {
+		response.Error(c, apperror.ErrUnauthenticated)
+		return
+	}
+	result, err := h.service.TouchActivity(c.Request.Context(), cookie.Value)
+	if err != nil {
+		// 只有会话本身失效才回 401；存储/依赖错误按 500 处理，避免把故障伪装成重登。
+		if errors.Is(err, ErrSessionInactive) {
+			response.Error(c, apperror.ErrUnauthenticated)
+			return
+		}
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, gin.H{
+		"idle_timeout_seconds": int64(result.IdleTimeout / time.Second),
+		"idle_remaining_ms":    result.IdleRemaining.Milliseconds(),
 	})
 }
 
