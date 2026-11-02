@@ -15,6 +15,7 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/apperror"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/auth"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/response"
+	sharedscope "github.com/unified-identity-auth-platform/data-analysis/internal/shared/scope"
 )
 
 type alertService interface {
@@ -31,9 +32,16 @@ func alertScope(principal auth.Principal) application.AlertScope {
 	if mode == "" {
 		mode = "TENANT"
 	}
-	ids := make([]string, 0, len(principal.OrganizationIDs)+len(principal.TeamIDs))
-	ids = append(ids, principal.OrganizationIDs...)
-	ids = append(ids, principal.TeamIDs...)
+	// 范围映射与看板共用 internal/shared/scope：ORG 取组织与团队并集，
+	// TEAM 只取 TeamIDs，其它模式不产生组织单元集合。
+	ids, err := sharedscope.OwnerOrgUnitIDs(mode, principal)
+	if err != nil {
+		// 命名空间断言失败（TEAM 模式携带组织单元授权）：保留模式但清空集合，
+		// 仓储对 ORG/TEAM + 空集合生成恒空条件（1 = 0），因此列表、汇总与状态
+		// 写入都不会命中任何行，而不是退化为全租户。
+		sharedscope.WarnNamespaceViolation(mode, len(principal.OrganizationIDs), len(principal.TeamIDs))
+		return application.AlertScope{Mode: mode}
+	}
 	return application.AlertScope{Mode: mode, OrgUnitIDs: ids}
 }
 

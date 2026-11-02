@@ -38,6 +38,13 @@ func AuditWrites(reporter platformaudit.Reporter, logger *slog.Logger, trustedPr
 		logger = slog.Default()
 	}
 	return func(c *gin.Context) {
+		// 会话活动续期只刷新本地会话时间戳，不是业务写入：与 /auth/me 同级，
+		// 不产生平台审计事件，也不受强制审计门禁影响。否则前端活动探测
+		//（默认 30s 一次/用户）会放大审计写入，审计管道故障还会让在线用户被误登出。
+		if isSessionActivity(c.Request.Method, c.FullPath()) {
+			c.Next()
+			return
+		}
 		if isReadMethod(c.Request.Method) && !sensitiveRead(c.Request.URL.Path) {
 			c.Next()
 			return
@@ -173,6 +180,12 @@ func clientIPAddress(value string) *netip.Addr {
 
 func isReadMethod(method string) bool {
 	return method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
+}
+
+// isSessionActivity 识别浏览器会话活动续期端点：只刷新本地会话时间戳，非业务写入。
+// 参数 fullPath 使用 gin 匹配到的路由模板（未匹配路由为空），避免任意 URL 后缀绕过审计。
+func isSessionActivity(method, fullPath string) bool {
+	return method == http.MethodPost && strings.HasSuffix(fullPath, "/auth/activity")
 }
 func auditResource(c *gin.Context) (string, string) {
 	path := c.FullPath()

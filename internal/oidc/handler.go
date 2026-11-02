@@ -1,6 +1,7 @@
 package oidc
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -75,12 +76,13 @@ func (h *Handler) Callback(c *gin.Context) {
 		response.Error(c, apperror.New(http.StatusInternalServerError, "AUTH_VERIFIER_DECRYPT", "failed to decrypt verifier"))
 		return
 	}
-	sessionToken, _, err := h.service.ExchangeAndCreateSession(c.Request.Context(), code, verifier, nonce, transaction)
+	sessionToken, session, err := h.service.ExchangeAndCreateSession(c.Request.Context(), code, verifier, nonce, transaction)
 	if err != nil {
 		response.Error(c, apperror.Wrap(err, http.StatusUnauthorized, "AUTH_TOKEN_EXCHANGE_FAILED", "OIDC token exchange failed"))
 		return
 	}
-	h.setCookie(c, sessionToken, time.Now().UTC().Add(h.service.sessionTTL))
+	// Cookie 到期与绝对期限一致：活动只在服务端续期空闲计时，不延长绝对期限。
+	h.setCookie(c, sessionToken, session.ExpiresAt)
 	redirect := transaction.ReturnPath
 	if !isSafeReturnPath(redirect, h.service.PathPrefix()) {
 		redirect = h.service.PathPrefix() + "/"
@@ -115,7 +117,35 @@ func (h *Handler) AuthMe(c *gin.Context) {
 		"permissions":      sortedKeys(principal.Permissions),
 		"role_config_hash": principal.RoleConfigHash,
 		"authz_revision":   principal.AuthzRevision,
-		"expires_at":       principal.ExpiresAt,
+		// 绝对到期（既有字段）；空闲相关字段为向后兼容的追加字段。
+		"expires_at":           principal.ExpiresAt,
+		"idle_timeout_seconds": principal.IdleTimeoutSeconds,
+		"idle_remaining_ms":    principal.IdleRemainingMS,
+	})
+}
+
+// Activity 处理浏览器显式活动续期（POST /api/v1/auth/activity）。
+// 只依赖本地 cookie 会话：无请求体，不读取客户端声明的用户或活动内容；
+// 会话无效/空闲或绝对到期返回 401，且不得复活。
+func (h *Handler) Activity(c *gin.Context) {
+	cookie, err := c.Request.Cookie(h.options.CookieName)
+	if err != nil || cookie.Value == "" {
+		response.Error(c, apperror.ErrUnauthenticated)
+		return
+	}
+	result, err := h.service.TouchActivity(c.Request.Context(), cookie.Value)
+	if err != nil {
+		// 只有会话本身失效才回 401；存储/依赖错误按 500 处理，避免把故障伪装成重登。
+		if errors.Is(err, ErrSessionInactive) {
+			response.Error(c, apperror.ErrUnauthenticated)
+			return
+		}
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, gin.H{
+		"idle_timeout_seconds": int64(result.IdleTimeout / time.Second),
+		"idle_remaining_ms":    result.IdleRemaining.Milliseconds(),
 	})
 }
 

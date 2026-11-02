@@ -48,7 +48,7 @@ func TestImportedContractExcludedAcrossOrdinaryScopes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	repo := NewGORMRepository(db)
+	repo := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t))
 	for _, mode := range []string{"TENANT", "ORG", "TEAM", "SELF"} {
 		ctx := auth.WithPrincipal(context.Background(), auth.Principal{TenantID: tenant, UserID: "u", ScopeMode: mode, OrganizationIDs: []string{"o"}})
 		rows, count, err := repo.ListContracts(ctx, tenant, 1, 20)

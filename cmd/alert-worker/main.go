@@ -15,6 +15,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 
+	"github.com/unified-identity-auth-platform/data-analysis/internal/aggregation"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/alertworker"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 )
@@ -51,8 +52,34 @@ func main() {
 		logger.Error("OIDC_TENANT_ID is required for alert rule isolation")
 		os.Exit(1)
 	}
+	// 到期窗口的"今天"按业务时区（DASHBOARD_TIMEZONE，默认 Asia/Shanghai）换算，
+	// 与看板/聚合共用同一键；非法时区在启动期失败关闭，不静默漂回 UTC。
+	businessLocation, err := aggregation.LoadBusinessLocation(os.Getenv("DASHBOARD_TIMEZONE"))
+	if err != nil {
+		logger.Error("business day timezone invalid", "error", err)
+		os.Exit(1)
+	}
 	worker := alertworker.New(alertworker.NewGormStore(db, tenantID))
+	worker.Logger = logger
+	worker.SetBusinessLocation(businessLocation)
+	logger.Info("alert business day timezone", "timezone", businessLocation.String())
 	worker.LicenseCheck = func(ctx context.Context) error { return licenseCheck.Allow(ctx, commercial.MutateBusiness) }
+	// 告警生命周期收敛默认关闭，保持现网"只增不关"的行为；产品策略确认后由
+	// ALERT_AUTO_RESOLVE=true 显式启用（见 docs/alert-lifecycle.md）。
+	// 其余策略项（确认轮数、复开策略、收缩安全阀比例）取值非法时启动失败，
+	// 避免带病运行把配置错误变成批量误关/误开。
+	lifecycle, lifecycleErr := alertworker.LifecycleOptionsFromEnv(os.Getenv)
+	if lifecycleErr != nil {
+		logger.Error("alert lifecycle configuration invalid", "error", lifecycleErr)
+		os.Exit(1)
+	}
+	worker.SetLifecycle(lifecycle)
+	logger.Info("alert lifecycle policy",
+		"auto_resolve", lifecycle.AutoResolve,
+		"confirm_rounds", lifecycle.ConfirmRounds,
+		"reopen_policy", string(lifecycle.ReopenPolicy),
+		"close_guard_ratio", lifecycle.CloseGuardRatio,
+	)
 
 	if *once {
 		count, runErr := worker.RunOnce(ctx)

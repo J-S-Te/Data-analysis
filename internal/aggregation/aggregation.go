@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
@@ -35,10 +36,22 @@ type Runner struct {
 	sources           map[string]string // subsystem_code -> 只读 DSN
 	tenantID          string
 	// effectiveStatuses 为"已生效"合同状态过滤（字典口径待确认；默认空=不过滤）
-	effectiveStatuses      []string
+	effectiveStatuses []string
+	// BusinessLocation 是财务快照业务日（as_of_date/90 天 cutoff/本月前缀）所在时区，
+	// 由启动装配按 DASHBOARD_TIMEZONE 注入；为零值时按 UTC 处理（兼容既有测试与
+	// 未配置的调用方）。它只影响日期边界，金额/账龄 SQL 语义与存储时间戳仍为 UTC。
+	BusinessLocation       *time.Location
 	QueueLeaseDuration     time.Duration
 	QueueHeartbeatInterval time.Duration
 	QueueTaskTimeout       time.Duration
+	// RunOverlapGuard 控制“同租户/子系统存在未结束的其它轮次”时的 precompute 行为：
+	// warn（默认）跳过 precompute + WARN，enforce 同样跳过并把重叠计为当轮错误。
+	// 由启动装配按 AGG_RUN_OVERLAP_GUARD 注入；零值按 warn 处理。
+	RunOverlapGuard RunOverlapGuard
+	// precomputeSigning/precomputeConversion 允许测试观察重叠闸门是否放行 precompute，
+	// 生产为 nil，走真实的 PrecomputeContractSigning/PrecomputeConversion。
+	precomputeSigning    func(context.Context) error
+	precomputeConversion func(context.Context) error
 }
 
 func (r *Runner) checkLicense(ctx context.Context) error {
@@ -88,7 +101,10 @@ type SyncSource struct {
 	LastWatermark  *time.Time `gorm:"column:last_watermark"`
 	LastRunAt      *time.Time `gorm:"column:last_run_at"`
 	LastStatus     string     `gorm:"column:last_status"`
-	LastError      *string    `gorm:"column:last_error"`
+	// LastSuccessAt 是该通道最近一次成功的持久标记（不随后续失败清空）：
+	// 看板 DASHBOARD_APPROVAL_SOURCE=instances 的升级门禁依赖“首次成功”证据。
+	LastSuccessAt *time.Time `gorm:"column:last_success_at"`
+	LastError     *string    `gorm:"column:last_error"`
 	CreatedAt      time.Time  `gorm:"column:created_at"`
 	UpdatedAt      time.Time  `gorm:"column:updated_at"`
 }
@@ -117,41 +133,76 @@ type SyncJob struct {
 func (SyncJob) TableName() string { return "sync_job" }
 
 // EnsureSyncSources 幂等登记已配置只读 DSN 或项目投影 API 的同步源。
+// 审批投影通道（contract_approval）与合同只读通道共用 CONTRACT_READ_DSN：
+// 只有合同 DSN 配置时才登记，保证看板门禁读到的是“该通道真的跑过”的状态。
 func (r *Runner) EnsureSyncSources(ctx context.Context) error {
 	if err := r.checkLicense(ctx); err != nil {
 		return err
 	}
+	codes := make([]string, 0, len(r.configuredSources())+1)
 	for code := range r.configuredSources() {
+		codes = append(codes, code)
+	}
+	if _, configured := r.sources["contract_management"]; configured {
+		codes = append(codes, ContractApprovalSource)
+	}
+	for _, code := range codes {
 		if err := r.checkLicense(ctx); err != nil {
 			return err
 		}
-		var count int64
-		if err := r.aggDB.WithContext(ctx).Model(&SyncSource{}).Where("tenant_id = ? AND subsystem_code = ?", r.tenantID, code).Count(&count).Error; err != nil {
+		if err := r.ensureSyncSource(ctx, code); err != nil {
 			return err
-		}
-		if count == 0 {
-			now := time.Now().UTC()
-			if err := r.aggregationWrite(ctx, func(tx *gorm.DB) error {
-				return tx.Create(&SyncSource{
-					TenantID: r.tenantID, ID: ulid(), SubsystemCode: code, DBHost: "source-secret", DBSchema: code,
-					ReadAccountRef: code + ".read", Enabled: true,
-					LastStatus: "PENDING", CreatedAt: now, UpdatedAt: now,
-				}).Error
-			}); err != nil {
-				return err
-			}
 		}
 	}
 	return nil
 }
 
+// ensureSyncSource 幂等登记单个同步源状态行。
+// 参数：ctx 为许可/取消上下文，code 为子系统编码。
+// 返回值：读取或创建失败返回错误；已存在时不改写状态。
+func (r *Runner) ensureSyncSource(ctx context.Context, code string) error {
+	var count int64
+	if err := r.aggDB.WithContext(ctx).Model(&SyncSource{}).Where("tenant_id = ? AND subsystem_code = ?", r.tenantID, code).Count(&count).Error; err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	return r.aggregationWrite(ctx, func(tx *gorm.DB) error {
+		return tx.Create(&SyncSource{
+			TenantID: r.tenantID, ID: ulid(), SubsystemCode: code, DBHost: "source-secret", DBSchema: code,
+			ReadAccountRef: code + ".read", Enabled: true,
+			LastStatus: "PENDING", CreatedAt: now, UpdatedAt: now,
+		}).Error
+	})
+}
+
 // RunOnce 执行一轮完整同步 + 预计算（PoC V5 主线）。
 // ctx 用于透传取消信号；返回 errors.Join 聚合错误，多源失败时不短路；全部成功返回 nil。
+// 每个来源在全量同步期间持有跨进程数据库锁；重叠实例跳过该来源而不是并发覆盖维表。
 func (r *Runner) RunOnce(ctx context.Context) error {
 	if err := r.checkLicense(ctx); err != nil {
 		return err
 	}
+	return r.runScheduledSources(ctx, scheduledSyncLockerFor(r.aggDB))
+}
+
+// runScheduledSources 在来源级互斥锁下执行一轮定时同步。
+// 参数：ctx 为许可/取消上下文，locker 为互斥实现（nil 时按聚合库方言选择）。
+// 返回值：聚合错误；未获得锁的来源本轮跳过，不写同步状态或维表，避免旧批次覆盖新值。
+func (r *Runner) runScheduledSources(ctx context.Context, locker scheduledSyncLocker) error {
+	if err := r.checkLicense(ctx); err != nil {
+		return err
+	}
+	if locker == nil {
+		locker = scheduledSyncLockerFor(r.aggDB)
+	}
 	start := time.Now().UTC()
+	// 每轮起止记录：用于跨实例轮次重叠检测（BIZ-DATA-08 残项 B）。
+	// 记录失败只降级守卫（WARN），不影响本轮同步与 precompute。
+	runRecorded := r.beginSyncRun(ctx, start)
+	defer r.finishSyncRun(context.WithoutCancel(ctx), start)
 	var runErrors []error
 	sources := r.configuredSources()
 	sourceOK := make(map[string]bool, len(sources))
@@ -159,36 +210,102 @@ func (r *Runner) RunOnce(ctx context.Context) error {
 		if err := r.checkLicense(ctx); err != nil {
 			return err
 		}
-		slog.Info("aggregation sync start", "source", code)
-		r.mark(ctx, code, statusRunning, start, nil)
-		err := r.runSource(ctx, code, dsn)
+		release, acquired, err := locker.TryAcquire(ctx, r.tenantID, code)
 		if err != nil {
-			msg := err.Error()
-			r.mark(ctx, code, statusFailed, start, &msg)
-			slog.Error("aggregation sync failed", "source", code, "error", err)
-			runErrors = append(runErrors, fmt.Errorf("sync source %s: %w", code, err))
+			// 锁不可用时宁可本轮不同步，也不能在无互斥保证下覆盖维表。
+			runErrors = append(runErrors, fmt.Errorf("acquire sync lock for source %s: %w", code, err))
 			continue
 		}
-		sourceOK[code] = true
-		r.mark(ctx, code, statusSuccess, start, nil)
-		slog.Info("aggregation sync done", "source", code)
+		if !acquired {
+			// 另一个进程正持有同一租户/来源的全量同步锁：本轮不读写该来源，
+			// 避免迟到批次覆盖新值，也避免覆盖持锁进程的同步水位。
+			slog.Warn("aggregation sync skipped: another process holds the source lock", "source", code)
+			continue
+		}
+		sourceErr := func() error {
+			defer func() {
+				if releaseErr := release(); releaseErr != nil {
+					slog.Warn("release aggregation sync lock failed", "source", code, "error", releaseErr)
+				}
+			}()
+			slog.Info("aggregation sync start", "source", code)
+			r.mark(ctx, code, statusRunning, start, nil)
+			if err := r.runSource(ctx, code, dsn); err != nil {
+				// 审批投影失败不影响已成功的合同维表：通道保持 SUCCESS，
+				// 失败已写入 sync_source.contract_approval，错误仍计入当轮。
+				var approvalErr *ContractApprovalError
+				if errors.As(err, &approvalErr) {
+					sourceOK[code] = true
+					r.mark(ctx, code, statusSuccess, start, nil)
+					slog.Warn("aggregation sync partial: contract approval projection failed", "source", code, "error", err)
+					return err
+				}
+				msg := err.Error()
+				r.mark(ctx, code, statusFailed, start, &msg)
+				slog.Error("aggregation sync failed", "source", code, "error", err)
+				return fmt.Errorf("sync source %s: %w", code, err)
+			}
+			sourceOK[code] = true
+			r.mark(ctx, code, statusSuccess, start, nil)
+			slog.Info("aggregation sync done", "source", code)
+			return nil
+		}()
+		if sourceErr != nil {
+			runErrors = append(runErrors, sourceErr)
+		}
 	}
 	// 从成功的来源预计算每个事实。无关的 CRM 或
 	// 项目故障不得冻结合同签署事实。
+	// 轮次重叠时跳过 precompute（派生数据，跳过不损失事实），避免混代次。
+	if err := r.runPrecompute(ctx, sources, sourceOK, start, runRecorded); err != nil {
+		runErrors = append(runErrors, err)
+	}
+	slog.Info("aggregation run completed", "elapsed", time.Since(start).String())
+	return errors.Join(runErrors...)
+}
+
+// runPrecompute 在轮次重叠闸门下执行派生预计算。
+// 参数：ctx 为许可/取消上下文，sources/sourceOK 为本轮来源与成功集合，
+// runStartedAt 为本轮开始时间，runRecorded 表示 sync_run 是否已记录。
+// 返回值：precompute 错误；重叠时按 AGG_RUN_OVERLAP_GUARD 决定是否返回错误。
+func (r *Runner) runPrecompute(ctx context.Context, sources map[string]string, sourceOK map[string]bool, runStartedAt time.Time, runRecorded bool) error {
 	signing, conversion := precomputeEligibility(sources, sourceOK)
+	if !signing && !conversion {
+		return nil
+	}
+	skip, guardErr := r.precomputeOverlapGuard(ctx, runStartedAt, runRecorded)
+	if skip {
+		return guardErr
+	}
+	var runErrors []error
 	if signing {
-		if err := r.PrecomputeContractSigning(ctx); err != nil {
+		if err := r.runPrecomputeSigning(ctx); err != nil {
 			slog.Error("precompute failed", "error", err)
 			runErrors = append(runErrors, fmt.Errorf("precompute contract signing: %w", err))
 		}
 	}
 	if conversion {
-		if err := r.PrecomputeConversion(ctx); err != nil {
+		if err := r.runPrecomputeConversion(ctx); err != nil {
 			runErrors = append(runErrors, err)
 		}
 	}
-	slog.Info("aggregation run completed", "elapsed", time.Since(start).String())
 	return errors.Join(runErrors...)
+}
+
+// runPrecomputeSigning 执行合同签署事实预计算；测试可注入替代实现观察闸门。
+func (r *Runner) runPrecomputeSigning(ctx context.Context) error {
+	if r.precomputeSigning != nil {
+		return r.precomputeSigning(ctx)
+	}
+	return r.PrecomputeContractSigning(ctx)
+}
+
+// runPrecomputeConversion 执行商机转化事实预计算；测试可注入替代实现观察闸门。
+func (r *Runner) runPrecomputeConversion(ctx context.Context) error {
+	if r.precomputeConversion != nil {
+		return r.precomputeConversion(ctx)
+	}
+	return r.PrecomputeConversion(ctx)
 }
 
 func precomputeEligibility(sources map[string]string, sourceOK map[string]bool) (signing, conversion bool) {
@@ -218,7 +335,16 @@ func (r *Runner) runSource(ctx context.Context, code, dsn string) error {
 	}
 	switch code {
 	case "contract_management":
-		return r.syncContract(ctx, dsn)
+		if err := r.syncContract(ctx, dsn); err != nil {
+			return err
+		}
+		// 审批投影挂在同一只读通道（定时与队列都经 runSource）：失败只降级审批口径
+		// （instances 门禁），不撤销已成功的合同维表。包装成 ContractApprovalError，
+		// 让定时轮次保持 contract_management 的 SUCCESS 状态。
+		if err := r.syncContractApproval(ctx, dsn); err != nil {
+			return &ContractApprovalError{Err: err}
+		}
+		return nil
 	case "customer_and_opportunity":
 		return r.syncCRM(ctx, dsn)
 	case "settlement":
@@ -230,6 +356,10 @@ func (r *Runner) runSource(ctx context.Context, code, dsn string) error {
 
 func (r *Runner) mark(ctx context.Context, code string, status string, runAt time.Time, errMsg *string) {
 	updates := map[string]interface{}{"last_status": status, "last_run_at": runAt, "updated_at": time.Now().UTC()}
+	if status == statusSuccess {
+		// 持久化“曾经成功”：后续失败不清除，供看板 instances 口径的升级门禁使用。
+		updates["last_success_at"] = time.Now().UTC()
+	}
 	if errMsg != nil {
 		updates["last_error"] = *errMsg
 	} else {
@@ -281,6 +411,53 @@ func scanSourceBatches[T any, K comparable](src *gorm.DB, table, selectColumns, 
 		}
 		lastKey = keyOf(rows[len(rows)-1])
 	}
+}
+
+// dimContractUpsert、dimCustomerUpsert、dimOpportunityUpsert 是维表全量同步的语句。
+// 它们用来源行 updated_at 作为版本防护：只有来源行不早于已存行时才覆盖业务列，
+// 因此迟到或较旧的读取结果不会把较新的镜像数据回退。
+//
+// 说明：防护依赖 MySQL 对 ON DUPLICATE KEY UPDATE 赋值的从左到右求值，
+// 所以 updated_at 自身必须放在赋值列表最后；业务列的守卫表达式读到的仍是旧行时间。
+var (
+	dimContractUpsert = guardedDimUpsert("dim_contract",
+		[]string{"origin_kind", "tenant_id", "contract_id", "contract_number", "title", "contract_type",
+			"service_type", "status", "start_date", "end_date", "crm_customer_id", "opportunity_id",
+			"amount_minor", "currency", "owner_user_id", "owner_org_id", "owner_identity_id", "project_id", "updated_at"},
+		[]string{"origin_kind", "contract_number", "title", "contract_type", "service_type", "status",
+			"start_date", "end_date", "crm_customer_id", "opportunity_id", "currency", "amount_minor",
+			"owner_user_id", "owner_identity_id", "project_id", "owner_org_id"})
+	dimCustomerUpsert = guardedDimUpsert("dim_customer",
+		[]string{"tenant_id", "customer_id", "customer_no", "customer_name", "customer_type", "industry",
+			"region", "status", "owner_user_id", "owner_org_id", "deleted_at", "updated_at"},
+		[]string{"customer_name", "customer_type", "industry", "region", "status", "owner_user_id",
+			"owner_org_id", "deleted_at"})
+	dimOpportunityUpsert = guardedDimUpsert("dim_opportunity",
+		[]string{"tenant_id", "opportunity_id", "opportunity_no", "name", "customer_id", "type", "source",
+			"expected_amount", "expected_sign_date", "owner_user_id", "owner_org_id", "current_stage",
+			"opp_status", "contract_ref", "contract_id", "created_at", "lost_reason", "stage_changed_at",
+			"deleted_at", "updated_at"},
+		[]string{"name", "customer_id", "type", "source", "expected_amount", "expected_sign_date",
+			"owner_user_id", "owner_org_id", "current_stage", "opp_status", "contract_ref", "contract_id",
+			"created_at", "lost_reason", "stage_changed_at", "deleted_at"})
+)
+
+// guardedDimUpsert 构造带来源时间防护的维表 upsert 语句。
+// 参数：table 为目标表，insertColumns 为插入列（最后一项必须是 updated_at），
+// updateColumns 为冲突时允许覆盖的业务列（不含 updated_at）。
+// 返回值：占位符与插入列同序的完整 SQL；updated_at 在赋值列表最后并以同样守卫更新。
+func guardedDimUpsert(table string, insertColumns, updateColumns []string) string {
+	placeholders := make([]string, len(insertColumns))
+	for i := range insertColumns {
+		placeholders[i] = "?"
+	}
+	assignments := make([]string, 0, len(updateColumns)+1)
+	for _, column := range updateColumns {
+		assignments = append(assignments, column+"=IF(VALUES(updated_at)>=updated_at,VALUES("+column+"),"+column+")")
+	}
+	assignments = append(assignments, "updated_at=IF(VALUES(updated_at)>=updated_at,VALUES(updated_at),updated_at)")
+	return "INSERT INTO " + table + "\n(" + strings.Join(insertColumns, ", ") + ")\nVALUES (" +
+		strings.Join(placeholders, ", ") + ")\nON DUPLICATE KEY UPDATE " + strings.Join(assignments, ", ")
 }
 
 // syncContract 将合同来源及来源类型同步到独立租户维表。
@@ -354,10 +531,7 @@ func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 					if err := r.checkLicense(ctx); err != nil {
 						return err
 					}
-					if err := r.execAggregation(ctx, `INSERT INTO dim_contract
-(origin_kind, tenant_id, contract_id, contract_number, title, contract_type, service_type, status, start_date, end_date, crm_customer_id, opportunity_id, amount_minor, currency, owner_user_id, owner_org_id, owner_identity_id, project_id, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON DUPLICATE KEY UPDATE origin_kind=VALUES(origin_kind), contract_number=VALUES(contract_number), title=VALUES(title), contract_type=VALUES(contract_type), service_type=VALUES(service_type), status=VALUES(status), start_date=VALUES(start_date), end_date=VALUES(end_date), crm_customer_id=VALUES(crm_customer_id), opportunity_id=VALUES(opportunity_id), currency=VALUES(currency), amount_minor=VALUES(amount_minor), owner_user_id=VALUES(owner_user_id), owner_identity_id=VALUES(owner_identity_id), project_id=VALUES(project_id), owner_org_id=VALUES(owner_org_id), updated_at=VALUES(updated_at)`,
+					if err := r.execAggregation(ctx, dimContractUpsert,
 						row.OriginKind, tenant, row.ID, row.ContractNumber, row.Title, row.ContractType, row.ServiceType, row.Status,
 						row.StartDate, row.EndDate, crmID, row.OpportunityID, row.AmountMinor, row.Currency,
 						row.OwnerUserID, org, identity, project, row.UpdatedAt); err != nil {
@@ -418,10 +592,7 @@ func (r *Runner) syncCRM(ctx context.Context, dsn string) error {
 					if err := r.checkLicense(ctx); err != nil {
 						return err
 					}
-					if err := r.execAggregation(ctx, `INSERT INTO dim_customer
-(tenant_id, customer_id, customer_no, customer_name, customer_type, industry, region, status, owner_user_id, owner_org_id, deleted_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON DUPLICATE KEY UPDATE customer_name=VALUES(customer_name), customer_type=VALUES(customer_type), industry=VALUES(industry), region=VALUES(region), status=VALUES(status), owner_user_id=VALUES(owner_user_id), owner_org_id=VALUES(owner_org_id), deleted_at=VALUES(deleted_at), updated_at=VALUES(updated_at)`,
+					if err := r.execAggregation(ctx, dimCustomerUpsert,
 						row.TenantID, row.ID, row.CustomerNo, row.Name, row.CustomerType, row.Industry, row.Region,
 						row.Status, row.OwnerUserID, row.OwnerOrgID, row.DeletedAt, row.UpdatedAt); err != nil {
 						return err
@@ -470,10 +641,7 @@ ON DUPLICATE KEY UPDATE customer_name=VALUES(customer_name), customer_type=VALUE
 					if err := r.checkLicense(ctx); err != nil {
 						return err
 					}
-					if err := r.execAggregation(ctx, `INSERT INTO dim_opportunity
-(tenant_id, opportunity_id, opportunity_no, name, customer_id, type, source, expected_amount, expected_sign_date, owner_user_id, owner_org_id, current_stage, opp_status, contract_ref, contract_id, created_at, lost_reason, stage_changed_at, deleted_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON DUPLICATE KEY UPDATE name=VALUES(name), customer_id=VALUES(customer_id), type=VALUES(type), source=VALUES(source), expected_amount=VALUES(expected_amount), expected_sign_date=VALUES(expected_sign_date), owner_user_id=VALUES(owner_user_id), owner_org_id=VALUES(owner_org_id), current_stage=VALUES(current_stage), opp_status=VALUES(opp_status), contract_ref=VALUES(contract_ref), contract_id=VALUES(contract_id), created_at=VALUES(created_at), lost_reason=VALUES(lost_reason), stage_changed_at=VALUES(stage_changed_at), deleted_at=VALUES(deleted_at), updated_at=VALUES(updated_at)`,
+					if err := r.execAggregation(ctx, dimOpportunityUpsert,
 						row.TenantID, row.ID, row.OpportunityNo, row.Name, row.CustomerID, row.Type, row.Source,
 						row.ExpectedAmount, row.ExpectedSignDate, row.OwnerUserID, row.OwnerOrgID, row.CurrentStage,
 						row.OppStatus, row.ContractRef, row.ContractID, row.CreatedAt, row.LostReason, row.StageChangedAt, row.DeletedAt, row.UpdatedAt); err != nil {

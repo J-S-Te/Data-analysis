@@ -11,6 +11,10 @@ import (
 	"log/slog"
 	"sort"
 	"time"
+	// 业务日时区依赖 IANA tzdata。内嵌一份可确保精简容器/构建镜像缺少
+	// /usr/share/zoneinfo 时 LoadLocation 仍可用，避免业务日静默回退 UTC；
+	// 代价是二进制增大 zoneinfo 体积（约 400KB），可接受。
+	_ "time/tzdata"
 
 	"gorm.io/gorm"
 
@@ -19,11 +23,81 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard/domain"
 )
 
-// GORMRepository 从 MySQL 视图读取物化看板快照。
-type GORMRepository struct{ db *gorm.DB }
+// DashboardTimezone 是看板“今天/到期”业务日的默认时区。
+// 存储、同步与其它时间戳仍全部使用 UTC，只有业务日边界按此换算，
+// 避免 UTC 00:00（北京时间 08:00，前一晚刚跨日）让到期状态与实际作息不符。
+const DashboardTimezone = "Asia/Shanghai"
 
-// NewGORMRepository 构造看板持久化适配器。
-func NewGORMRepository(db *gorm.DB) *GORMRepository { return &GORMRepository{db: db} }
+// GORMRepository 从 MySQL 视图读取物化看板快照。
+type GORMRepository struct {
+	db *gorm.DB
+	// location 是“今天/到期”业务日所在时区；为零值时按 UTC 处理。
+	location *time.Location
+	// approvalSource 是“审批中”口径；零值按 status（源状态 pending 近似）处理，
+	// 保证既有调用方行为不变。
+	approvalSource ApprovalSource
+}
+
+// NewGORMRepositoryWithLocation 构造业务日时区明确的看板持久化适配器。
+// 参数：db 为聚合库连接，location 为已校验的业务日时区（nil 视为 UTC）。
+// 返回值：看板仓储（审批中口径默认 status）。
+func NewGORMRepositoryWithLocation(db *gorm.DB, location *time.Location) *GORMRepository {
+	if location == nil {
+		location = time.UTC
+	}
+	return &GORMRepository{db: db, location: location}
+}
+
+// NewGORMRepositoryWithApprovalSource 构造审批中口径明确的看板持久化适配器。
+// 参数：db 为聚合库连接，location 为业务日时区（nil 视为 UTC），source 为已解析口径。
+// 返回值：看板仓储；source 为零值/未知值时按 status 处理（调用方启动期已用
+// ParseApprovalSource 拒绝非法值，这里只做防御性归一）。
+func NewGORMRepositoryWithApprovalSource(db *gorm.DB, location *time.Location, source ApprovalSource) *GORMRepository {
+	repository := NewGORMRepositoryWithLocation(db, location)
+	repository.approvalSource = normalizeApprovalSource(source)
+	return repository
+}
+
+// businessLocation 返回业务日时区；零值按 UTC 处理。
+// 参数：无。
+// 返回值：非空时区。
+func (repository *GORMRepository) businessLocation() *time.Location {
+	if repository.location == nil {
+		return time.UTC
+	}
+	return repository.location
+}
+
+// businessOffset 返回业务时区相对 UTC 的偏移（如 "+08:00"），供 CONVERT_TZ 绑定。
+// 参数：now 为取偏移的时刻（DST 时区按该时刻判定）。
+// 返回值：MySQL CONVERT_TZ 目标时区字符串。
+// 存储的 snapshot_at/created_at/updated_at 都是 UTC 墙钟 DATETIME，取月前缀前
+// 必须先换算到业务时区，否则北京时间每月首日 00:00-08:00 的数据会落到上一月。
+func (repository *GORMRepository) businessOffset(now time.Time) string {
+	return aggregation.BusinessUTCOffset(repository.businessLocation(), now)
+}
+
+// businessMonthWindowStart 返回"近 months 个月"趋势窗口下界。
+// 参数：now 为当前时刻，months 为月份数（不足 1 时按 1）。
+// 返回值：业务当月月初再回退 months-1 个月的 UTC 墙钟 DATETIME 字符串。
+// 不再用 UTC_TIMESTAMP() 做窗口下界：那是 UTC 的"现在"，与业务月边界相差一个
+// 偏移量，会把业务当月首日凌晨的数据切到窗口外。用字符串绑定是为了不受 DSN loc
+// 影响（值已是 UTC 墙钟，可直接与 snapshot_at 比较）。
+func (repository *GORMRepository) businessMonthWindowStart(now time.Time, months int) string {
+	if months < 1 {
+		months = 1
+	}
+	location := repository.businessLocation()
+	local := now.In(location)
+	start := time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, location).AddDate(0, -(months - 1), 0)
+	return start.UTC().Format("2006-01-02 15:04:05")
+}
+
+// businessDate 返回业务日时区下的当日日期（YYYY-MM-DD）。
+// 只用于“今天/到期”派生边界，不影响任何存储或时间戳口径。
+func (repository *GORMRepository) businessDate(now time.Time) string {
+	return now.In(repository.businessLocation()).Format("2006-01-02")
+}
 
 // LatestContract 返回租户最新合同聚合。
 func (repository *GORMRepository) LatestContract(ctx context.Context, tenantID string) (domain.ContractSnapshot, bool, error) {
@@ -145,6 +219,47 @@ func (repository *GORMRepository) ListContracts(ctx context.Context, tenantID st
 	return rows, total, err
 }
 
+// projectTrendQuery 按月取每租户最新项目快照；月前缀按业务时区归集。
+// 占位符顺序：业务时区偏移（月前缀）、业务时区偏移（窗口分区）、租户、
+// 业务月窗口下界、LIMIT。偏移以参数传入，不硬编码 +08:00。
+const projectTrendQuery = `SELECT period, project_count FROM (
+	SELECT DATE_FORMAT(CONVERT_TZ(snapshot_at, '+00:00', ?), '%Y-%m') AS period, project_count,
+	       ROW_NUMBER() OVER (PARTITION BY DATE_FORMAT(CONVERT_TZ(snapshot_at, '+00:00', ?), '%Y-%m') ORDER BY snapshot_at DESC, id DESC) AS rn
+	FROM api_project_dashboard
+	WHERE tenant_id = ? AND snapshot_at >= ?
+) t WHERE rn = 1 ORDER BY period DESC LIMIT ?`
+
+// contractSigningPeriodExpr 返回合同签约月的分组表达式（含业务时区偏移占位符）。
+// 参数：dialect 为数据库方言名（sqlite 走 strftime 时间修饰符）。
+// 返回值：带一个绑定占位符的月前缀表达式。
+// start_date 是 DATE 无时区，回退分支 updated_at 是 UTC 墙钟，必须先换算到业务时区。
+func contractSigningPeriodExpr(dialect string) string {
+	if dialect == "sqlite" {
+		return "strftime('%Y-%m', COALESCE(start_date, datetime(updated_at, ?)))"
+	}
+	return "DATE_FORMAT(COALESCE(start_date, DATE(CONVERT_TZ(updated_at, '+00:00', ?))), '%Y-%m')"
+}
+
+// projectCreationPeriodExpr 返回项目创建月的分组表达式（含业务时区偏移占位符）。
+// 参数：dialect 为数据库方言名。
+// 返回值：带一个绑定占位符的月前缀表达式。
+// created_at 是 UTC 墙钟，按业务时区取创建月，避免月初数据落到上一月。
+func projectCreationPeriodExpr(dialect string) string {
+	if dialect == "sqlite" {
+		return "strftime('%Y-%m', created_at, ?)"
+	}
+	return "DATE_FORMAT(CONVERT_TZ(created_at, '+00:00', ?), '%Y-%m')"
+}
+
+// projectTrendArgs 返回 projectTrendQuery 的绑定参数，顺序与占位符一一对应：
+// 业务时区偏移（月前缀）、业务时区偏移（窗口分区）、租户、业务月窗口下界、LIMIT。
+// 参数：now 为当前时刻，tenantID 为租户，months 为月份上限。
+// 返回值：与 projectTrendQuery 占位符顺序一致的参数切片。
+func (repository *GORMRepository) projectTrendArgs(now time.Time, tenantID string, months int) []any {
+	offset := repository.businessOffset(now)
+	return []any{offset, offset, tenantID, repository.businessMonthWindowStart(now, months), months}
+}
+
 // ListTrend 返回最近若干月的合同和项目趋势；缺失月份由前端按空值展示。
 func (repository *GORMRepository) ListTrend(ctx context.Context, tenantID string, months int) ([]domain.TrendPoint, error) {
 	if months < 1 || months > 24 {
@@ -174,13 +289,10 @@ func (repository *GORMRepository) ListTrend(ctx context.Context, tenantID string
 		Period string `gorm:"column:period"`
 		Count  int    `gorm:"column:project_count"`
 	}
-	projectSQL := `SELECT period, project_count FROM (
-		SELECT DATE_FORMAT(snapshot_at, '%Y-%m') AS period, project_count,
-		       ROW_NUMBER() OVER (PARTITION BY DATE_FORMAT(snapshot_at, '%Y-%m') ORDER BY snapshot_at DESC, id DESC) AS rn
-		FROM api_project_dashboard
-		WHERE tenant_id = ? AND snapshot_at >= DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ? MONTH)
-	) t WHERE rn = 1 ORDER BY period DESC LIMIT ?`
-	if err := repository.db.WithContext(ctx).Raw(projectSQL, tenantID, months, months).Scan(&projects).Error; err != nil {
+	// 业务月：snapshot_at 是 UTC 墙钟，先 CONVERT_TZ 到业务时区再取月前缀；
+	// 偏移以绑定参数传入（不硬编码 +08:00）。窗口下界同样取业务月边界。
+	now := time.Now()
+	if err := repository.db.WithContext(ctx).Raw(projectTrendQuery, repository.projectTrendArgs(now, tenantID, months)...).Scan(&projects).Error; err != nil {
 		return nil, err
 	}
 	projectByPeriod := make(map[string]int, len(projects))
@@ -206,12 +318,20 @@ func applyContractScope(query *gorm.DB, scope queryScope) *gorm.DB {
 	return applyOrgScope(query, scope, "owner_org_id")
 }
 
+// applyOrgScope 将可信范围应用到“归属组织单元”列（当前均为 owner_org_id）。
+// 参数：query 为已限定租户的查询，scope 为可信主体范围，column 为归属组织单元列。
+// 返回值：范围内查询；未知模式或空集合返回恒空条件。
+//
+// ORG 与 TEAM 的 ID 都来自平台 ORG 类型的数据范围绑定（见 internal/oidc/scope.go），
+// 属于同一组织单元命名空间，因此都映射到 owner_org_id。dim_project.team 是团队名称
+// 快照而不是授权键，不能作为过滤列；若未来平台引入独立团队实体，必须在此显式拒绝
+// TEAM 模式，而不是猜测列映射。
 func applyOrgScope(query *gorm.DB, scope queryScope, column string) *gorm.DB {
 	switch scope.mode {
 	case "TENANT":
 		return query
 	case "ORG", "TEAM":
-		if len(scope.orgUnitIDs) == 0 {
+		if !scope.hasScopedIDs() {
 			return query.Where("1=0")
 		}
 		return query.Where(column+" IN ?", scope.orgUnitIDs)
@@ -224,7 +344,7 @@ func applyOrgScope(query *gorm.DB, scope queryScope, column string) *gorm.DB {
 // 参数：ctx 为读取上下文，scope 为已解析的可信范围。
 // 返回值：范围快照、可用标记及读取错误；历史和未知来源不计入。
 func (repository *GORMRepository) scopedContract(ctx context.Context, scope queryScope) (domain.ContractSnapshot, bool, error) {
-	if len(scope.orgUnitIDs) == 0 && (scope.mode != "SELF" || scope.userID == "") {
+	if !scope.contractRowsVisible() {
 		return domain.ContractSnapshot{DiscountBuckets: map[string]int64{}}, false, nil
 	}
 	var row struct {
@@ -236,12 +356,35 @@ func (repository *GORMRepository) scopedContract(ctx context.Context, scope quer
 		// 源业务行 updated_at 的最大值，用于 source_updated_at，不能拿查询时间顶替。
 		SourceUpdatedAt *string `gorm:"column:source_updated_at"`
 	}
+	// 状态口径必须是合同源词表 + 到期派生，不能使用 APPROVING/EXPIRED/EFFECTIVE/SIGNED
+	// 这类派生词：dim_contract.status 存的是 contract_management 生命周期状态
+	// (draft/pending/approved/active/in_progress/pending_pay/completed/terminated/archived)。
+	// 派生规则与合同系统全租户看板一致：
+	// 审批中=审批实例在途（DASHBOARD_APPROVAL_SOURCE=instances 时用
+	// dim_contract_approval 的 EXISTS(status='running')，含变更审批；默认 status
+	// 则沿用源状态 pending 近似）；履行中=active/in_progress/pending_pay 且未到期，
+	// 外加终态 archived（源系统亦计入有效合同且从不算到期）；已到期=active 族且 end_date 早于业务日。
+	// 业务日期用绑定参数（业务时区当日，默认 Asia/Shanghai），等价于源系统的本地
+	// CURDATE() 而不再用 UTC 当日，避免北京时间 00:00-08:00 期间到期口径滞后一天。
+	//
+	// instances 口径是升级门禁：审批投影通道从未成功时必须拒绝（fail-closed），
+	// 否则会把“近似 >0”变成恒 0 的静默回归。
+	if normalizeApprovalSource(repository.approvalSource) == ApprovalSourceInstances {
+		ready, err := ApprovalInstancesReady(ctx, repository.db, scope.tenantID)
+		if err != nil {
+			return domain.ContractSnapshot{}, false, fmt.Errorf("approval instances source unavailable: %w", err)
+		}
+		if !ready {
+			return domain.ContractSnapshot{}, false, ErrApprovalSourceNotReady
+		}
+	}
+	today := repository.businessDate(time.Now())
 	scoped := applyContractScope(repository.db.WithContext(ctx).Table("dim_contract").Where("origin_kind = 'NORMAL'").Where("tenant_id = ?", scope.tenantID), scope)
 	err := scoped.Select(`COALESCE(SUM(amount_minor),0) AS total_amount_minor, COUNT(*) AS total_contracts,
-			COALESCE(SUM(status IN ('APPROVING','PENDING_APPROVAL','APPROVAL')),0) AS approval_contracts,
-			COALESCE(SUM(status IN ('ACTIVE','EFFECTIVE','SIGNED')),0) AS active_contracts,
-			COALESCE(SUM(status='EXPIRED'),0) AS expired_contracts,
-			MAX(updated_at) AS source_updated_at`).Scan(&row).Error
+			`+repository.approvalCountExpr()+`,
+			COALESCE(SUM(CASE WHEN status='archived' OR (status IN ('active','in_progress','pending_pay') AND (end_date IS NULL OR end_date >= ?)) THEN 1 ELSE 0 END),0) AS active_contracts,
+			COALESCE(SUM(CASE WHEN status IN ('active','in_progress','pending_pay') AND end_date IS NOT NULL AND end_date < ? THEN 1 ELSE 0 END),0) AS expired_contracts,
+			MAX(updated_at) AS source_updated_at`, today, today).Scan(&row).Error
 	if err != nil {
 		return domain.ContractSnapshot{}, false, err
 	}
@@ -280,7 +423,7 @@ func (repository *GORMRepository) scopedContract(ctx context.Context, scope quer
 // snapshot, so a concurrent atomic publish cannot mix generations.
 func (repository *GORMRepository) scopedProject(ctx context.Context, scope queryScope) (domain.ProjectSnapshot, bool, error) {
 	result := domain.ProjectSnapshot{StatusCounts: map[string]int{}}
-	if scope.mode != "TENANT" && (scope.mode != "ORG" && scope.mode != "TEAM" || len(scope.orgUnitIDs) == 0) {
+	if !scope.projectRowsVisible() {
 		return result, false, nil
 	}
 	result.TenantID = scope.tenantID
@@ -320,7 +463,7 @@ func (repository *GORMRepository) scopedProject(ctx context.Context, scope query
 			}
 		}
 		enabled := true
-		watermark, known, err := (&GORMRepository{db: tx}).syncWatermark(ctx, scope.tenantID, "project_management")
+		watermark, known, err := (&GORMRepository{db: tx, location: repository.location}).syncWatermark(ctx, scope.tenantID, "project_management")
 		if err != nil {
 			return err
 		}
@@ -389,7 +532,7 @@ func stringValue(value *string) string {
 // 参数：ctx 为读取上下文，scope 为可信范围，months 为月份上限。
 // 返回值：分币种趋势及数据库错误；历史/未知来源不计普通合同。
 func (repository *GORMRepository) scopedTrend(ctx context.Context, scope queryScope, months int) ([]domain.TrendPoint, error) {
-	if len(scope.orgUnitIDs) == 0 && (scope.mode != "SELF" || scope.userID == "") {
+	if !scope.contractRowsVisible() {
 		return nil, nil
 	}
 	var contractFacts []struct {
@@ -398,8 +541,10 @@ func (repository *GORMRepository) scopedTrend(ctx context.Context, scope querySc
 		Amount   int64
 		Count    int64
 	}
+	// start_date 是 DATE（无时区），但回退分支 DATE(updated_at) 是 UTC 日，
+	// 必须先换算到业务时区再取月前缀，否则签约月会落在上一个月。
 	err := applyContractScope(repository.db.WithContext(ctx).Table("dim_contract").Where("origin_kind = 'NORMAL'").Where("tenant_id = ?", scope.tenantID), scope).
-		Select("DATE_FORMAT(COALESCE(start_date, DATE(updated_at)), '%Y-%m') AS period, currency, COALESCE(SUM(amount_minor),0) AS amount, COUNT(*) AS count").
+		Select(contractSigningPeriodExpr(repository.db.Dialector.Name())+" AS period, currency, COALESCE(SUM(amount_minor),0) AS amount, COUNT(*) AS count", repository.businessOffset(time.Now())).
 		Group("period,currency").Order("period DESC").Limit(months * 8).Scan(&contractFacts).Error
 	if err != nil {
 		return nil, err
@@ -473,7 +618,7 @@ func mergeTrendPoints(contractRows []domain.TrendPoint, projectByPeriod map[stri
 // projectCreationTrend uses source creation months only after a complete publish.
 func (repository *GORMRepository) projectCreationTrend(ctx context.Context, scope queryScope) (map[string]int, error) {
 	counts := map[string]int{}
-	if scope.mode != "TENANT" && (scope.mode != "ORG" && scope.mode != "TEAM" || len(scope.orgUnitIDs) == 0) {
+	if !scope.projectRowsVisible() {
 		return counts, nil
 	}
 	err := repository.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -492,11 +637,9 @@ func (repository *GORMRepository) projectCreationTrend(ctx context.Context, scop
 			Period string
 			Count  int
 		}
-		expression := "DATE_FORMAT(created_at, '%Y-%m')"
-		if tx.Dialector.Name() == "sqlite" {
-			expression = "strftime('%Y-%m', created_at)"
-		}
-		err = applyOrgScope(tx.Table("dim_project").Where("tenant_id=? AND snapshot_id=?", scope.tenantID, state.PublishedSnapshotID), scope, "owner_org_id").Select(expression + " period,COUNT(*) count").Group("period").Scan(&rows).Error
+		// created_at 是 UTC 墙钟，按业务时区取创建月；偏移以绑定参数传入。
+		expression := projectCreationPeriodExpr(tx.Dialector.Name())
+		err = applyOrgScope(tx.Table("dim_project").Where("tenant_id=? AND snapshot_id=?", scope.tenantID, state.PublishedSnapshotID), scope, "owner_org_id").Select(expression+" period,COUNT(*) count", repository.businessOffset(time.Now())).Group("period").Scan(&rows).Error
 		if err != nil {
 			return err
 		}

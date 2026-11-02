@@ -17,7 +17,11 @@ type Principal struct {
 	RoleConfigHash         string
 	AuthzRevision          uint64
 	AuthorizationCheckedAt int64 // Unix 时间戳。
-	ExpiresAt              int64 // Unix 时间戳。
+	ExpiresAt              int64 // Unix 时间戳（绝对期限）。
+	// IdleTimeoutSeconds 是会话空闲期限（秒）；IdleRemainingMS 是认证时点剩余可用时长
+	// （毫秒，min(空闲截止, 绝对截止) - now，非负）。供 /api/v1/auth/me 展示与前端探测。
+	IdleTimeoutSeconds int64
+	IdleRemainingMS    int64
 }
 
 func (p Principal) HasPermission(permission string) bool {

@@ -36,7 +36,7 @@ func TestTrendKeepsOnlyLatestProjectSnapshotPerMonthOnMySQL(t *testing.T) {
 			}
 		}
 	}
-	rows, err := NewGORMRepository(db).ListTrend(context.Background(), tenant, 2)
+	rows, err := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t)).ListTrend(context.Background(), tenant, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestTrendPreservesContractCurrenciesOnMySQL(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	rows, err := NewGORMRepository(db).ListTrend(context.Background(), tenant, 1)
+	rows, err := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t)).ListTrend(context.Background(), tenant, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

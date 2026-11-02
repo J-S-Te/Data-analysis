@@ -57,15 +57,27 @@ func TestImportedHistoryScopeAndOriginalDates(t *testing.T) {
 	if err := db.Create(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
+	// 范围语义与看板/告警统一（BIZ-DATA-09）：ORG=组织∪团队，TEAM=仅团队，
+	// TEAM 同时携带组织授权时按命名空间断言失败拒绝（ErrScope）。
 	for _, tc := range []struct {
 		mode, user        string
-		orgs              []string
+		orgs, teams       []string
 		count, unassigned int
 		denied            bool
 	}{
-		{"TENANT", "u", nil, 3, 1, false}, {"ORG", "u", []string{"o"}, 2, 0, false}, {"TEAM", "u", []string{"p"}, 1, 1, false}, {"SELF", "u", nil, 2, 0, false}, {"NONE", "u", nil, 0, 0, true}, {"UNKNOWN", "u", nil, 0, 0, true}, {"ORG", "u", nil, 0, 0, true}, {"", "u", nil, 0, 0, true},
+		{"TENANT", "u", nil, nil, 3, 1, false},
+		{"ORG", "u", []string{"o"}, nil, 2, 0, false},
+		{"ORG", "u", []string{"o"}, []string{"p"}, 3, 1, false},
+		{"TEAM", "u", nil, []string{"p"}, 1, 1, false},
+		{"TEAM", "u", []string{"o"}, nil, 0, 0, true},
+		{"TEAM", "u", []string{"o"}, []string{"p"}, 0, 0, true},
+		{"SELF", "u", nil, nil, 2, 0, false},
+		{"NONE", "u", nil, nil, 0, 0, true},
+		{"UNKNOWN", "u", nil, nil, 0, 0, true},
+		{"ORG", "u", nil, nil, 0, 0, true},
+		{"", "u", nil, nil, 0, 0, true},
 	} {
-		ctx := auth.WithPrincipal(context.Background(), auth.Principal{TenantID: "t", UserID: tc.user, ScopeMode: tc.mode, OrganizationIDs: tc.orgs})
+		ctx := auth.WithPrincipal(context.Background(), auth.Principal{TenantID: "t", UserID: tc.user, ScopeMode: tc.mode, OrganizationIDs: tc.orgs, TeamIDs: tc.teams})
 		result, err := History(ctx, db)
 		if tc.denied {
 			if err == nil {
@@ -107,20 +119,20 @@ func TestStatusMachineTrustBoundary(t *testing.T) {
 	der, _ := x509.MarshalPKIXPublicKey(pub)
 	path := filepath.Join(t.TempDir(), "public.pem")
 	os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), 0600)
-	verifier, err := NewVerifier(VerifierOptions{Issuer: "platform", Audience: "analysis", PublicKeyPath: path, ClientID: "contract-reader", TenantID: "t", CallerEnvironment: "test"})
+	verifier, err := NewVerifier(VerifierOptions{Issuer: "platform", Audience: "analysis", PublicKeyPath: path, ClientID: "contract-reader", OAuthClientID: "x", TenantID: "t", CallerEnvironment: "test", RequireApplicationID: true, RequireEnvironmentID: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	router := gin.New()
 	router.GET("/status", StatusHandler(db, verifier, nil))
 	now := time.Now().Unix()
-	claims := map[string]any{"iss": "platform", "aud": "analysis", "sub": "contract-reader", "oauth_client_id": "x", "tenant_id": "t", "application_code": "contract_management", "environment_code": "test", "token_use": "application", "scope": []string{"analysis.contract-import.report-status"}, "iat": now - 1, "nbf": now - 1, "exp": now + 60}
+	claims := map[string]any{"iss": "platform", "aud": "analysis", "sub": "contract-reader", "oauth_client_id": "x", "tenant_id": "t", "application_id": "app-1", "application_code": "contract_management", "environment_id": "env-1", "environment_code": "test", "token_use": "application", "scope": []string{"analysis.contract-import.report-status"}, "iat": now - 1, "nbf": now - 1, "exp": now + 60}
 	for _, tc := range []struct {
 		key    string
 		value  any
 		status int
 	}{
-		{"", nil, http.StatusNotFound}, {"tenant_id", "other", 401}, {"scope", []string{"dashboard.contract.read"}, 401}, {"application_code", "data_analysis", 401}, {"aud", "wrong", 401}, {"environment_code", "prod", 401}, {"token_use", "access_token", 401},
+		{"", nil, http.StatusNotFound}, {"tenant_id", "other", 401}, {"scope", []string{"dashboard.contract.read"}, 401}, {"application_code", "data_analysis", 401}, {"aud", "wrong", 401}, {"environment_code", "prod", 401}, {"token_use", "access_token", 401}, {"oauth_client_id", "other-client", 401}, {"application_id", "", 401}, {"environment_id", "", 401},
 	} {
 		copy := map[string]any{}
 		for k, v := range claims {

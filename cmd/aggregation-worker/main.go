@@ -56,11 +56,24 @@ func main() {
 		logger.Error("DASHBOARD_MYSQL_DSN is required")
 		os.Exit(1)
 	}
+	// 财务快照业务日与看板“今天/到期”共用 DASHBOARD_TIMEZONE：非法时区在启动期
+	// 失败关闭，不让 as_of_date/月前缀/90 天 cutoff 静默漂回 UTC。
+	businessLocation, err := businessLocationFromEnv(os.Getenv)
+	if err != nil {
+		logger.Error("business day timezone invalid", "error", err)
+		os.Exit(1)
+	}
 	sources := map[string]string{}
-	for _, code := range []string{"contract_management", "customer_and_opportunity", "project_management", "settlement"} {
+	for _, code := range aggregationSourceCodes {
 		if dsn := os.Getenv(readDSNEnv(code)); dsn != "" {
 			sources[code] = dsn
 		}
+	}
+	// 轮次重叠守卫在启动期校验：非法值失败关闭，不静默退回 warn。
+	overlapGuard, err := overlapGuardFromEnv(os.Getenv)
+	if err != nil {
+		logger.Error("aggregation overlap guard invalid", "error", err)
+		os.Exit(1)
 	}
 	var runner *aggregation.Runner
 	if len(sources) > 0 || projection.URL != "" || importOptions.Enabled {
@@ -70,6 +83,8 @@ func main() {
 			os.Exit(1)
 		}
 		runner.LicenseCheck = checkBusiness
+		runner.BusinessLocation = businessLocation
+		runner.RunOverlapGuard = overlapGuard
 		runner.QueueLeaseDuration = *queueLease
 		runner.QueueHeartbeatInterval = *queueHeartbeat
 		runner.QueueTaskTimeout = *queueTimeout
@@ -78,6 +93,9 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	// 空 DSN 表示该业务源被显式禁用（只读 DSN 不下发时不登记、不伪造数据）；
+	// 逐个源显式告警，避免运维把“看板缺数”误判为同步 bug。日志只含源与变量名。
+	warnDisabledSources(os.Getenv, logger)
 	aggDB, err := gorm.Open(mysql.Open(aggDSN), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
 		logger.Error("aggregation db failed", "error", err)
@@ -165,6 +183,37 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// businessLocationFromEnv 从 DASHBOARD_TIMEZONE 解析财务快照业务日时区。
+// 参数：getenv 为环境读取函数（生产为 os.Getenv，测试可替换）。
+// 返回值：已校验的时区对象；空值取默认 Asia/Shanghai，非法值返回错误，
+// 由调用方记录日志并非零退出（fail-closed）。日志与错误只含时区名，不含凭据。
+func businessLocationFromEnv(getenv func(string) string) (*time.Location, error) {
+	return aggregation.LoadBusinessLocation(getenv("DASHBOARD_TIMEZONE"))
+}
+
+// aggregationSourceCodes 是本进程登记的全部业务只读源；顺序仅用于稳定的启动日志。
+var aggregationSourceCodes = []string{"contract_management", "customer_and_opportunity", "project_management", "settlement"}
+
+// overlapGuardFromEnv 从 AGG_RUN_OVERLAP_GUARD 解析轮次重叠守卫策略。
+// 参数：getenv 为环境读取函数（生产为 os.Getenv，测试可替换）。
+// 返回值：warn（默认）/enforce 或非法值错误；错误由调用方日志并非零退出。
+func overlapGuardFromEnv(getenv func(string) string) (aggregation.RunOverlapGuard, error) {
+	return aggregation.ParseRunOverlapGuard(getenv("AGG_RUN_OVERLAP_GUARD"))
+}
+
+// warnDisabledSources 对每个只读 DSN 为空（源被显式禁用）的业务源输出一条 WARN。
+// 参数：getenv 为环境读取函数（生产为 os.Getenv，测试可替换）；logger 为结构化日志器。
+// 返回值：无。只记录源编码与环境变量名，绝不记录 DSN 值或凭据，也不改变退出码与同步行为。
+// 注意：project_management 仍可能由项目投影/API 通道提供数据，此处仅表达“数据库直读被禁用”。
+func warnDisabledSources(getenv func(string) string, logger *slog.Logger) {
+	for _, code := range aggregationSourceCodes {
+		envName := readDSNEnv(code)
+		if getenv(envName) == "" {
+			logger.Warn("aggregation source disabled: read DSN is empty", "source", code, "env", envName)
+		}
+	}
 }
 
 func readDSNEnv(code string) string {

@@ -13,6 +13,7 @@
 - 告警候选与写入均限制 Worker 配置租户；写入/停用/删除共用规则行锁，避免失效规则迟到写入。原 Worker 返回数量仍为候选数量，非并发状态变更后的精确持久化数量。
 - 合同与项目原生摘要页展示真实聚合数据；报告/财务也已接入原生 business_dashboard_snapshot，并保留独立 Metabase 嵌入。报告来源 PROJECT_READ_DSN，财务来源 SETTLEMENT_READ_DSN，均只读；缺失指标明确不可用，不填演示零值。
 - 指标字典读取使用 dictionary.view，维护使用 dictionary.manage（目录 data-analysis-v2）；编码不可变，新建默认停用，版本冲突拒绝写入，删除保留墓碑和不可变历史。内置与已登记引用保护；历史接口返回最近 200 条。
+- 浏览器会话为“空闲 + 绝对”双期限：OIDC_SESSION_IDLE_TTL（默认 30m）只由 POST /api/v1/auth/activity 续期，普通业务请求只刷新 last_seen_at；OIDC_SESSION_ABSOLUTE_TTL（默认 8h）为登录后绝对到期，Cookie 到期与之一致。000024 迁移为 da_oidc_sessions 增加 last_interactive_at，旧行 NULL 按 created_at 兼容；/api/v1/auth/me 追加 idle_timeout_seconds/idle_remaining_ms。
 - migration 13 增加字典启用/来源/删除状态、历史快照与引用登记表。数据库读取失败显式返回错误，不静默回退。自定义公式仅口径说明，不执行任意计算；当前仅已确认且与内置定义一致的 2.1 绑定 PROJECT_STATUS_COUNTS_V1，其他未绑定指标不可启用。字典启停不动态改变既有固定看板计算。
 
 ## 关键入口

@@ -105,7 +105,7 @@ func TestProjectProjectionConsumerRealMySQLConsistentRead(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	ctx = auth.WithPrincipal(ctx, auth.Principal{TenantID: tenant, UserID: "qa-user", ScopeMode: "ORG", OrganizationIDs: []string{"qa-org"}})
-	repo := NewGORMRepository(db)
+	repo := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t))
 	old, available, err := repo.LatestProject(ctx, tenant)
 	if callbackErr != nil {
 		t.Fatal(callbackErr)

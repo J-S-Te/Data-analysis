@@ -29,7 +29,7 @@ func TestLatestContractReadsCurrencyTotalsOnMySQL(t *testing.T) {
 		tenant, time.Now().UTC(), 880000, `[{"currency":"CNY","amount_minor":100000,"contracts":1},{"currency":"USD","amount_minor":780000,"contracts":7}]`, 8, 2, 4, 1).Error; err != nil {
 		t.Fatal(err)
 	}
-	snapshot, available, err := NewGORMRepository(db).LatestContract(context.Background(), tenant)
+	snapshot, available, err := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t)).LatestContract(context.Background(), tenant)
 	if err != nil {
 		t.Fatal(err)
 	}

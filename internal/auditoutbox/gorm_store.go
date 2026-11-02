@@ -20,6 +20,11 @@ type GORMStore struct {
 	MaxTries uint
 }
 
+// outboxRow 是 bi_audit_outbox 的行映射。
+//
+// request_id 与 payload 由迁移 000028 补出：000016 建表没有这两列。读取走 SELECT *，
+// 缺列不会报错而是静默读成零值（追踪号/本地证据丢失）；写入按列名 INSERT，缺列即
+// MySQL ERROR 1054。因此改动这里的列必须同时有对应迁移。
 type outboxRow struct {
 	ID             string     `gorm:"column:id;primaryKey"`
 	TenantID       string     `gorm:"column:tenant_id"`
@@ -29,6 +34,7 @@ type outboxRow struct {
 	ResourceType   string     `gorm:"column:resource_type"`
 	ResourceID     string     `gorm:"column:resource_id"`
 	RequestID      *string    `gorm:"column:request_id"`
+	Payload        *string    `gorm:"column:payload"`
 	LoginIP        []byte     `gorm:"column:login_ip"`
 	ClientIP       []byte     `gorm:"column:client_ip"`
 	IPSource       string     `gorm:"column:ip_source"`
@@ -88,6 +94,7 @@ func (s *GORMStore) Claim(ctx context.Context, workerID string, limit int, now t
 		entries = append(entries, Entry{
 			ID: row.ID, TenantID: row.TenantID, EventID: row.EventID, ActorID: deref(row.ActorID),
 			Action: row.Action, ResourceType: row.ResourceType, ResourceID: row.ResourceID, RequestID: deref(row.RequestID),
+			Payload: deref(row.Payload),
 			LoginIP: ipString(row.LoginIP), ClientIP: ipString(row.ClientIP), IPSource: row.IPSource,
 			Result: row.Result, Attempts: row.Attempts,
 		})

@@ -6,13 +6,63 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	// 业务日时区依赖 IANA tzdata。聚合进程与看板 API 是两个独立二进制，
+	// 内嵌一份可确保精简镜像缺少 /usr/share/zoneinfo 时 LoadLocation 仍可用，
+	// 避免财务快照业务日静默回退 UTC（约 400KB 体积代价，可接受）。
+	_ "time/tzdata"
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard/domain"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+// DefaultBusinessTimezone 是财务快照业务日的默认时区，与看板“今天/到期”
+// 业务日（DASHBOARD_TIMEZONE）默认值一致，避免同一租户两处日界不同。
+const DefaultBusinessTimezone = "Asia/Shanghai"
+
+// LoadBusinessLocation 解析并校验财务快照业务日时区。
+// 参数：name 为 IANA 时区名，空值（含纯空白）取默认值 Asia/Shanghai。
+// 返回值：时区对象，或非法时区错误。非法值必须让进程启动失败（fail-closed），
+// 不把 as_of_date/月前缀/90 天 cutoff 悄悄退回 UTC。
+func LoadBusinessLocation(name string) (*time.Location, error) {
+	if strings.TrimSpace(name) == "" {
+		name = DefaultBusinessTimezone
+	}
+	location, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, fmt.Errorf("DASHBOARD_TIMEZONE %q is not a valid IANA time zone", name)
+	}
+	return location, nil
+}
+
+// businessLocation 返回财务快照业务日时区；未注入时退回 UTC，
+// 保持既有调用方（含测试）的日界语义不变。
+func (r *Runner) businessLocation() *time.Location {
+	if r.BusinessLocation == nil {
+		return time.UTC
+	}
+	return r.BusinessLocation
+}
+
+// BusinessUTCOffset 把业务时区相对 UTC 的偏移格式化为 ±HH:MM（如 "+08:00"）。
+// 参数：loc 为业务时区（nil 视为 UTC），at 为取偏移的时刻（DST 时区按该时刻判定）。
+// 返回值：MySQL CONVERT_TZ 目标时区/SQLite 时间修饰符都接受的偏移字符串。
+// 用固定偏移而不是命名时区是有意为之：MySQL 容器常未加载 tz 表，
+// CONVERT_TZ(...,'UTC','Asia/Shanghai') 会静默返回 NULL；数字偏移无需 tz 表。
+func BusinessUTCOffset(loc *time.Location, at time.Time) string {
+	if loc == nil {
+		loc = time.UTC
+	}
+	_, seconds := at.In(loc).Zone()
+	sign := "+"
+	if seconds < 0 {
+		sign, seconds = "-", -seconds
+	}
+	return fmt.Sprintf("%s%02d:%02d", sign, seconds/3600, (seconds%3600)/60)
+}
 
 type businessRow struct {
 	TenantID   string `gorm:"primaryKey"`
@@ -59,7 +109,8 @@ func (r *Runner) syncBusiness(ctx context.Context, code, dsn string) error {
 			section = "report"
 			snapshot, e = reportStatistics(ctx, tx, r.tenantID)
 		} else {
-			snapshot, e = financeStatistics(ctx, tx, r.tenantID, time.Now().UTC())
+			// 财务快照的“今天”按业务日时区换算；存储时间戳仍由 storeBusiness 用 UTC。
+			snapshot, e = financeStatistics(ctx, tx, r.tenantID, time.Now().In(r.businessLocation()))
 		}
 		return e
 	}, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
@@ -120,9 +171,26 @@ func reportStatistics(ctx context.Context, db *gorm.DB, tenant string) (domain.B
 	return domain.BusinessSnapshot{Metrics: map[string]any{"active_reports": active, "void_reports": void, "status_counts": counts, "cycle_p50_days": median, "cycle_samples": sampleCount, "reviewed_reports": counts["REVIEWED"] + counts["APPROVED"] + counts["ISSUED"] + counts["ARCHIVED"]}, MissingMetrics: []string{"first_pass_rate", "open_complaints"}, Basis: "报告版本台账：有效版本按状态计数；周期为 prepared_at 至 issued_at，P50 只计时间完整且非负的已签发版本；作废版本单列，不伪造首次通过率和投诉。"}, nil
 }
 
+// financeDateBoundaries 依据业务日时区的“现在”计算财务快照的三个日期边界。
+// 参数：now 为业务日时区下的时刻（调用方用 Runner.BusinessLocation 换算）。
+// 返回值：as_of_date（2006-01-02）、90 天账龄截止日（2006-01-02）与业务时区当月首日；
+// 只产出日期边界，不改变金额/账龄 SQL 语义，存储时间戳仍为 UTC。
+func financeDateBoundaries(now time.Time) (asOfDate, cutoff string, monthStart time.Time) {
+	asOfDate = now.Format("2006-01-02")
+	cutoff = now.AddDate(0, 0, -90).Format("2006-01-02")
+	// 本月首日按业务时区构造，不再固定 UTC：否则北京时间每月首日凌晨的回款
+	// 会落到上一个月，与看板“本月”口径不一致。
+	monthStart = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+	return asOfDate, cutoff, monthStart
+}
+
+// financeStatistics 按币种汇总应收、账龄与本月回款。
+// 参数：ctx 为查询上下文；db 为只读源库连接；tenant 为租户隔离边界；now 为业务日
+// 时区下的“现在”（调用方用 Runner.BusinessLocation 换算）。now 只决定 as_of_date、
+// 90 天 cutoff 与本月前缀三个日期边界，金额/账龄 SQL 语义不变，存储仍为 UTC。
+// 返回值：快照或查询错误。
 func financeStatistics(ctx context.Context, db *gorm.DB, tenant string, now time.Time) (domain.BusinessSnapshot, error) {
-	cutoff := now.AddDate(0, 0, -90).Format("2006-01-02")
-	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	asOfDate, cutoff, monthStart := financeDateBoundaries(now)
 	type currencyTotals struct {
 		Currency           string   `json:"currency"`
 		OriginalMinor      int64    `json:"original_minor"`
@@ -163,7 +231,7 @@ func financeStatistics(ctx context.Context, db *gorm.DB, tenant string, now time
 	if rows == nil {
 		rows = []currencyTotals{}
 	}
-	return domain.BusinessSnapshot{Metrics: map[string]any{"currencies": rows, "month": monthStart.Format("2006-01"), "as_of_date": now.Format("2006-01-02")}, MissingMetrics: []string{"recognized_income", "department_cost"}, Basis: "按币种分别计算，金额为分；回款率=已核销回款/原始应收；账龄按到期日超过90天的未清余额；本月已登记回款不是收入确认，使用UTC业务日期。"}, nil
+	return domain.BusinessSnapshot{Metrics: map[string]any{"currencies": rows, "month": monthStart.Format("2006-01"), "as_of_date": asOfDate}, MissingMetrics: []string{"recognized_income", "department_cost"}, Basis: "按币种分别计算，金额为分；回款率=已核销回款/原始应收；账龄按到期日超过90天的未清余额；本月已登记回款不是收入确认；as_of_date、90天账龄截止日与本月前缀按业务日时区（DASHBOARD_TIMEZONE，默认 Asia/Shanghai）计算，存储时间戳仍为 UTC。"}, nil
 }
 
 // syncProject publishes the API projection and optional report independently.

@@ -17,6 +17,7 @@ func TestControlledStartupDoesNotFallbackWhenConfigurationMissing(t *testing.T) 
 
 func TestDisabledStartupPreservesUnenrolledDeployment(t *testing.T) {
 	t.Setenv("COMMERCIAL_LICENSE_ENABLED", "false")
+	t.Setenv("COMMERCIAL_LICENSE_COMPATIBILITY", "true")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	check, err := Start(ctx)

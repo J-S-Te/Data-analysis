@@ -59,7 +59,7 @@ func TestDashboardOrganizationAndTeamScopeOnMySQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	publishTestProjection(t, db, tenant, 2)
-	repository := NewGORMRepository(db)
+	repository := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t))
 	orgCtx := auth.WithPrincipal(context.Background(), auth.Principal{TenantID: tenant, UserID: "sales-director", ScopeMode: "ORG", OrganizationIDs: []string{"org-a"}})
 	contract, available, err := repository.LatestContract(orgCtx, tenant)
 	if err != nil || !available || contract.TotalAmountMinor != 10000 || contract.TotalContracts != 1 {

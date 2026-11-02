@@ -39,6 +39,9 @@ services:
     environment:
       LISTEN_ADDR: :8080
       DASHBOARD_MYSQL_DSN: dashboard:${DASHBOARD_MYSQL_PASSWORD}@tcp(dashboard-mysql:3306)/dashboard_aggregation?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci
+      # 看板业务日/业务月时区（IANA 名）：非法规启动失败（fail-closed）。
+      # 看板、聚合、预警三个进程共用同一键，保证同一租户日界与月前缀一致。
+      DASHBOARD_TIMEZONE: ${DASHBOARD_TIMEZONE:-Asia/Shanghai}
       PLATFORM_BASE_URL: ${PLATFORM_BASE_URL}
       PLATFORM_AUDIT_CLIENT_ID: ${PLATFORM_AUDIT_CLIENT_ID}
       PLATFORM_AUDIT_CLIENT_SECRET: ${PLATFORM_AUDIT_CLIENT_SECRET}
@@ -60,10 +63,16 @@ services:
       CONTRACT_IMPORT_STATUS_CLIENT_ID: ${CONTRACT_IMPORT_STATUS_CLIENT_ID:-}
       CONTRACT_IMPORT_STATUS_TENANT_ID: ${CONTRACT_IMPORT_STATUS_TENANT_ID:-}
       CONTRACT_IMPORT_STATUS_CALLER_ENVIRONMENT_CODE: ${CONTRACT_IMPORT_STATUS_CALLER_ENVIRONMENT_CODE:-}
+      # 机器读取合同导入状态的 OAuth 客户端绑定：为空则
+      # /internal/v1/contract-imports/report-status 端点不挂载（fail-closed）。
+      # 合同侧 BASE_URL 必须是纯 origin，见 docs/report-status-endpoint.md。
+      REPORT_STATUS_MACHINE_OAUTH_CLIENT_ID: ${REPORT_STATUS_MACHINE_OAUTH_CLIENT_ID:-}
       METABASE_INTERNAL_URL: http://metabase:3000
       METABASE_EMBEDDING_SECRET: ${METABASE_EMBEDDING_SECRET:?required}
       OIDC_CODEC_KEY: ${OIDC_CODEC_KEY:?required}
       OIDC_BACKCHANNEL_BASE_URL: ${OIDC_BACKCHANNEL_BASE_URL}
+      OIDC_SESSION_IDLE_TTL: ${OIDC_SESSION_IDLE_TTL:-30m}
+      OIDC_SESSION_ABSOLUTE_TTL: ${OIDC_SESSION_ABSOLUTE_TTL:-8h}
       APP_PATH_PREFIX: ${APP_PATH_PREFIX}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
     depends_on:
@@ -90,6 +99,8 @@ services:
       target: aggregation-worker
     environment:
       DASHBOARD_MYSQL_DSN: dashboard:${DASHBOARD_MYSQL_PASSWORD}@tcp(dashboard-mysql:3306)/dashboard_aggregation?parseTime=true&charset=utf8mb4
+      # 财务快照业务日/商机转化月份按该时区归集（非法值启动失败）。
+      DASHBOARD_TIMEZONE: ${DASHBOARD_TIMEZONE:-Asia/Shanghai}
       # 业务库只读 DSN 由 Secret 注入（设计方案 §5.4）
       CONTRACT_READ_DSN: ${CONTRACT_READ_DSN}
       CONTRACT_IMPORT_SYNC_ENABLED: ${CONTRACT_IMPORT_SYNC_ENABLED:-false}
@@ -130,6 +141,22 @@ services:
       target: alert-worker
     environment:
       DASHBOARD_MYSQL_DSN: dashboard:${DASHBOARD_MYSQL_PASSWORD}@tcp(dashboard-mysql:3306)/dashboard_aggregation?parseTime=true&charset=utf8mb4
+      # 到期提醒窗口的“今天”按该时区折算（非法值启动失败），与看板 businessDate 同口径。
+      DASHBOARD_TIMEZONE: ${DASHBOARD_TIMEZONE:-Asia/Shanghai}
+      # 告警规则按租户隔离：cmd/alert-worker 在 OIDC_TENANT_ID 为空时拒绝启动
+      # （fail-closed），故与 aggregation-worker 一样要求必填，避免本地/测试栈
+      # 静默退化成“无租户”告警写入。
+      OIDC_TENANT_ID: ${OIDC_TENANT_ID:?required}
+      # 告警生命周期收敛（BIZ-DATA-07）默认关闭，保持“只增不关”行为；
+      # 置 true 才启用自动 CLOSED/重开，见 docs/alert-lifecycle.md。
+      ALERT_AUTO_RESOLVE: ${ALERT_AUTO_RESOLVE:-false}
+      # 收敛策略细项（仅 ALERT_AUTO_RESOLVE=true 时生效，默认值与代码一致）：
+      # ALERT_CONFIRM_ROUNDS=连续未命中确认轮数（1..10），
+      # ALERT_REOPEN_POLICY=auto|manual，ALERT_CLOSE_GUARD_RATIO=收缩安全阀比例（(0,1]）。
+      # 详见 docs/alert-lifecycle.md。
+      ALERT_CONFIRM_ROUNDS: ${ALERT_CONFIRM_ROUNDS:-2}
+      ALERT_REOPEN_POLICY: ${ALERT_REOPEN_POLICY:-auto}
+      ALERT_CLOSE_GUARD_RATIO: ${ALERT_CLOSE_GUARD_RATIO:-0.5}
     depends_on:
       dashboard-migrate:
         condition: service_completed_successfully
