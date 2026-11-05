@@ -165,7 +165,7 @@ func LoadConfig() (Config, error) {
 		AuditEnvironmentCode: envOr("PLATFORM_ENVIRONMENT_CODE", "dev"),
 		AuditWorkerID:        envOr("AUDIT_WORKER_ID", "dashboard-api"),
 		TrustedProxies:       commaList(envOr("APP_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")),
-		AuditRequired:        envBool("PLATFORM_AUDIT_REQUIRED", strings.EqualFold(envOr("PLATFORM_ENVIRONMENT_CODE", "dev"), "prod")),
+		AuditRequired:        auditRequiredFromEnvironment(),
 
 		AuthorizationContextURL: envOr("PLATFORM_AUTHORIZATION_CONTEXT_URL", "http://platform-api:8080/oauth2/authorization-context"),
 		MetabaseInternalURL:     envOr("METABASE_INTERNAL_URL", "http://metabase:3000"),
@@ -253,6 +253,21 @@ func envOr(key string, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// auditRequiredFromEnvironment 与 internal/middleware 的 auditRequired 同一语义：
+// PLATFORM_AUDIT_REQUIRED 显式设置优先，为空时按生产环境编码兜底；非法显式值
+// （无法解析的布尔串）按失败关闭返回 true，避免拼写错误静默关闭强制审计。
+func auditRequiredFromEnvironment() bool {
+	raw := strings.TrimSpace(os.Getenv("PLATFORM_AUDIT_REQUIRED"))
+	if raw != "" {
+		required, err := strconv.ParseBool(raw)
+		if err != nil {
+			return true
+		}
+		return required
+	}
+	return strings.EqualFold(envOr("PLATFORM_ENVIRONMENT_CODE", "dev"), "prod")
 }
 
 func envBool(key string, fallback bool) bool {
