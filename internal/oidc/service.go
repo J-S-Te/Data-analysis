@@ -336,6 +336,8 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 		return "", Session{}, err
 	}
 	lifetimes := s.newSessionLifetimes(now)
+	// 访问令牌到期时间与 central 分支无关：必须在所有登录模式下都有确定值，
+	// 否则零值会以 '0000-00-00 00:00:00' 写入 MySQL 并被严格 sql_mode 拒绝（1292）。
 	session = Session{
 		SessionIDHash:          tokenHash(sessionToken),
 		TenantID:               authz.TenantID,
@@ -349,6 +351,7 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 		AuthzRevision:          authz.AuthorizationRevision,
 		AccessTokenCipher:      accessTokenCipher,
 		ExpiresAt:              lifetimes.ExpiresAt,
+		AccessTokenExpiresAt:   loginAccessTokenExpiry(rawToken.Expiry, lifetimes.ExpiresAt),
 		AuthorizationCheckedAt: now,
 		CreatedAt:              now,
 		LastSeenAt:             now,
@@ -368,7 +371,9 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 		}
 		session.CentralSessionID = binding.Context.SessionID
 		session.ExpiresAt = binding.Context.AbsoluteExpiresAt
-		session.AccessTokenExpiresAt = rawToken.Expiry.UTC()
+		// 中央模式保留权威绝对到期（binding.Context.AbsoluteExpiresAt，已在 central.Validate 中
+		// 拒绝零值）作为缺省回退，仍优先采用提供方返回的访问令牌到期。
+		session.AccessTokenExpiresAt = loginAccessTokenExpiry(rawToken.Expiry, binding.Context.AbsoluteExpiresAt)
 		session.OIDCSubject = claims.Sub
 		session.OIDCSessionID = claims.SessionID
 	}
@@ -385,6 +390,18 @@ func (s *Service) ExchangeAndCreateSession(ctx context.Context, code string, cod
 // 返回值：绝对到期与最近显式活动时间。
 func (s *Service) newSessionLifetimes(now time.Time) sessionLifetimes {
 	return sessionLifetimes{ExpiresAt: now.Add(s.sessionAbsoluteTTL), LastInteractiveAt: now}
+}
+
+// loginAccessTokenExpiry 计算登录会话落库的 access_token_expires_at。
+// 参数：tokenExpiry 为提供方令牌端点返回的访问令牌到期时间（未返回 expires_in 时为零值）；
+// sessionExpiresAt 为本次会话的绝对到期（非中央模式为本地推导值，中央模式为权威中央窗口）。
+// 返回值：优先提供方到期；为零值则回退到会话绝对到期。da_oidc_sessions.access_token_expires_at
+// 不接受 '0000-00-00 00:00:00'（MySQL 1292），因此任何登录分支都必须写入确定值。
+func loginAccessTokenExpiry(tokenExpiry, sessionExpiresAt time.Time) time.Time {
+	if !tokenExpiry.IsZero() {
+		return tokenExpiry.UTC()
+	}
+	return sessionExpiresAt.UTC()
 }
 
 // reportAuth 向平台审计上报登录/登出事件；审计未配置或上报失败均不影响认证流程。
