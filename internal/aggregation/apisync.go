@@ -388,6 +388,9 @@ func (r *APISyncRunner) SyncProjectDashboard(ctx context.Context) error {
 			RiskProjects     int            `json:"risk_projects"`
 			ServiceItems     int            `json:"service_items"`
 			StatusCounts     map[string]int `json:"status_counts"`
+			// ReportStageCounts 是可选增量契约：旧 PM 不发该键（nil=未采集），
+			// 新 PM 发 map（空对象表示“已采集且无项目”），两者不能归一成同一状态。
+			ReportStageCounts map[string]int `json:"report_stage_counts"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&payload); err != nil {
@@ -397,15 +400,24 @@ func (r *APISyncRunner) SyncProjectDashboard(ctx context.Context) error {
 		return fmt.Errorf("project dashboard tenant mismatch: requested %q, received %q", r.options.TenantID, responseTenantID)
 	}
 	statusJSON, _ := json.Marshal(payload.Data.StatusCounts)
+	// 缺失（nil）写 SQL NULL，表示该快照未采集报告阶段；存在（含空对象）写 JSON。
+	var reportStageJSON any
+	if payload.Data.ReportStageCounts != nil {
+		encoded, err := json.Marshal(payload.Data.ReportStageCounts)
+		if err != nil {
+			return fmt.Errorf("encode project report stage counts: %w", err)
+		}
+		reportStageJSON = string(encoded)
+	}
 	now := time.Now().UTC()
 	if err := r.checkLicense(ctx); err != nil {
 		return err
 	}
 	if err := r.db.Exec(`INSERT INTO api_project_dashboard
-(tenant_id, snapshot_at, project_count, in_flight_projects, risk_projects, service_items, status_counts_json, source)
-VALUES (?, ?, ?, ?, ?, ?, ?, 'project-api')`,
+(tenant_id, snapshot_at, project_count, in_flight_projects, risk_projects, service_items, status_counts_json, report_stage_counts_json, source)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'project-api')`,
 		r.options.TenantID, now, payload.Data.ProjectCount, payload.Data.InFlightProjects,
-		payload.Data.RiskProjects, payload.Data.ServiceItems, string(statusJSON)).Error; err != nil {
+		payload.Data.RiskProjects, payload.Data.ServiceItems, string(statusJSON), reportStageJSON).Error; err != nil {
 		return err
 	}
 	return nil

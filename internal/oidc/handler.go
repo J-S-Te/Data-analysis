@@ -15,9 +15,10 @@ import (
 
 // HTTPOptions 控制 cookie 与同源约束。
 type HTTPOptions struct {
-	CookieName   string
-	PublicOrigin string
-	SecureCookie bool
+	CookieName            string
+	PublicOrigin          string
+	SecureCookie          bool
+	DashboardEmbedEnabled *bool
 }
 
 type Handler struct {
@@ -144,14 +145,18 @@ func (h *Handler) Logout(c *gin.Context) {
 	c.Redirect(http.StatusFound, h.service.PathPrefix()+"/")
 }
 
-// AuthMe 返回当前会话身份（接入手册 §3.1 /api/v1/auth/me）。
+// AuthMe 返回当前会话身份与服务端配置的看板能力。
+// 参数：c 为经服务端会话认证的请求上下文。
+// 返回值：无；缺少主体时返回未认证错误。
 func (h *Handler) AuthMe(c *gin.Context) {
 	principal, ok := auth.FromContext(c.Request.Context())
 	if !ok {
 		response.Error(c, apperror.ErrUnauthenticated)
 		return
 	}
+	embedEnabled := h.options.DashboardEmbedEnabled == nil || *h.options.DashboardEmbedEnabled
 	response.OK(c, gin.H{
+		"capabilities":     gin.H{"dashboard_embed_enabled": embedEnabled},
 		"user_id":          principal.UserID,
 		"tenant_id":        principal.TenantID,
 		"display_name":     principal.DisplayName,

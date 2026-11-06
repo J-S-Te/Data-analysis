@@ -62,16 +62,19 @@ type ContractSnapshot struct {
 
 // ProjectSnapshot 是单个租户最新项目看板聚合。
 // StatusCounts 始终初始化为非 nil 映射，保证 API 值稳定。
+// ReportStageCounts 只在“该快照已采集报告阶段”时非 nil：nil 表示未采集
+// （旧 PM 或历史持久快照），空映射表示已采集且没有任何分桶，两者不能合并。
 type ProjectSnapshot struct {
-	Available        bool           `json:"available"`
-	TenantID         string         `json:"tenant_id"`
-	SnapshotAt       string         `json:"snapshot_at"`
-	Freshness        DataFreshness  `json:"freshness"`
-	ProjectCount     int            `json:"project_count"`
-	InFlightProjects int            `json:"in_flight_projects"`
-	RiskProjects     int            `json:"risk_projects"`
-	ServiceItems     int            `json:"service_items"`
-	StatusCounts     map[string]int `json:"status_counts"`
+	Available         bool           `json:"available"`
+	TenantID          string         `json:"tenant_id"`
+	SnapshotAt        string         `json:"snapshot_at"`
+	Freshness         DataFreshness  `json:"freshness"`
+	ProjectCount      int            `json:"project_count"`
+	InFlightProjects  int            `json:"in_flight_projects"`
+	RiskProjects      int            `json:"risk_projects"`
+	ServiceItems      int            `json:"service_items"`
+	StatusCounts      map[string]int `json:"status_counts"`
+	ReportStageCounts map[string]int `json:"report_stage_counts"`
 }
 
 // ContractDetail 是合同下钻列表的脱敏字段集合。

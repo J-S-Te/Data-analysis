@@ -111,12 +111,17 @@ func AuditWrites(reporter platformaudit.Reporter, logger *slog.Logger, trustedPr
 }
 
 // auditRequired 判定是否处于强制审计模式：PLATFORM_AUDIT_REQUIRED 显式设置优先，
-// 否则环境码为 prod 时默认强制。与 bootstrap 的 AuditRequired 判定保持同一语义。
+// 否则环境码为 prod 时默认强制。非法显式值（无法解析的布尔串）按失败关闭返回 true，
+// 不允许一个拼写错误静默关闭强制审计；与 bootstrap 的 AuditRequired 判定保持同一语义，
+// 参照 project_management 的 config.AuditRequiredFromEnvironment，请勿改回 fail-open。
 func auditRequired() bool {
 	raw := strings.TrimSpace(os.Getenv("PLATFORM_AUDIT_REQUIRED"))
 	if raw != "" {
 		required, err := strconv.ParseBool(raw)
-		return err == nil && required
+		if err != nil {
+			return true
+		}
+		return required
 	}
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("PLATFORM_ENVIRONMENT_CODE")), "prod")
 }

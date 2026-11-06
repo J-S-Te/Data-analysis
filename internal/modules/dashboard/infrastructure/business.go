@@ -5,10 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard/domain"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/standardfacts"
 	"gorm.io/gorm"
 )
 
+// LatestBusiness 按明确来源读取当前租户财务或报告快照。
+// 参数：ctx 为已授权上下文，tenant 为可信租户，section 为看板类别。
+// 返回值：真实快照、未发布状态或来源错误；不跨来源回退。
 func (repository *GORMRepository) LatestBusiness(ctx context.Context, tenant, section string) (domain.BusinessSnapshot, error) {
+	if section == "finance" && repository.financeSource == "standard" {
+		return (&standardfacts.Store{DB: repository.db}).Read(ctx, tenant)
+	}
 	var row struct{ Payload string }
 	err := repository.db.WithContext(ctx).Table("business_dashboard_snapshot").Select("payload").Where("tenant_id = ? AND section = ?", tenant, section).Take(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {

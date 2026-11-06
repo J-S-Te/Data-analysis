@@ -35,6 +35,11 @@ func (p Principal) HasPermission(permission string) bool {
 	return ok
 }
 
+// HasTenantScope 报告主体是否绑定全租户数据范围。
+// 租户级配置写入只允许 ScopeMode == "TENANT"：ORG/SELF 主体只能看各自范围，
+// 不能改动影响全租户的字典、预警规则或同步任务。
+func (p Principal) HasTenantScope() bool { return p.ScopeMode == "TENANT" }
+
 type contextKey string
 
 const principalKey contextKey = "principal"

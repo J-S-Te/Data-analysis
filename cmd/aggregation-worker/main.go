@@ -15,6 +15,7 @@ import (
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/aggregation"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/integrationsync"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
@@ -34,6 +35,11 @@ func main() {
 	slog.SetDefault(logger)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	integrationSyncEnabled, err := integrationsync.EnabledFromEnv(os.Getenv)
+	if err != nil {
+		logger.Error("integration sync configuration invalid", "error", err)
+		os.Exit(1)
+	}
 	importOptions, err := importReportOptionsFromEnv()
 	if err != nil {
 		logger.Error("contract import report configuration invalid", "error", err)
@@ -63,12 +69,7 @@ func main() {
 		logger.Error("business day timezone invalid", "error", err)
 		os.Exit(1)
 	}
-	sources := map[string]string{}
-	for _, code := range aggregationSourceCodes {
-		if dsn := os.Getenv(readDSNEnv(code)); dsn != "" {
-			sources[code] = dsn
-		}
-	}
+	sources := integrationReadSources(integrationSyncEnabled, os.Getenv)
 	// 轮次重叠守卫在启动期校验：非法值失败关闭，不静默退回 warn。
 	overlapGuard, err := overlapGuardFromEnv(os.Getenv)
 	if err != nil {
@@ -95,34 +96,41 @@ func main() {
 	}
 	// 空 DSN 表示该业务源被显式禁用（只读 DSN 不下发时不登记、不伪造数据）；
 	// 逐个源显式告警，避免运维把“看板缺数”误判为同步 bug。日志只含源与变量名。
-	warnDisabledSources(os.Getenv, logger)
+	if integrationSyncEnabled {
+		warnDisabledSources(os.Getenv, logger)
+	} else {
+		logger.Info("external business integration sync explicitly disabled; existing facts and queued jobs retained")
+	}
 	aggDB, err := gorm.Open(mysql.Open(aggDSN), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
 		logger.Error("aggregation db failed", "error", err)
 		os.Exit(1)
 	}
-	apiSync := aggregation.NewAPISyncRunner(aggDB, aggregation.APISyncOptions{
-		LicenseCheck:         checkBusiness,
-		MachineTokenURL:      os.Getenv("MACHINE_TOKEN_URL"),
-		MachineTokenIssuer:   firstNonEmpty(os.Getenv("MACHINE_TOKEN_ISSUER"), os.Getenv("OIDC_ISSUER")),
-		MachineTokenAudience: firstNonEmpty(os.Getenv("MACHINE_TOKEN_AUDIENCE"), "basic-platform-application"),
-		ContractCredential: aggregation.MachineCredential{
-			ClientID: os.Getenv("CONTRACT_MACHINE_CLIENT_ID"), ClientSecret: os.Getenv("CONTRACT_MACHINE_CLIENT_SECRET"),
-			Scope: firstNonEmpty(os.Getenv("CONTRACT_MACHINE_TOKEN_SCOPE"), "dashboard.contract.read"),
-		},
-		ProjectCredential: aggregation.MachineCredential{
-			ClientID: os.Getenv("PROJECT_MACHINE_CLIENT_ID"), ClientSecret: os.Getenv("PROJECT_MACHINE_CLIENT_SECRET"),
-			Scope: firstNonEmpty(os.Getenv("PROJECT_MACHINE_TOKEN_SCOPE"), "dashboard.project.read"),
-		},
-		ContractInternalURL: os.Getenv("CONTRACT_INTERNAL_URL"),
-		ProjectInternalURL:  os.Getenv("PROJECT_INTERNAL_URL"),
-		TenantID:            os.Getenv("OIDC_TENANT_ID"),
-	})
+	var apiSync *aggregation.APISyncRunner
+	if integrationSyncEnabled {
+		apiSync = aggregation.NewAPISyncRunner(aggDB, aggregation.APISyncOptions{
+			LicenseCheck:         checkBusiness,
+			MachineTokenURL:      os.Getenv("MACHINE_TOKEN_URL"),
+			MachineTokenIssuer:   firstNonEmpty(os.Getenv("MACHINE_TOKEN_ISSUER"), os.Getenv("OIDC_ISSUER")),
+			MachineTokenAudience: firstNonEmpty(os.Getenv("MACHINE_TOKEN_AUDIENCE"), "basic-platform-application"),
+			ContractCredential: aggregation.MachineCredential{
+				ClientID: os.Getenv("CONTRACT_MACHINE_CLIENT_ID"), ClientSecret: os.Getenv("CONTRACT_MACHINE_CLIENT_SECRET"),
+				Scope: firstNonEmpty(os.Getenv("CONTRACT_MACHINE_TOKEN_SCOPE"), "dashboard.contract.read"),
+			},
+			ProjectCredential: aggregation.MachineCredential{
+				ClientID: os.Getenv("PROJECT_MACHINE_CLIENT_ID"), ClientSecret: os.Getenv("PROJECT_MACHINE_CLIENT_SECRET"),
+				Scope: firstNonEmpty(os.Getenv("PROJECT_MACHINE_TOKEN_SCOPE"), "dashboard.project.read"),
+			},
+			ContractInternalURL: os.Getenv("CONTRACT_INTERNAL_URL"),
+			ProjectInternalURL:  os.Getenv("PROJECT_INTERNAL_URL"),
+			TenantID:            os.Getenv("OIDC_TENANT_ID"),
+		})
+	}
 	if runner != nil {
 		runner.ProjectProjection = projection
 		runner.ProjectAPI = apiSync
 	}
-	pass := aggregation.Pass{LicenseCheck: checkBusiness}
+	var importSync func(context.Context) error
 	if importOptions.Enabled {
 		importAPI := aggregation.NewAPISyncRunner(aggDB, aggregation.APISyncOptions{
 			LicenseCheck: checkBusiness, MachineTokenURL: importOptions.TokenURL,
@@ -130,29 +138,15 @@ func main() {
 			MachineTokenAudience: firstNonEmpty(os.Getenv("MACHINE_TOKEN_AUDIENCE"), "basic-platform-application"),
 			TenantID:             os.Getenv("OIDC_TENANT_ID"), ContractCredential: importOptions.Credential,
 		})
-		pass.SyncImportReport = func(ctx context.Context) error { return runner.SyncImportReport(ctx, importAPI, importOptions.URL) }
+		importSync = func(ctx context.Context) error { return runner.SyncImportReport(ctx, importAPI, importOptions.URL) }
 	}
-	if runner != nil {
-		// 主动跨库同步：从源库（合同/客户）读取并写入聚合库维表，保证看板有数据。
-		pass.SyncSources = func(ctx context.Context) error {
-			if err := runner.EnsureSyncSources(ctx); err != nil {
-				return err
-			}
-			return runner.RunOnce(ctx)
-		}
-		// 跨系统同步也支持由已持久化的访问/管理请求（队列）触发。
-		pass.SyncJobs = runner.RunQueued
-	}
-	if os.Getenv("CONTRACT_INTERNAL_URL") != "" {
-		pass.SyncContractDashboard = apiSync.SyncContractDashboard
-	}
-	if os.Getenv("PROJECT_INTERNAL_URL") != "" {
-		pass.SyncProjectDashboard = apiSync.SyncProjectDashboard
-	}
+	pass := integrationPass(integrationSyncEnabled, runner, apiSync, importSync, os.Getenv, checkBusiness)
 	if !pass.Configured() {
 		// 无任何同步通道：once 模式单次执行后退出合理；长驻模式必须保持
 		// 存活等待配置（RunLoop 对空 pass 安全），否则容器会陷入重启循环。
-		logger.Warn("no database sources or internal API endpoints configured; nothing to sync")
+		if integrationSyncEnabled {
+			logger.Warn("no database sources or internal API endpoints configured; nothing to sync")
+		}
 		if *once {
 			return
 		}
@@ -231,8 +225,14 @@ func readDSNEnv(code string) string {
 	}
 }
 
-// Explicit zero/negative/overflow limits are configuration errors, not defaults.
+// projectProjectionOptionsFromEnv 仅为启用的外源同步读取严格投影配置。
+// 参数：无；配置来自环境变量。
+// 返回值：投影参数或配置错误；关闭时返回空参数。
 func projectProjectionOptionsFromEnv() (aggregation.ProjectProjectionOptions, error) {
+	enabled, err := integrationsync.EnabledFromEnv(os.Getenv)
+	if err != nil || !enabled {
+		return aggregation.ProjectProjectionOptions{}, err
+	}
 	options := aggregation.ProjectProjectionOptions{URL: os.Getenv("PROJECT_PROJECTION_URL")}
 	if value, exists := os.LookupEnv("PROJECT_PROJECTION_HTTP_TIMEOUT"); exists {
 		duration, err := time.ParseDuration(value)

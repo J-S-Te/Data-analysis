@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"reflect"
 	"testing"
 
 	dashboardinfrastructure "github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard/infrastructure"
@@ -106,6 +107,37 @@ func TestLoadConfigApprovalSource(t *testing.T) {
 		}
 		if config.DashboardApprovalSource != tc.want {
 			t.Fatalf("DashboardApprovalSource = %q, want %q", config.DashboardApprovalSource, tc.want)
+		}
+	}
+}
+
+// TestLoadConfigDashboardEmbedEnabled 验证原生模式可显式关闭嵌入且非法开关失败关闭。
+// 参数：t 为测试上下文。
+// 返回值：无。
+func TestLoadConfigDashboardEmbedEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		raw     string
+		want    bool
+		invalid bool
+	}{
+		{raw: "", want: true}, {raw: "true", want: true},
+		{raw: "false", want: false}, {raw: "typo", invalid: true},
+	} {
+		t.Setenv("OIDC_CODEC_KEY", testCodecKeyHex)
+		t.Setenv("DASHBOARD_EMBED_ENABLED", tc.raw)
+		config, err := LoadConfig()
+		if tc.invalid {
+			if err == nil {
+				t.Fatal("invalid DASHBOARD_EMBED_ENABLED accepted")
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		enabled := reflect.ValueOf(config).FieldByName("DashboardEmbedEnabled")
+		if !enabled.IsValid() || enabled.Kind() != reflect.Bool || enabled.Bool() != tc.want {
+			t.Fatalf("DASHBOARD_EMBED_ENABLED=%q: capability missing or incorrect", tc.raw)
 		}
 	}
 }

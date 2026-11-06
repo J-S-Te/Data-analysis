@@ -22,16 +22,34 @@ const projectFixtureV1 = `{"type":"header","schema_version":1,"tenant_id":"synth
 {"type":"end","schema_version":1,"tenant_id":"synthetic-tenant","snapshot_id":"synthetic-project-snapshot-v1","total":2,"checksum_sha256":"af567d6d4df4bd3f64b476bbf8c692a1e75bed08d53df2af26147657c38ea561"}
 `
 
+// projectFixtureV2 是同一快照叠加可选 report_stage 的冻结 fixture：
+// 第一行合法码 RECTIFYING，第二行空串（未采集/不可判定）。checksum 按原始行
+// 字节冻结，用来证明校验和跟随实际收到的字节，而不是重新编码后的对象。
+// 源：BI 协同设计 2026-11-05 §3.1/§8（PM 侧同字节副本发布后必须保持一致）。
+const projectFixtureV2 = `{"type":"header","schema_version":1,"tenant_id":"synthetic-tenant","snapshot_id":"synthetic-project-snapshot-v2","source_snapshot_at":"2026-10-23T00:00:00.000000123Z"}
+{"type":"project","tenant_id":"synthetic-tenant","snapshot_id":"synthetic-project-snapshot-v2","id":"P-001","name":"合成项目：交付完成且部分终止","customer":"合成客户","customer_id":"synthetic-customer","contract":"SYNTHETIC-HT-001","contract_id":"synthetic-contract","category":"合成检测类别","team":"合成团队展示值","manager":"合成经理","manager_identity_id":"synthetic-manager","owner_org_id":"synthetic-org","owner_identity_id":"synthetic-owner","status":"已完成","progress":100,"risk":true,"in_flight":false,"service_items":2,"created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-20T00:00:00Z","source_updated_at":"2026-10-22T00:00:00Z","report_stage":"RECTIFYING"}
+{"type":"project","tenant_id":"synthetic-tenant","snapshot_id":"synthetic-project-snapshot-v2","id":"P-002","name":"合成项目：等待实施","customer":"合成客户","customer_id":"synthetic-customer","contract":"SYNTHETIC-HT-001","contract_id":"synthetic-contract","category":"合成检测类别","team":"合成团队展示值","manager":"合成经理","manager_identity_id":"synthetic-manager","owner_org_id":"synthetic-org","owner_identity_id":"synthetic-owner","status":"待实施","progress":0,"risk":false,"in_flight":true,"service_items":0,"created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-20T00:00:00Z","source_updated_at":"2026-10-22T00:00:00Z","report_stage":""}
+{"type":"end","schema_version":1,"tenant_id":"synthetic-tenant","snapshot_id":"synthetic-project-snapshot-v2","total":2,"checksum_sha256":"345463c31163adcce76aa9f7832313097a622e5a03cebf3f80b90b2f279ec8cc"}
+`
+
 func projectFixture(t *testing.T) []byte {
 	t.Helper()
 	return []byte(projectFixtureV1)
 }
+func projectFixtureWithReportStage(t *testing.T) []byte {
+	t.Helper()
+	return []byte(projectFixtureV2)
+}
 func projectWire(t *testing.T, rows ...map[string]any) []byte {
 	t.Helper()
-	lines := bytes.Split(bytes.TrimSpace(projectFixture(t)), []byte{'\n'})
+	return projectWireFrom(t, projectFixtureV1, rows...)
+}
+func projectWireFrom(t *testing.T, fixture string, rows ...map[string]any) []byte {
+	t.Helper()
+	lines := bytes.Split(bytes.TrimSpace([]byte(fixture)), []byte{'\n'})
 	var h, e map[string]any
 	json.Unmarshal(lines[0], &h)
-	json.Unmarshal(lines[3], &e)
+	json.Unmarshal(lines[len(lines)-1], &e)
 	var b bytes.Buffer
 	first, _ := json.Marshal(h)
 	b.Write(first)
@@ -52,8 +70,16 @@ func projectWire(t *testing.T, rows ...map[string]any) []byte {
 }
 func projectMap(t *testing.T) map[string]any {
 	t.Helper()
+	return projectMapFrom(t, projectFixtureV1)
+}
+func projectMapWithReportStage(t *testing.T) map[string]any {
+	t.Helper()
+	return projectMapFrom(t, projectFixtureV2)
+}
+func projectMapFrom(t *testing.T, fixture string) map[string]any {
+	t.Helper()
 	var m map[string]any
-	json.Unmarshal(bytes.Split(projectFixture(t), []byte{'\n'})[1], &m)
+	json.Unmarshal(bytes.Split([]byte(fixture), []byte{'\n'})[1], &m)
 	return m
 }
 
@@ -588,5 +614,182 @@ func TestProjectStagingReclamationLicenseRenewalAndBatching(t *testing.T) {
 	r.aggDB.Model(&projectProjectionStage{}).Where("tenant_id=?", r.tenantID).Count(&n)
 	if n != 0 {
 		t.Fatal("renewal did not reclaim backlog")
+	}
+}
+
+// TestProjectStreamAcceptsOptionalReportStage 覆盖 DA 先发布时的两种上游形态：
+// 旧 PM 不发 report_stage（按未采集落空串）与新 PM 发合法码/空串（含冻结 checksum）。
+func TestProjectStreamAcceptsOptionalReportStage(t *testing.T) {
+	for name, wire := range map[string][]byte{
+		"legacy_without_field": projectFixture(t),
+		"report_stage_present": projectFixtureWithReportStage(t),
+	} {
+		t.Run(name, func(t *testing.T) {
+			sink := &collectingProjectSink{}
+			summary, err := readProjectSnapshot(context.Background(), bytes.NewReader(wire), "synthetic-tenant", ProjectProjectionOptions{}, sink)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if summary.Total != 2 || len(sink.rows) != 2 {
+				t.Fatalf("summary/rows = %+v / %d", summary, len(sink.rows))
+			}
+			want := []string{"", ""}
+			if name == "report_stage_present" {
+				want = []string{"RECTIFYING", ""}
+				if summary.ChecksumSHA256 != "345463c31163adcce76aa9f7832313097a622e5a03cebf3f80b90b2f279ec8cc" {
+					t.Fatalf("frozen v2 checksum = %q", summary.ChecksumSHA256)
+				}
+			}
+			for i, row := range sink.rows {
+				if row.ReportStage != want[i] {
+					t.Fatalf("row %d report_stage = %q, want %q", i, row.ReportStage, want[i])
+				}
+			}
+		})
+	}
+	// 词表内 6 个码与空串都必须逐字接受。
+	for _, stage := range []string{"", "NONE", "RECTIFYING", "COMPILING", "REVIEWED", "ISSUED", "ARCHIVED"} {
+		row := projectMapWithReportStage(t)
+		row["report_stage"] = stage
+		sink := &collectingProjectSink{}
+		if _, err := readProjectSnapshot(context.Background(), bytes.NewReader(projectWireFrom(t, projectFixtureV2, row)), "synthetic-tenant", ProjectProjectionOptions{}, sink); err != nil {
+			t.Fatalf("stage %q rejected: %v", stage, err)
+		}
+		if len(sink.rows) != 1 || sink.rows[0].ReportStage != stage {
+			t.Fatalf("stage %q persisted as %+v", stage, sink.rows)
+		}
+	}
+}
+
+// TestProjectStreamRejectsInvalidReportStage 固定 fail-closed 边界：未知码不被
+// 静默映射为空或 NONE，null/非字符串/空白变体/重复键/超长一律拒绝。
+func TestProjectStreamRejectsInvalidReportStage(t *testing.T) {
+	rejected := map[string]map[string]any{
+		"unknown_code":      {"report_stage": "UNKNOWN"},
+		"lowercase":         {"report_stage": "rectifying"},
+		"leading_space":     {"report_stage": " RECTIFYING"},
+		"trailing_space":    {"report_stage": "RECTIFYING "},
+		"inner_space":       {"report_stage": "RECTI FYING"},
+		"numeric":           {"report_stage": 3},
+		"boolean":           {"report_stage": true},
+		"null":              {"report_stage": nil},
+		"object":            {"report_stage": map[string]any{"code": "RECTIFYING"}},
+		"non_ascii":         {"report_stage": "整改中"},
+		"over_long":         {"report_stage": strings.Repeat("R", 33)},
+		"unknown_and_extra": {"report_stage": "RECTIFYING", "extra": "x"},
+	}
+	for name, change := range rejected {
+		t.Run(name, func(t *testing.T) {
+			row := projectMapWithReportStage(t)
+			for key, value := range change {
+				row[key] = value
+			}
+			if _, err := readProjectSnapshot(context.Background(), bytes.NewReader(projectWireFrom(t, projectFixtureV2, row)), "synthetic-tenant", ProjectProjectionOptions{}, &collectingProjectSink{}); err == nil {
+				t.Fatal("invalid report_stage accepted")
+			}
+		})
+	}
+	// 缺必需字段在多一个可选键之后仍必须失败。
+	row := projectMapWithReportStage(t)
+	delete(row, "risk")
+	if _, err := readProjectSnapshot(context.Background(), bytes.NewReader(projectWireFrom(t, projectFixtureV2, row)), "synthetic-tenant", ProjectProjectionOptions{}, &collectingProjectSink{}); err == nil {
+		t.Fatal("missing required field accepted")
+	}
+	// 重复键在解码阶段拒绝，与 checksum 无关。
+	duplicated := bytes.Replace(projectFixtureWithReportStage(t), []byte(`"report_stage":"RECTIFYING"`), []byte(`"report_stage":"RECTIFYING","report_stage":"RECTIFYING"`), 1)
+	if _, err := readProjectSnapshot(context.Background(), bytes.NewReader(duplicated), "synthetic-tenant", ProjectProjectionOptions{}, &collectingProjectSink{}); err == nil {
+		t.Fatal("duplicate report_stage accepted")
+	}
+	// 直接 staging 也必须复核词表，不能绕过 reader 的契约。
+	r := projectRunner(t)
+	ctx := context.Background()
+	a, err := r.beginProjectProjection(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &collectingProjectSink{}
+	if _, err = readProjectSnapshot(ctx, bytes.NewReader(projectFixtureWithReportStage(t)), r.tenantID, ProjectProjectionOptions{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	staged := sink.rows[0]
+	staged.ReportStage = "BOGUS"
+	if err = r.stageProjectProjection(ctx, a, []ProjectProjection{staged}); err == nil {
+		t.Fatal("direct staging accepted unknown report_stage")
+	}
+}
+
+// TestProjectHeaderAndEndRejectReportStage 保持 header/end 精确字段集：
+// 可选字段只属于 project 行，不能被折叠进头尾。
+func TestProjectHeaderAndEndRejectReportStage(t *testing.T) {
+	good := projectFixtureWithReportStage(t)
+	lines := bytes.Split(bytes.TrimSpace(good), []byte{'\n'})
+	header := bytes.Replace(lines[0], []byte(`"source_snapshot_at"`), []byte(`"report_stage":"RECTIFYING","source_snapshot_at"`), 1)
+	headerWire := bytes.Join(append([][]byte{header}, lines[1:]...), []byte{'\n'})
+	headerWire = append(headerWire, '\n')
+	if _, err := readProjectSnapshot(context.Background(), bytes.NewReader(headerWire), "synthetic-tenant", ProjectProjectionOptions{}, &collectingProjectSink{}); err == nil {
+		t.Fatal("header accepted optional row field")
+	}
+	end := bytes.Replace(lines[len(lines)-1], []byte(`"total"`), []byte(`"report_stage":"","total"`), 1)
+	endWire := bytes.Join(append(append([][]byte{}, lines[:len(lines)-1]...), end), []byte{'\n'})
+	endWire = append(endWire, '\n')
+	if _, err := readProjectSnapshot(context.Background(), bytes.NewReader(endWire), "synthetic-tenant", ProjectProjectionOptions{}, &collectingProjectSink{}); err == nil {
+		t.Fatal("end accepted optional row field")
+	}
+}
+
+// TestProjectReportStageChecksumCoversRawBytes 证明 checksum 仍按原始行字节计算：
+// 把合法码换成另一个合法码但不改 end 摘要，必须因 checksum 失败而拒绝。
+func TestProjectReportStageChecksumCoversRawBytes(t *testing.T) {
+	good := projectFixtureWithReportStage(t)
+	if _, err := readProjectSnapshot(context.Background(), bytes.NewReader(good), "synthetic-tenant", ProjectProjectionOptions{}, &collectingProjectSink{}); err != nil {
+		t.Fatalf("frozen v2 fixture rejected: %v", err)
+	}
+	changed := bytes.Replace(good, []byte(`"report_stage":"RECTIFYING"`), []byte(`"report_stage":"COMPILING"`), 1)
+	if _, err := readProjectSnapshot(context.Background(), bytes.NewReader(changed), "synthetic-tenant", ProjectProjectionOptions{}, &collectingProjectSink{}); err == nil {
+		t.Fatal("checksum ignored optional field bytes")
+	}
+}
+
+// TestProjectReportStagePersistsToStageAndDimension 验证 stage 与 dim 的写入列
+// 都带上 report_stage，且旧 PM 快照仍落空串（未采集）。
+func TestProjectReportStagePersistsToStageAndDimension(t *testing.T) {
+	if !strings.Contains(projectInsertColumns, "report_stage") {
+		t.Fatalf("projectInsertColumns missing report_stage: %s", projectInsertColumns)
+	}
+	r := projectRunner(t)
+	ctx := context.Background()
+	a, err := r.beginProjectProjection(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, err := readProjectSnapshot(ctx, bytes.NewReader(projectFixtureWithReportStage(t)), r.tenantID, ProjectProjectionOptions{}, projectAttemptSink{r, a})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var staged []projectProjectionStage
+	if err = r.aggDB.Where("tenant_id=? AND run_id=?", r.tenantID, a.RunID).Order("project_id").Find(&staged).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(staged) != 2 || staged[0].ReportStage != "RECTIFYING" || staged[1].ReportStage != "" {
+		t.Fatalf("staged report_stage = %+v", staged)
+	}
+	if err = r.publishProjectProjection(ctx, a, summary); err != nil {
+		t.Fatal(err)
+	}
+	var published []ProjectProjection
+	if err = r.aggDB.Where("tenant_id=?", r.tenantID).Order("project_id").Find(&published).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(published) != 2 || published[0].ReportStage != "RECTIFYING" || published[1].ReportStage != "" {
+		t.Fatalf("published report_stage = %+v", published)
+	}
+	// 旧 PM 快照（无字段）仍可发布，report_stage 落未采集空串。
+	importProject(t, r, projectFixture(t))
+	var legacy []ProjectProjection
+	if err = r.aggDB.Where("tenant_id=?", r.tenantID).Order("project_id").Find(&legacy).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy) != 2 || legacy[0].ReportStage != "" || legacy[1].ReportStage != "" {
+		t.Fatalf("legacy report_stage = %+v", legacy)
 	}
 }

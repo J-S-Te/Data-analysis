@@ -18,14 +18,22 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/aggregation"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/alertworker"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/integrationsync"
 )
 
+// main 启动受许可保护的本地聚合告警评估，不装配外部业务数据源。
+// 参数：无；配置来自环境和命令行。
+// 返回值：无；配置或许可初始化失败时非零退出。
 func main() {
 	once := flag.Bool("once", envBool("ALERT_WORKER_ONCE"), "run one alert evaluation pass and exit")
 	interval := flag.Duration("interval", envDuration("ALERT_WORKER_INTERVAL", 5*time.Minute), "alert evaluation interval")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	if _, err := integrationsync.EnabledFromEnv(os.Getenv); err != nil {
+		logger.Error("integration sync configuration invalid", "error", err)
+		os.Exit(1)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	licenseCheck, err := commercial.Start(ctx)

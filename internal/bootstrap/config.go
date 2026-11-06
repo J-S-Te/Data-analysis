@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/importreport"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/integrationsync"
 	dashboardinfrastructure "github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard/infrastructure"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/oidc"
 )
@@ -52,6 +53,9 @@ type Config struct {
 	// TrustedProxies 是唯一允许采信 X-Real-IP / X-Forwarded-For 的直接对端集合。
 	TrustedProxies []string
 
+	IntegrationSyncEnabled  bool
+	DashboardEmbedEnabled   bool
+	FinanceSource           string
 	AuthorizationContextURL string
 	MetabaseInternalURL     string
 	MetabaseBasePath        string
@@ -106,6 +110,18 @@ func LoadConfig() (Config, error) {
 	centralEnabled, err := strconv.ParseBool(envOr("CENTRAL_SESSION_ENABLED", "false"))
 	if err != nil {
 		return Config{}, errors.New("invalid CENTRAL_SESSION_ENABLED")
+	}
+	integrationSyncEnabled, err := integrationsync.EnabledFromEnv(os.Getenv)
+	if err != nil {
+		return Config{}, err
+	}
+	embedEnabled, err := strconv.ParseBool(envOr("DASHBOARD_EMBED_ENABLED", "true"))
+	if err != nil {
+		return Config{}, errors.New("invalid DASHBOARD_EMBED_ENABLED")
+	}
+	financeSource := envOr("DASHBOARD_FINANCE_SOURCE", "integration")
+	if financeSource != "integration" && financeSource != "standard" {
+		return Config{}, errors.New("invalid DASHBOARD_FINANCE_SOURCE")
 	}
 	// COOKIE_SECURE 默认跟随 PublicOrigin 协议：https 部署未显式配置时仍获得
 	// Secure Cookie，避免生产漏配导致会话凭据以明文 Cookie 传输。
@@ -165,8 +181,11 @@ func LoadConfig() (Config, error) {
 		AuditEnvironmentCode: envOr("PLATFORM_ENVIRONMENT_CODE", "dev"),
 		AuditWorkerID:        envOr("AUDIT_WORKER_ID", "dashboard-api"),
 		TrustedProxies:       commaList(envOr("APP_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")),
-		AuditRequired:        envBool("PLATFORM_AUDIT_REQUIRED", strings.EqualFold(envOr("PLATFORM_ENVIRONMENT_CODE", "dev"), "prod")),
+		AuditRequired:        auditRequiredFromEnvironment(),
 
+		IntegrationSyncEnabled:  integrationSyncEnabled,
+		DashboardEmbedEnabled:   embedEnabled,
+		FinanceSource:           financeSource,
 		AuthorizationContextURL: envOr("PLATFORM_AUTHORIZATION_CONTEXT_URL", "http://platform-api:8080/oauth2/authorization-context"),
 		MetabaseInternalURL:     envOr("METABASE_INTERNAL_URL", "http://metabase:3000"),
 		MetabaseBasePath:        strings.TrimRight(envOr("METABASE_BASE_PATH", "/"), "/"),
@@ -253,6 +272,21 @@ func envOr(key string, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// auditRequiredFromEnvironment 与 internal/middleware 的 auditRequired 同一语义：
+// PLATFORM_AUDIT_REQUIRED 显式设置优先，为空时按生产环境编码兜底；非法显式值
+// （无法解析的布尔串）按失败关闭返回 true，避免拼写错误静默关闭强制审计。
+func auditRequiredFromEnvironment() bool {
+	raw := strings.TrimSpace(os.Getenv("PLATFORM_AUDIT_REQUIRED"))
+	if raw != "" {
+		required, err := strconv.ParseBool(raw)
+		if err != nil {
+			return true
+		}
+		return required
+	}
+	return strings.EqualFold(envOr("PLATFORM_ENVIRONMENT_CODE", "dev"), "prod")
 }
 
 func envBool(key string, fallback bool) bool {

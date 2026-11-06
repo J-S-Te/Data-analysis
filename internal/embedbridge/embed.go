@@ -47,6 +47,9 @@ type Bridge struct {
 	dashboardIDs map[string]string
 }
 
+// New 构造启用模式的嵌入桥并校验必需凭据与独立来源。
+// 参数：db 为令牌存储，options 为嵌入及许可配置。
+// 返回值：嵌入桥或缺失配置、来源不安全错误。
 func New(db *gorm.DB, options Options) (*Bridge, error) {
 	if options.MetabaseInternalURL == "" || options.EmbeddingSecret == "" {
 		return nil, errors.New("embed bridge requires metabase internal url and embedding secret")
@@ -76,7 +79,7 @@ func (b *Bridge) Issue(c *gin.Context, dashboardCode string) {
 		response.Error(c, apperror.ErrUnauthenticated)
 		return
 	}
-	permission, exists := b.permissionFor(dashboardCode)
+	permission, exists := permissionFor(dashboardCode)
 	if !exists || !principal.HasPermission(permission) {
 		response.Error(c, apperror.ErrForbidden)
 		return
@@ -485,7 +488,10 @@ func metabaseDashboardResource(value string) (interface{}, error) {
 
 type signedEmbed struct{ token string }
 
-func (b *Bridge) permissionFor(dashboardCode string) (string, bool) {
+// permissionFor 解析受支持看板的授权权限码。
+// 参数：dashboardCode 为受支持看板代码。
+// 返回值：权限码与是否存在该看板。
+func permissionFor(dashboardCode string) (string, bool) {
 	switch dashboardCode {
 	case "overview":
 		return "dashboard.overview.view", true

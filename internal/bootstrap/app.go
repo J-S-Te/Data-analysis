@@ -14,7 +14,6 @@ import (
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
-	"github.com/unified-identity-auth-platform/data-analysis/internal/embedbridge"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/importreport"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/middleware"
 	adminapplication "github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin/application"
@@ -33,6 +32,7 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/platformcatalog"
 	central "github.com/unified-identity-auth-platform/data-analysis/internal/sessiongovernance"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/response"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/standardfacts"
 )
 
 // App 是数据看板服务运行时容器，保存当前启动配置、数据库连接与路由/HTTP 服务实例，供主流程统一关闭或复用。
@@ -126,16 +126,7 @@ func New(config Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	bridge, err := embedbridge.New(db, embedbridge.Options{
-		LicenseCheck:        licenseCheck,
-		MetabaseInternalURL: config.MetabaseInternalURL,
-		MetabaseBasePath:    config.MetabaseBasePath,
-		EmbeddingSecret:     config.MetabaseEmbeddingSecret,
-		DashboardIDs:        config.DashboardIDs,
-		PathPrefix:          config.PathPrefix,
-		PublicOrigin:        config.PublicOrigin,
-		EmbedPublicOrigin:   config.EmbedPublicOrigin,
-	})
+	bridge, err := newDashboardEmbedBridge(db, config, licenseCheck)
 	if err != nil {
 		return nil, err
 	}
@@ -166,14 +157,28 @@ func New(config Config) (*App, error) {
 		if auditReporter != nil {
 			auditStatus = "enabled"
 		}
-		c.JSON(http.StatusOK, gin.H{"status": "ready", "audit": auditStatus})
+		// C14：能力维度快照；嵌入开关与财务来源是模式事实，不影响整体就绪。
+		embedState := "disabled"
+		if config.DashboardEmbedEnabled {
+			embedState = "ready"
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status": "ready",
+			"audit":  auditStatus,
+			"capabilities": gin.H{
+				"dashboard_embed":  gin.H{"enabled": config.DashboardEmbedEnabled, "state": embedState},
+				"finance_source":   gin.H{"mode": config.FinanceSource, "state": "ready"},
+				"integration_sync": gin.H{"enabled": config.IntegrationSyncEnabled, "state": dashboardSyncState(config.IntegrationSyncEnabled)},
+			},
+		})
 	})
 	base.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 
 	authHandler := oidc.NewHandler(authService, oidc.HTTPOptions{
-		CookieName:   "data_analysis_session",
-		PublicOrigin: config.PublicOrigin,
-		SecureCookie: config.SecureCookie,
+		CookieName:            "data_analysis_session",
+		PublicOrigin:          config.PublicOrigin,
+		SecureCookie:          config.SecureCookie,
+		DashboardEmbedEnabled: &config.DashboardEmbedEnabled,
 	})
 	base.GET("/auth/login", authHandler.Login)
 	base.GET("/auth/callback", authHandler.Callback)
@@ -194,16 +199,8 @@ func New(config Config) (*App, error) {
 	// commercial 白名单与审计豁免分别在 gate.go / audit.go 中按 /auth/me 同级处理。
 	api.POST("/auth/activity", authHandler.Activity)
 
-	// 嵌入桥（设计方案 §9）
-	api.GET("/embed/:dashboard", func(c *gin.Context) { bridge.Issue(c, c.Param("dashboard")) })
-	// embed-proxy 以 URL 内的一次性令牌为唯一凭证；CORS 只对 BI_EMBED_PUBLIC_ORIGIN
-	// 明确配置的独立嵌入源回显，不透明源（Origin: null）与其他外源一律不设置 ACAO，
-	// 且仅作用于该前缀，会话接口不受影响。
-	embedProxy := base.Group("/api/v1/embed-proxy", middleware.EmbedProxyCORS(config.EmbedPublicOrigin))
-	embedProxy.GET("/:token", func(c *gin.Context) { bridge.Proxy(c, c.Param("token")) })
-	embedProxy.GET("/:token/*resource", func(c *gin.Context) {
-		bridge.ProxyResource(c, c.Param("token"), c.Param("resource"))
-	})
+	mountDashboardEmbedRoutes(api, base, bridge, config, licenseCheck)
+	(&standardfacts.Handler{Store: &standardfacts.Store{DB: db, LicenseCheck: licenseCheck}, FinanceSource: config.FinanceSource}).Register(api)
 
 	// 业务桩（聚合库表就绪后生效）
 	alertHandler := alertshttp.NewHandler(alertsapplication.NewService(alertsinfrastructure.NewGORMRepository(db)))
@@ -222,7 +219,7 @@ func New(config Config) (*App, error) {
 	api.GET("/dictionary/metrics/:code/versions", middleware.RequirePermission("dictionary.view"), dictHandler.History)
 
 	adminHandler := adminhttp.NewHandler(adminapplication.NewService(admininfrastructure.NewGORMRepository(db)))
-	dashboardHandler := dashboardhttp.NewHandler(dashboardapplication.NewService(dashboardinfrastructure.NewGORMRepositoryWithApprovalSource(db, dashboardLocation, config.DashboardApprovalSource)))
+	dashboardHandler := dashboardhttp.NewHandler(dashboardapplication.NewService(dashboardinfrastructure.NewGORMRepositoryWithApprovalSource(db, dashboardLocation, config.DashboardApprovalSource).WithFinanceSource(config.FinanceSource)))
 	api.GET("/dashboard/contract-import-history", middleware.RequirePermission("dashboard.contract.view"), importreport.HistoryHandler(db))
 	api.GET("/dashboard/contract", middleware.RequirePermission("dashboard.contract.view"), dashboardHandler.Contract)
 	api.GET("/dashboard/project", middleware.RequirePermission("dashboard.project.view"), dashboardHandler.Project)
@@ -230,9 +227,9 @@ func New(config Config) (*App, error) {
 	api.GET("/dashboard/finance", middleware.RequirePermission("dashboard.finance.view"), dashboardHandler.Business("finance"))
 	api.GET("/dashboard/contracts", middleware.RequirePermission("dashboard.contract.view"), dashboardHandler.Contracts)
 	api.GET("/dashboard/trend", middleware.RequirePermission("dashboard.overview.view"), dashboardHandler.Trend)
-	api.GET("/admin/sources", middleware.RequirePermission("aggregation.manage"), adminHandler.ListSources)
-	api.POST("/admin/sources/:id/trigger", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("aggregation.manage"), func(c *gin.Context) { adminHandler.TriggerSource(c, c.Param("id")) })
-	api.POST("/admin/sources/trigger-all", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("aggregation.manage"), adminHandler.TriggerAllSources)
+	api.GET("/admin/sources", middleware.RequirePermission("aggregation.manage"), requireIntegrationSync(config.IntegrationSyncEnabled), adminHandler.ListSources)
+	api.POST("/admin/sources/:id/trigger", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("aggregation.manage"), requireIntegrationSync(config.IntegrationSyncEnabled), func(c *gin.Context) { adminHandler.TriggerSource(c, c.Param("id")) })
+	api.POST("/admin/sources/trigger-all", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("aggregation.manage"), requireIntegrationSync(config.IntegrationSyncEnabled), adminHandler.TriggerAllSources)
 	api.GET("/alert-rules", middleware.RequirePermission("alert.manage"), adminHandler.ListAlertRules)
 	api.PUT("/alert-rules", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("alert.manage"), adminHandler.PutAlertRules)
 	api.DELETE("/alert-rules/:id", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("alert.manage"), func(c *gin.Context) { adminHandler.DeleteAlertRule(c, c.Param("id")) })
@@ -286,6 +283,17 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 		WriteTimeout:      45 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+}
+
+// dashboardSyncState 渲染集成同步开关状态；disabled 属可选未购买/被停用，
+// 不计入就绪降级；enabled 恒为配置校验通过后的运行态。
+// 参数：enabled 为该能力开关的运行事实。
+// 返回值：ready 或 disabled。
+func dashboardSyncState(enabled bool) string {
+	if enabled {
+		return "ready"
+	}
+	return "disabled"
 }
 
 var _ = slog.Default
