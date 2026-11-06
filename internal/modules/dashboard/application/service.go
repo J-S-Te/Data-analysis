@@ -65,6 +65,10 @@ func (service *Service) Contract(ctx context.Context, tenantID string) (domain.C
 
 // Project 返回租户最新项目聚合。尚未运行聚合时，返回的快照
 // 有意为空，但仍有效。
+//
+// ReportStageCounts 保持仓储给出的 nil/非 nil 语义：nil 表示该数据源未采集
+// 报告阶段（旧 PM 或历史持久快照），空映射表示已采集且无分桶。这里不做
+// nil→空映射归一，否则“未采集”和“0 个整改中”无法区分。
 func (service *Service) Project(ctx context.Context, tenantID string) (domain.ProjectSnapshot, error) {
 	snapshot, available, err := service.snapshots.LatestProject(ctx, tenantID)
 	if err != nil {

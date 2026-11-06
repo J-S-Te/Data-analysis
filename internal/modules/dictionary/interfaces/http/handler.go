@@ -26,6 +26,13 @@ func principal(c *gin.Context, manage bool) (auth.Principal, bool) {
 		c.JSON(403, gin.H{"code": "FORBIDDEN", "message": "无指标字典操作权限"})
 		return p, false
 	}
+	// 租户级字典写入（PUT /dictionary、POST/PUT/PATCH/DELETE /dictionary/metrics）影响全租户，
+	// 只有 TENANT 数据范围可以改动；ORG/SELF 主体即使有管理权限也只读。
+	// 口径与 standardfacts 的全租户管理门禁一致（ScopeMode == "TENANT"）。
+	if manage && !p.HasTenantScope() {
+		c.JSON(403, gin.H{"code": "TENANT_SCOPE_REQUIRED", "message": "指标字典配置仅允许具有全租户数据范围的管理员操作"})
+		return p, false
+	}
 	return p, true
 }
 func respondError(c *gin.Context, e error) {

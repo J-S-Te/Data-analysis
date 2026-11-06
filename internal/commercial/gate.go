@@ -33,6 +33,9 @@ func Reject(c *gin.Context, err error) bool {
 	return true
 }
 
+// Middleware 按明确接口分类执行商业许可门禁，未知接口保持业务写限制。
+// 参数：check为当前运行组件的真实许可校验器。
+// 返回值：Gin中间件；拒绝时终止请求，不替代业务权限或数据范围校验。
 func Middleware(check Check) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 会话元数据接口只依赖本地会话 cookie，不属于业务读写：/auth/me 与
@@ -46,7 +49,7 @@ func Middleware(check Check) gin.HandlerFunc {
 		// 历史读取，嵌入授权签发本身也是 GET。
 		operation := MutateBusiness
 		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
-			for _, suffix := range []string{"/alerts", "/alerts/summary", "/dictionary", "/dictionary/metrics/:code/versions", "/dashboard/contract", "/dashboard/project", "/dashboard/report", "/dashboard/finance", "/dashboard/contracts", "/dashboard/trend", "/admin/sources", "/alert-rules"} {
+			for _, suffix := range []string{"/admin/standard-finance/status", "/alerts", "/alerts/summary", "/dictionary", "/dictionary/metrics/:code/versions", "/dashboard/contract", "/dashboard/project", "/dashboard/report", "/dashboard/finance", "/dashboard/contracts", "/dashboard/trend", "/admin/sources", "/alert-rules"} {
 				if strings.HasSuffix(c.FullPath(), "/api/v1"+suffix) {
 					operation = ReadHistory
 					break

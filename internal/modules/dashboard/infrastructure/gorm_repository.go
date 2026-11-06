@@ -30,7 +30,8 @@ const DashboardTimezone = "Asia/Shanghai"
 
 // GORMRepository 从 MySQL 视图读取物化看板快照。
 type GORMRepository struct {
-	db *gorm.DB
+	db            *gorm.DB
+	financeSource string
 	// location 是“今天/到期”业务日所在时区；为零值时按 UTC 处理。
 	location *time.Location
 	// approvalSource 是“审批中”口径；零值按 status（源状态 pending 近似）处理，
@@ -55,6 +56,14 @@ func NewGORMRepositoryWithLocation(db *gorm.DB, location *time.Location) *GORMRe
 func NewGORMRepositoryWithApprovalSource(db *gorm.DB, location *time.Location, source ApprovalSource) *GORMRepository {
 	repository := NewGORMRepositoryWithLocation(db, location)
 	repository.approvalSource = normalizeApprovalSource(source)
+	return repository
+}
+
+// WithFinanceSource 在装配期选择财务看板的唯一来源，默认维持现有联动模式。
+// 参数：source 为已校验的 integration 或 standard 来源名。
+// 返回值：当前仓储；标准来源查询失败时不会回退或混合联动来源。
+func (repository *GORMRepository) WithFinanceSource(source string) *GORMRepository {
+	repository.financeSource = source
 	return repository
 }
 
@@ -171,6 +180,9 @@ func (repository *GORMRepository) LatestProject(ctx context.Context, tenantID st
 		RiskProjects     int    `gorm:"column:risk_projects"`
 		ServiceItems     int    `gorm:"column:service_items"`
 		StatusCountsJSON string `gorm:"column:status_counts_json"`
+		// NULL 表示该持久快照未采集报告阶段（历史行或旧 PM）：不能用空映射冒充，
+		// 否则“未采集”会被展示成“0 个整改中”。
+		ReportStageCountsJSON *string `gorm:"column:report_stage_counts_json"`
 	}
 	err := repository.db.WithContext(ctx).Table("api_project_dashboard").
 		Where("tenant_id = ?", tenantID).Order("snapshot_at DESC").First(&row).Error
@@ -186,6 +198,14 @@ func (repository *GORMRepository) LatestProject(ctx context.Context, tenantID st
 			return domain.ProjectSnapshot{}, false, fmt.Errorf("%w: %v", application.ErrInvalidProjectSnapshot, err)
 		}
 	}
+	// 未采集时保持 nil；采集过（含空对象）时解析为映射，解析失败沿用既有
+	// invalid snapshot 错误语义，不静默降级为“0 个整改中”。
+	var reportStageCounts map[string]int
+	if row.ReportStageCountsJSON != nil && *row.ReportStageCountsJSON != "" {
+		if err := json.Unmarshal([]byte(*row.ReportStageCountsJSON), &reportStageCounts); err != nil {
+			return domain.ProjectSnapshot{}, false, fmt.Errorf("%w: %v", application.ErrInvalidProjectSnapshot, err)
+		}
+	}
 	return domain.ProjectSnapshot{
 		TenantID: row.TenantID, SnapshotAt: row.SnapshotAt,
 		Freshness: application.BuildFreshness(application.FreshnessInput{
@@ -195,6 +215,7 @@ func (repository *GORMRepository) LatestProject(ctx context.Context, tenantID st
 		ProjectCount:     row.ProjectCount,
 		InFlightProjects: row.InFlightProjects, RiskProjects: row.RiskProjects,
 		ServiceItems: row.ServiceItems, StatusCounts: statusCounts,
+		ReportStageCounts: reportStageCounts,
 	}, true, nil
 }
 
@@ -422,7 +443,9 @@ func (repository *GORMRepository) scopedContract(ctx context.Context, scope quer
 // scopedProject reads the publication marker and its dimension rows in one RR
 // snapshot, so a concurrent atomic publish cannot mix generations.
 func (repository *GORMRepository) scopedProject(ctx context.Context, scope queryScope) (domain.ProjectSnapshot, bool, error) {
-	result := domain.ProjectSnapshot{StatusCounts: map[string]int{}}
+	// 组织/团队范围实时聚合已发布的 dim_project，两个分组口径（status /
+	// report_stage）都来自同一代次；report_stage 用空映射起步，旧行落 '' 桶。
+	result := domain.ProjectSnapshot{StatusCounts: map[string]int{}, ReportStageCounts: map[string]int{}}
 	if !scope.projectRowsVisible() {
 		return result, false, nil
 	}
@@ -451,6 +474,16 @@ func (repository *GORMRepository) scopedProject(ctx context.Context, scope query
 		if err != nil {
 			return err
 		}
+		// 报告阶段分组与状态聚合并列，同属一条只读 RR 事务，保证两者同代次。
+		// 空串（未采集/旧行）保留为 '' 桶，不丢弃、不猜测。
+		var stageRows []struct {
+			ReportStage string
+			Count       int
+		}
+		err = applyOrgScope(tx.Table("dim_project").Where("tenant_id=? AND snapshot_id=?", scope.tenantID, state.PublishedSnapshotID), scope, "owner_org_id").Select("report_stage, COUNT(*) count").Group("report_stage").Scan(&stageRows).Error
+		if err != nil {
+			return err
+		}
 		var sourceAt *time.Time
 		for _, row := range rows {
 			result.StatusCounts[row.Status] = row.Count
@@ -461,6 +494,9 @@ func (repository *GORMRepository) scopedProject(ctx context.Context, scope query
 			if at := application.ParseDashboardTimestamp(stringValue(row.SourceUpdatedAt)); at != nil && (sourceAt == nil || at.After(*sourceAt)) {
 				sourceAt = at
 			}
+		}
+		for _, row := range stageRows {
+			result.ReportStageCounts[row.ReportStage] = row.Count
 		}
 		enabled := true
 		watermark, known, err := (&GORMRepository{db: tx, location: repository.location}).syncWatermark(ctx, scope.tenantID, "project_management")

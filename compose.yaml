@@ -2,6 +2,8 @@
 # 注意：
 #  - Metabase 为第三方服务（决策 A），不登记为子系统、不对外暴露；浏览器只经 dashboard-api 代理访问
 #  - 业务库只读 DSN 由部署 Secret 注入，不入本文件
+#  - 原生模式设 DASHBOARD_EMBED_ENABLED=false，仅启动 dashboard-api / aggregation-worker /
+#    alert-worker（自动包含自有库与迁移），不选择 metabase；默认全栈 up 仍兼容原有嵌入部署。
 name: data-analysis
 
 services:
@@ -42,6 +44,8 @@ services:
       # 看板业务日/业务月时区（IANA 名）：非法规启动失败（fail-closed）。
       # 看板、聚合、预警三个进程共用同一键，保证同一租户日界与月前缀一致。
       DASHBOARD_TIMEZONE: ${DASHBOARD_TIMEZONE:-Asia/Shanghai}
+      DASHBOARD_INTEGRATION_SYNC_ENABLED: ${DASHBOARD_INTEGRATION_SYNC_ENABLED:-true}
+      DASHBOARD_FINANCE_SOURCE: ${DASHBOARD_FINANCE_SOURCE:-integration}
       PLATFORM_BASE_URL: ${PLATFORM_BASE_URL}
       PLATFORM_AUDIT_CLIENT_ID: ${PLATFORM_AUDIT_CLIENT_ID}
       PLATFORM_AUDIT_CLIENT_SECRET: ${PLATFORM_AUDIT_CLIENT_SECRET}
@@ -67,8 +71,11 @@ services:
       # /internal/v1/contract-imports/report-status 端点不挂载（fail-closed）。
       # 合同侧 BASE_URL 必须是纯 origin，见 docs/report-status-endpoint.md。
       REPORT_STATUS_MACHINE_OAUTH_CLIENT_ID: ${REPORT_STATUS_MACHINE_OAUTH_CLIENT_ID:-}
-      METABASE_INTERNAL_URL: http://metabase:3000
-      METABASE_EMBEDDING_SECRET: ${METABASE_EMBEDDING_SECRET:?required}
+      # 原生分析模式可省嵌入凭据；启用时由 API 校验必需秘密与独立来源。
+      DASHBOARD_EMBED_ENABLED: ${DASHBOARD_EMBED_ENABLED:-true}
+      METABASE_INTERNAL_URL: ${METABASE_INTERNAL_URL:-http://metabase:3000}
+      METABASE_EMBEDDING_SECRET: ${METABASE_EMBEDDING_SECRET:-}
+      BI_EMBED_PUBLIC_ORIGIN: ${BI_EMBED_PUBLIC_ORIGIN:-}
       OIDC_CODEC_KEY: ${OIDC_CODEC_KEY:?required}
       OIDC_BACKCHANNEL_BASE_URL: ${OIDC_BACKCHANNEL_BASE_URL}
       OIDC_SESSION_IDLE_TTL: ${OIDC_SESSION_IDLE_TTL:-30m}
@@ -101,6 +108,7 @@ services:
       DASHBOARD_MYSQL_DSN: dashboard:${DASHBOARD_MYSQL_PASSWORD}@tcp(dashboard-mysql:3306)/dashboard_aggregation?parseTime=true&charset=utf8mb4
       # 财务快照业务日/商机转化月份按该时区归集（非法值启动失败）。
       DASHBOARD_TIMEZONE: ${DASHBOARD_TIMEZONE:-Asia/Shanghai}
+      DASHBOARD_INTEGRATION_SYNC_ENABLED: ${DASHBOARD_INTEGRATION_SYNC_ENABLED:-true}
       # 业务库只读 DSN 由 Secret 注入（设计方案 §5.4）
       CONTRACT_READ_DSN: ${CONTRACT_READ_DSN}
       CONTRACT_IMPORT_SYNC_ENABLED: ${CONTRACT_IMPORT_SYNC_ENABLED:-false}
@@ -143,6 +151,7 @@ services:
       DASHBOARD_MYSQL_DSN: dashboard:${DASHBOARD_MYSQL_PASSWORD}@tcp(dashboard-mysql:3306)/dashboard_aggregation?parseTime=true&charset=utf8mb4
       # 到期提醒窗口的“今天”按该时区折算（非法值启动失败），与看板 businessDate 同口径。
       DASHBOARD_TIMEZONE: ${DASHBOARD_TIMEZONE:-Asia/Shanghai}
+      DASHBOARD_INTEGRATION_SYNC_ENABLED: ${DASHBOARD_INTEGRATION_SYNC_ENABLED:-true}
       # 告警规则按租户隔离：cmd/alert-worker 在 OIDC_TENANT_ID 为空时拒绝启动
       # （fail-closed），故与 aggregation-worker 一样要求必填，避免本地/测试栈
       # 静默退化成“无租户”告警写入。

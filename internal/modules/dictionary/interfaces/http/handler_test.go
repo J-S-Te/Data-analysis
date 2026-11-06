@@ -50,7 +50,7 @@ func TestDictionaryPermissionChecks(t *testing.T) {
 }
 func TestToggleRequiresBoolean(t *testing.T) {
 	h := NewHandler(application.NewCatalogService())
-	manager := auth.Principal{UserID: "actor", TenantID: "tenant", Permissions: map[string]struct{}{"dictionary.manage": {}}}
+	manager := auth.Principal{UserID: "actor", TenantID: "tenant", ScopeMode: "TENANT", Permissions: map[string]struct{}{"dictionary.manage": {}}}
 	w := invoke(t, h.SetEnabled, &manager, `{"version":1}`)
 	if w.Code != 400 || !strings.Contains(w.Body.String(), "METRIC_PAYLOAD_INVALID") {
 		t.Fatalf("invalid toggle %d %s", w.Code, w.Body.String())
@@ -68,7 +68,7 @@ func TestStorageErrorDoesNotLeakSQL(t *testing.T) {
 
 func TestMutationRequiresVersion(t *testing.T) {
 	h := NewHandler(application.NewCatalogService())
-	p := auth.Principal{UserID: "actor", TenantID: "tenant", Permissions: map[string]struct{}{"dictionary.manage": {}}}
+	p := auth.Principal{UserID: "actor", TenantID: "tenant", ScopeMode: "TENANT", Permissions: map[string]struct{}{"dictionary.manage": {}}}
 	for _, tt := range []struct {
 		fn   gin.HandlerFunc
 		body string
@@ -76,6 +76,37 @@ func TestMutationRequiresVersion(t *testing.T) {
 		w := invoke(t, tt.fn, &p, tt.body)
 		if w.Code != 409 || !strings.Contains(w.Body.String(), "METRIC_VERSION_CONFLICT") {
 			t.Fatalf("version missing %d %s", w.Code, w.Body.String())
+		}
+	}
+}
+
+// TestDictionaryWritesRequireTenantScope 验证租户级字典写入只允许 TENANT 数据范围。
+// 参数：t为handler测试上下文。
+// 返回值：无；ORG/SELF 主体未被 403 拒绝或 TENANT 主体被范围门禁误拒时失败。
+func TestDictionaryWritesRequireTenantScope(t *testing.T) {
+	h := NewHandler(application.NewCatalogService())
+	for _, tt := range []struct {
+		name string
+		fn   gin.HandlerFunc
+		body string
+	}{
+		{"put-dictionary", h.Put, `[{"code":"custom.a","name":"n"}]`},
+		{"create-metric", h.Create, `{"code":"custom.a"}`},
+		{"update-metric", h.Update, `{"code":"custom.a","version":1}`},
+		{"toggle-metric", h.SetEnabled, `{"enabled":true,"version":1}`},
+		{"delete-metric", h.Delete, `{"version":1}`},
+	} {
+		for _, mode := range []string{"ORG", "SELF"} {
+			p := auth.Principal{UserID: "actor", TenantID: "tenant", ScopeMode: mode, Permissions: map[string]struct{}{"dictionary.manage": {}}}
+			w := invoke(t, tt.fn, &p, tt.body)
+			if w.Code != 403 || !strings.Contains(w.Body.String(), "TENANT_SCOPE_REQUIRED") {
+				t.Fatalf("%s scope=%s status=%d body=%s", tt.name, mode, w.Code, w.Body.String())
+			}
+		}
+		tenant := auth.Principal{UserID: "actor", TenantID: "tenant", ScopeMode: "TENANT", Permissions: map[string]struct{}{"dictionary.manage": {}}}
+		w := invoke(t, tt.fn, &tenant, tt.body)
+		if w.Code == 403 || strings.Contains(w.Body.String(), "TENANT_SCOPE_REQUIRED") {
+			t.Fatalf("%s TENANT scope rejected status=%d body=%s", tt.name, w.Code, w.Body.String())
 		}
 	}
 }
@@ -98,7 +129,7 @@ func TestHTTPPrincipalOwnsTenantAndActor(t *testing.T) {
 		}
 	}
 	h := NewHandler(application.NewCatalogService(db))
-	p := auth.Principal{UserID: "principal-actor", TenantID: "tenant-a", Permissions: map[string]struct{}{"dictionary.manage": {}, "dictionary.view": {}}}
+	p := auth.Principal{UserID: "principal-actor", TenantID: "tenant-a", ScopeMode: "TENANT", Permissions: map[string]struct{}{"dictionary.manage": {}, "dictionary.view": {}}}
 	body := `{"code":"custom.a","name":"tenant a name","dashboard":"dashboard","definition":"definition","formula":"description","source":"source","period":"month","status":"待确认","tenant_id":"tenant-b","actor_id":"forged"}`
 	w := invoke(t, h.Create, &p, body)
 	if w.Code != 200 {

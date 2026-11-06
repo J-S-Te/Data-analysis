@@ -21,29 +21,31 @@ type ProjectProjectionOptions struct {
 	MaxProjects, MaxBytes, MaxLineBytes int
 }
 type ProjectProjection struct {
-	Type              string    `json:"type" gorm:"-"`
-	TenantID          string    `json:"tenant_id" gorm:"column:tenant_id;primaryKey"`
-	SnapshotID        string    `json:"snapshot_id" gorm:"column:snapshot_id"`
-	ID                string    `json:"id" gorm:"column:project_id;primaryKey"`
-	Name              string    `json:"name"`
-	Customer          string    `json:"customer"`
-	CustomerID        string    `json:"customer_id"`
-	Contract          string    `json:"contract"`
-	ContractID        string    `json:"contract_id"`
-	Category          string    `json:"category"`
-	Team              string    `json:"team"`
-	Manager           string    `json:"manager"`
-	ManagerIdentityID string    `json:"manager_identity_id"`
-	OwnerOrgID        string    `json:"owner_org_id"`
-	OwnerIdentityID   string    `json:"owner_identity_id"`
-	Status            string    `json:"status"`
-	Progress          int       `json:"progress"`
-	Risk              bool      `json:"risk"`
-	InFlight          bool      `json:"in_flight"`
-	ServiceItems      int       `json:"service_items"`
-	CreatedAt         time.Time `json:"created_at" gorm:"autoCreateTime:false"`
-	UpdatedAt         time.Time `json:"updated_at" gorm:"autoUpdateTime:false"`
-	SourceUpdatedAt   time.Time `json:"source_updated_at"`
+	Type              string `json:"type" gorm:"-"`
+	TenantID          string `json:"tenant_id" gorm:"column:tenant_id;primaryKey"`
+	SnapshotID        string `json:"snapshot_id" gorm:"column:snapshot_id"`
+	ID                string `json:"id" gorm:"column:project_id;primaryKey"`
+	Name              string `json:"name"`
+	Customer          string `json:"customer"`
+	CustomerID        string `json:"customer_id"`
+	Contract          string `json:"contract"`
+	ContractID        string `json:"contract_id"`
+	Category          string `json:"category"`
+	Team              string `json:"team"`
+	Manager           string `json:"manager"`
+	ManagerIdentityID string `json:"manager_identity_id"`
+	OwnerOrgID        string `json:"owner_org_id"`
+	OwnerIdentityID   string `json:"owner_identity_id"`
+	Status            string `json:"status"`
+	// ReportStage 是 PM 派生的报告阶段（空串=未采集）；可选增量字段，旧 PM 不发。
+	ReportStage     string    `json:"report_stage" gorm:"column:report_stage;default:''"`
+	Progress        int       `json:"progress"`
+	Risk            bool      `json:"risk"`
+	InFlight        bool      `json:"in_flight"`
+	ServiceItems    int       `json:"service_items"`
+	CreatedAt       time.Time `json:"created_at" gorm:"autoCreateTime:false"`
+	UpdatedAt       time.Time `json:"updated_at" gorm:"autoUpdateTime:false"`
+	SourceUpdatedAt time.Time `json:"source_updated_at"`
 }
 
 func (ProjectProjection) TableName() string { return "dim_project" }
@@ -224,7 +226,7 @@ func (r *Runner) stageProjectProjection(ctx context.Context, a ProjectionAttempt
 	})
 }
 
-const projectInsertColumns = "tenant_id, snapshot_id, project_id, name, customer, customer_id, contract, contract_id, category, team, manager, manager_identity_id, owner_org_id, owner_identity_id, status, progress, risk, in_flight, service_items, created_at, updated_at, source_updated_at"
+const projectInsertColumns = "tenant_id, snapshot_id, project_id, name, customer, customer_id, contract, contract_id, category, team, manager, manager_identity_id, owner_org_id, owner_identity_id, status, report_stage, progress, risk, in_flight, service_items, created_at, updated_at, source_updated_at"
 
 func (r *Runner) publishProjectProjection(ctx context.Context, a ProjectionAttempt, s ProjectSnapshotSummary) error {
 	return r.aggregationWrite(ctx, func(tx *gorm.DB) error {

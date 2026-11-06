@@ -31,6 +31,9 @@ func (handler *Handler) TriggerAllSources(c *gin.Context) {
 		response.Error(c, apperror.ErrUnauthenticated)
 		return
 	}
+	if !requireTenantScope(c, principal) {
+		return
+	}
 	queued, skipped, err := handler.service.TriggerAllSources(c.Request.Context(), principal.TenantID)
 	if err != nil {
 		response.Error(c, apperror.Wrap(err, stdhttp.StatusInternalServerError, "SYNC_ALL_FAILED", "批量同步入队失败"))
@@ -48,6 +51,10 @@ func (handler *Handler) DeleteAlertRule(c *gin.Context, id string) {
 	}
 	if !principal.HasPermission("alert.manage") {
 		response.Error(c, apperror.New(stdhttp.StatusForbidden, "FORBIDDEN", "没有预警规则管理权限"))
+		return
+	}
+	// 删除与保存同为租户级配置写入：ORG/SELF 等更窄数据范围不得删除全租户规则。
+	if !requireTenantScope(c, principal) {
 		return
 	}
 	if err := handler.service.DeleteAlertRule(c.Request.Context(), principal.TenantID, id); err != nil {
@@ -82,7 +89,15 @@ func (handler *Handler) ListSources(c *gin.Context) {
 
 // TriggerSource 将手工同步请求写入队列。
 func (handler *Handler) TriggerSource(c *gin.Context, id string) {
-	job, err := handler.service.TriggerSource(c.Request.Context(), tenantID(c), id)
+	principal, ok := auth.FromContext(c.Request.Context())
+	if !ok {
+		response.Error(c, apperror.ErrUnauthenticated)
+		return
+	}
+	if !requireTenantScope(c, principal) {
+		return
+	}
+	job, err := handler.service.TriggerSource(c.Request.Context(), principal.TenantID, id)
 	if err != nil {
 		switch {
 		case errors.Is(err, application.ErrSourceNotFound):
@@ -120,6 +135,9 @@ func (handler *Handler) PutAlertRules(c *gin.Context) {
 	}
 	if !principal.HasPermission("alert.manage") {
 		response.Error(c, apperror.New(stdhttp.StatusForbidden, "FORBIDDEN", "没有预警规则管理权限"))
+		return
+	}
+	if !requireTenantScope(c, principal) {
 		return
 	}
 	var input []alertRuleRequest
@@ -167,4 +185,16 @@ func alertRulesFromRequest(input []alertRuleRequest) []domain.AlertRule {
 func tenantID(c *gin.Context) string {
 	principal, _ := auth.FromContext(c.Request.Context())
 	return principal.TenantID
+}
+
+// requireTenantScope 校验租户级配置写入必须绑定全租户数据范围。
+// 参数：c 为已认证请求上下文，principal 为服务端复核后的可信主体。
+// 返回值：TENANT 范围返回真；ORG/SELF 等更窄范围返回 403 并停止请求。
+// 口径与 standardfacts 的全租户管理门禁一致（ScopeMode == "TENANT"）。
+func requireTenantScope(c *gin.Context, principal auth.Principal) bool {
+	if principal.HasTenantScope() {
+		return true
+	}
+	response.Error(c, apperror.New(stdhttp.StatusForbidden, "TENANT_SCOPE_REQUIRED", "租户级配置仅允许具有全租户数据范围的管理员操作"))
+	return false
 }

@@ -39,11 +39,62 @@ func (o ProjectProjectionOptions) normalized() (ProjectProjectionOptions, error)
 
 var projectHeaderFields = strings.Fields("type schema_version tenant_id snapshot_id source_snapshot_at")
 var projectRowFields = strings.Fields("type tenant_id snapshot_id id name customer customer_id contract contract_id category team manager manager_identity_id owner_org_id owner_identity_id status progress risk in_flight service_items created_at updated_at source_updated_at")
+
+// projectOptionalRowFields 是允许出现在 project 行、但不要求出现的字段。
+// 旧 PM 不发这些键时按“未采集”落空串；新 PM 发出时逐个校验。
+var projectOptionalRowFields = strings.Fields("report_stage")
+
 var projectEndFields = strings.Fields("type schema_version tenant_id snapshot_id total checksum_sha256")
 
+// projectReportStages 是 PM 派生报告阶段的封闭词表。
+// 空串表示“未进入报告段/不可判定”，与“无整改”以外的未知码一律拒绝。
+var projectReportStages = map[string]bool{
+	"": true, "NONE": true, "RECTIFYING": true, "COMPILING": true,
+	"REVIEWED": true, "ISSUED": true, "ARCHIVED": true,
+}
+
+// validProjectReportStage 校验报告阶段取值：只接受封闭词表内的精确值，
+// 因此前后空格、大小写变体、超长字符串都会被拒绝（fail-closed）。
+func validProjectReportStage(value string) bool {
+	return utf8.ValidString(value) && utf8.RuneCountInString(value) <= 32 && projectReportStages[value]
+}
+
+// validateProjectReportStage 校验原始 JSON 片段必须是字符串且为合法阶段码。
+// 缺失的键不调用本函数：旧 PM 没有该字段是合法输入。
+func validateProjectReportStage(raw json.RawMessage) error {
+	var value string
+	if e := json.Unmarshal(raw, &value); e != nil {
+		return errors.New("invalid project report stage")
+	}
+	if !validProjectReportStage(value) {
+		return errors.New("invalid project report stage")
+	}
+	return nil
+}
+
+// projectFieldSet 在初始化期把字段名固化成集合，逐行解析不再重复分配。
+func projectFieldSet(required, optional []string) map[string]bool {
+	allowed := make(map[string]bool, len(required)+len(optional))
+	for _, key := range required {
+		allowed[key] = true
+	}
+	for _, key := range optional {
+		allowed[key] = true
+	}
+	return allowed
+}
+
+var (
+	projectHeaderAllowed = projectFieldSet(projectHeaderFields, nil)
+	projectRowAllowed    = projectFieldSet(projectRowFields, projectOptionalRowFields)
+	projectEndAllowed    = projectFieldSet(projectEndFields, nil)
+)
+
 // Decode an exact object, rejecting duplicate, missing, null and unknown fields.
+// Optional fields may be absent but are still validated when present, so the
+// contract stays “required 23 fields + at most one optional field”.
 // encoding/json alone accepts duplicate keys and replaces invalid UTF-8.
-func projectObject(raw []byte, fields []string, out any) (map[string]json.RawMessage, error) {
+func projectObject(raw []byte, fields []string, allowed map[string]bool, out any) (map[string]json.RawMessage, error) {
 	if !utf8.Valid(raw) {
 		return nil, errors.New("invalid project snapshot UTF-8")
 	}
@@ -65,6 +116,9 @@ func projectObject(raw []byte, fields []string, out any) (map[string]json.RawMes
 		if _, ok = values[key]; ok {
 			return nil, errors.New("duplicate project snapshot field")
 		}
+		if !allowed[key] {
+			return nil, errors.New("unexpected project snapshot fields")
+		}
 		var value json.RawMessage
 		if e = d.Decode(&value); e != nil {
 			return nil, e
@@ -80,7 +134,7 @@ func projectObject(raw []byte, fields []string, out any) (map[string]json.RawMes
 	if _, e = d.Token(); e != io.EOF {
 		return nil, errors.New("extra JSON value")
 	}
-	if len(values) != len(fields) {
+	if len(values) < len(fields) || len(values) > len(allowed) {
 		return nil, errors.New("unexpected project snapshot fields")
 	}
 	for _, key := range fields {
@@ -127,6 +181,10 @@ func validateProjectRow(p ProjectProjection) error {
 	}
 	if p.Status == "" || p.Progress < 0 || p.Progress > 100 || p.ServiceItems < 0 || p.ServiceItems > maxProjectServiceItems {
 		return errors.New("invalid project metrics")
+	}
+	// report_stage 是可选增量维度：空串=未采集，其余只接受封闭词表内的精确码。
+	if !validProjectReportStage(p.ReportStage) {
+		return errors.New("invalid project report stage")
 	}
 	for _, at := range []time.Time{p.CreatedAt, p.UpdatedAt, p.SourceUpdatedAt} {
 		if _, offset := at.Zone(); offset != 0 {
@@ -189,7 +247,7 @@ func readProjectSnapshot(ctx context.Context, reader io.Reader, expectedTenant s
 		SnapshotID       string    `json:"snapshot_id"`
 		SourceSnapshotAt time.Time `json:"source_snapshot_at"`
 	}
-	fields, e := projectObject(raw, projectHeaderFields, &header)
+	fields, e := projectObject(raw, projectHeaderFields, projectHeaderAllowed, &header)
 	if e != nil {
 		return fail(e)
 	}
@@ -235,7 +293,7 @@ func readProjectSnapshot(ctx context.Context, reader io.Reader, expectedTenant s
 				Total          int    `json:"total"`
 				ChecksumSHA256 string `json:"checksum_sha256"`
 			}
-			if _, e = projectObject(raw, projectEndFields, &end); e != nil {
+			if _, e = projectObject(raw, projectEndFields, projectEndAllowed, &end); e != nil {
 				return fail(e)
 			}
 			checksum := hex.EncodeToString(hash.Sum(nil))
@@ -261,9 +319,14 @@ func readProjectSnapshot(ctx context.Context, reader io.Reader, expectedTenant s
 			return summary, nil
 		}
 		var p ProjectProjection
-		fields, e = projectObject(raw, projectRowFields, &p)
+		fields, e = projectObject(raw, projectRowFields, projectRowAllowed, &p)
 		if e != nil {
 			return fail(e)
+		}
+		if rawStage, ok := fields["report_stage"]; ok {
+			if e = validateProjectReportStage(rawStage); e != nil {
+				return fail(e)
+			}
 		}
 		for _, key := range []string{"created_at", "updated_at", "source_updated_at"} {
 			if _, e = projectUTCTime(fields[key]); e != nil {

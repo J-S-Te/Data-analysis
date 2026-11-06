@@ -185,5 +185,44 @@ func TestProjectProjectionRealMySQLPublicationAndFencing(t *testing.T) {
 	if projectCount(t, r, r.tenantID) != 0 || projectCount(t, r, "qa-foreign") != 1 || projectState(t, r).PublishedTotal != 0 {
 		t.Fatal("verified empty cleared foreign tenant or lacks success")
 	}
+	// 报告阶段经 stage 的 INSERT 与 stage→dim 的 INSERT ... SELECT 原样搬运，
+	// 旧行（无字段）落空串；真实 MySQL 上确认列清单不缺 report_stage。
+	attempt, e = r.beginProjectProjection(ctx)
+	if e != nil {
+		t.Fatal(e)
+	}
+	summary, e = readProjectSnapshot(ctx, bytes.NewReader(projectFixtureWithReportStage(t)), r.tenantID, ProjectProjectionOptions{}, projectAttemptSink{r, attempt})
+	if e != nil {
+		t.Fatal(e)
+	}
+	var staged []struct {
+		ProjectID, ReportStage string
+	}
+	if e = db.Table("project_projection_stage").Select("project_id, report_stage").Where("tenant_id=? AND run_id=?", r.tenantID, attempt.RunID).Order("project_id").Scan(&staged).Error; e != nil {
+		t.Fatal(e)
+	}
+	if len(staged) != 2 || staged[0].ProjectID != "P-001" || staged[0].ReportStage != "RECTIFYING" || staged[1].ReportStage != "" {
+		t.Fatalf("real staged report_stage = %+v", staged)
+	}
+	if e = r.publishProjectProjection(ctx, attempt, summary); e != nil {
+		t.Fatal(e)
+	}
+	var published []struct {
+		ProjectID, ReportStage string
+	}
+	if e = db.Table("dim_project").Select("project_id, report_stage").Where("tenant_id=?", r.tenantID).Order("project_id").Scan(&published).Error; e != nil {
+		t.Fatal(e)
+	}
+	if len(published) != 2 || published[0].ReportStage != "RECTIFYING" || published[1].ReportStage != "" {
+		t.Fatalf("real published report_stage = %+v", published)
+	}
+	importProject(t, r, projectFixture(t))
+	var legacyStages []string
+	if e = db.Table("dim_project").Select("report_stage").Where("tenant_id=?", r.tenantID).Order("project_id").Scan(&legacyStages).Error; e != nil {
+		t.Fatal(e)
+	}
+	if len(legacyStages) != 2 || legacyStages[0] != "" || legacyStages[1] != "" {
+		t.Fatalf("real legacy report_stage = %v, want empty", legacyStages)
+	}
 	t.Log("real migrations, invisible staging, atomic replacement/rollback, generation/license/queue fencing and tenant-scoped verified empty passed")
 }

@@ -35,7 +35,7 @@ func freshnessTestDB(t *testing.T) *gorm.DB {
 			amount_minor INTEGER, currency TEXT, end_date DATE, start_date DATE,
 			owner_org_id TEXT, updated_at DATETIME)`,
 		`CREATE TABLE dim_project (
-			tenant_id TEXT, project_id TEXT, status TEXT, health TEXT,
+			tenant_id TEXT, project_id TEXT, status TEXT, report_stage TEXT NOT NULL DEFAULT '', health TEXT,
 			owner_org_id TEXT, snapshot_id TEXT, risk BOOLEAN, in_flight BOOLEAN, service_items INTEGER, source_updated_at DATETIME, created_at DATETIME, updated_at DATETIME)`,
 		`CREATE TABLE sync_source (
 			id TEXT, tenant_id TEXT, subsystem_code TEXT, db_schema TEXT, enabled BOOLEAN,
@@ -45,7 +45,7 @@ func freshnessTestDB(t *testing.T) *gorm.DB {
 			total_contracts INTEGER, approval_contracts INTEGER, active_contracts INTEGER, expired_contracts INTEGER)`,
 		`CREATE TABLE api_project_dashboard (
 			tenant_id TEXT, snapshot_at TEXT, project_count INTEGER, in_flight_projects INTEGER,
-			risk_projects INTEGER, service_items INTEGER, status_counts_json TEXT)`,
+			risk_projects INTEGER, service_items INTEGER, status_counts_json TEXT, report_stage_counts_json TEXT)`,
 		`CREATE TABLE fct_opportunity_conversion (
 			tenant_id TEXT, opportunity_count INTEGER, won_contract_count INTEGER)`,
 	} {

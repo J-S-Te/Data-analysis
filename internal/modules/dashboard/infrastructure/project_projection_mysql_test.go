@@ -119,3 +119,62 @@ func TestProjectProjectionConsumerRealMySQLConsistentRead(t *testing.T) {
 	}
 	t.Log("real read-only RR consumer retained old marker+rows across concurrent publication; next read observed new marker+rows")
 }
+
+// TestTenantProjectReportStageCountsRealMySQL 在真实 MySQL JSON 列上固定 TENANT
+// 读路径的两态：SQL NULL=未采集（nil），JSON=已采集（含空对象）。MySQL 会拒绝
+// 非法 JSON，非法文本的解析失败断言在 sqlite 用例中覆盖。
+func TestTenantProjectReportStageCountsRealMySQL(t *testing.T) {
+	file := os.Getenv("UIP_BI_PROJECTION_TEST_DSN_FILE")
+	if file == "" {
+		t.Skip("explicit isolated private DSN file required")
+	}
+	info, err := os.Lstat(file)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
+		t.Fatal("private regular DSN file required")
+	}
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal("read private DSN")
+	}
+	cfg, err := driver.ParseDSN(strings.TrimSpace(string(raw)))
+	if err != nil || !strings.HasSuffix(cfg.DBName, "_test") || cfg.Net != "tcp" || !strings.HasPrefix(cfg.Addr, "127.0.0.1:") {
+		t.Fatal("isolated loopback _test schema required")
+	}
+	db, err := gorm.Open(mysql.Open(cfg.FormatDSN()), &gorm.Config{Logger: logger.Discard})
+	if err != nil {
+		t.Fatal("open isolated MySQL")
+	}
+	pool, _ := db.DB()
+	t.Cleanup(func() { pool.Close() })
+	tenant := fmt.Sprintf("qa-report-stage-%d", time.Now().UnixNano())
+	if err = db.Exec("DELETE FROM api_project_dashboard WHERE tenant_id=?", tenant).Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Exec("DELETE FROM api_project_dashboard WHERE tenant_id=?", tenant).Error })
+	ctx := auth.WithPrincipal(context.Background(), auth.Principal{TenantID: tenant, UserID: "qa-boss", ScopeMode: "TENANT"})
+	repo := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t))
+	// 旧快照（NULL）先写入，最新快照带 JSON，TENANT 路径只读最新一行。
+	if err = db.Exec(`INSERT INTO api_project_dashboard (tenant_id, snapshot_at, project_count, status_counts_json, report_stage_counts_json)
+		VALUES (?, UTC_TIMESTAMP(3) - INTERVAL 1 HOUR, 1, '{}', NULL)`, tenant).Error; err != nil {
+		t.Fatal(err)
+	}
+	legacy, available, err := repo.LatestProject(ctx, tenant)
+	if err != nil || !available || legacy.ReportStageCounts != nil {
+		t.Fatalf("legacy snapshot = %+v available=%v err=%v, want nil report stage counts", legacy, available, err)
+	}
+	if err = db.Exec(`INSERT INTO api_project_dashboard (tenant_id, snapshot_at, project_count, status_counts_json, report_stage_counts_json)
+		VALUES (?, UTC_TIMESTAMP(3), 2, '{"待实施":2}', '{"RECTIFYING":1,"":1}')`, tenant).Error; err != nil {
+		t.Fatal(err)
+	}
+	fresh, available, err := repo.LatestProject(ctx, tenant)
+	if err != nil || !available || fresh.ReportStageCounts["RECTIFYING"] != 1 || fresh.ReportStageCounts[""] != 1 || len(fresh.ReportStageCounts) != 2 {
+		t.Fatalf("fresh snapshot = %+v available=%v err=%v", fresh, available, err)
+	}
+	if err = db.Exec(`UPDATE api_project_dashboard SET report_stage_counts_json='{}' WHERE tenant_id=? AND snapshot_at > UTC_TIMESTAMP(3) - INTERVAL 1 MINUTE`, tenant).Error; err != nil {
+		t.Fatal(err)
+	}
+	collected, available, err := repo.LatestProject(ctx, tenant)
+	if err != nil || !available || collected.ReportStageCounts == nil || len(collected.ReportStageCounts) != 0 {
+		t.Fatalf("collected empty snapshot = %+v available=%v err=%v, want empty non-nil map", collected, available, err)
+	}
+}

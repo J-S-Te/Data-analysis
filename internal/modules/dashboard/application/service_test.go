@@ -88,3 +88,38 @@ func TestTrendReturnsEmptyArrayWhenNoData(t *testing.T) {
 		t.Fatalf("points = %d，want 0", len(points))
 	}
 }
+
+// TestProjectKeepsReportStageCountsNilSemantics 固定“未采集”与“已采集且无分桶”的
+// 应用层差异：服务层不得把 nil 归一成空映射，也不得丢掉仓储给出的分桶。
+func TestProjectKeepsReportStageCountsNilSemantics(t *testing.T) {
+	notCollected, err := NewService(snapshotRepositoryStub{projectAvailable: true}).Project(context.Background(), "tenant-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notCollected.StatusCounts == nil {
+		t.Fatal("status counts must keep its existing non-nil contract")
+	}
+	if notCollected.ReportStageCounts != nil {
+		t.Fatalf("uncollected report stage counts = %v, want nil", notCollected.ReportStageCounts)
+	}
+	collected, err := NewService(snapshotRepositoryStub{
+		project:          domain.ProjectSnapshot{ReportStageCounts: map[string]int{}},
+		projectAvailable: true,
+	}).Project(context.Background(), "tenant-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected.ReportStageCounts == nil || len(collected.ReportStageCounts) != 0 {
+		t.Fatalf("collected report stage counts = %#v, want empty map", collected.ReportStageCounts)
+	}
+	withValues, err := NewService(snapshotRepositoryStub{
+		project:          domain.ProjectSnapshot{ReportStageCounts: map[string]int{"RECTIFYING": 2}},
+		projectAvailable: true,
+	}).Project(context.Background(), "tenant-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withValues.ReportStageCounts["RECTIFYING"] != 2 {
+		t.Fatalf("report stage counts = %v", withValues.ReportStageCounts)
+	}
+}

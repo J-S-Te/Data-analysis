@@ -2,6 +2,7 @@ package domain
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -20,7 +21,42 @@ func TestSnapshotJSONUsesAPIFieldNames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal project snapshot: %v", err)
 	}
-	if got := string(project); got != `{"available":true,"tenant_id":"","snapshot_at":"","freshness":{"source_updated_at":"","synced_at":"","computed_at":"","sync_status":"","stale":false,"stale_reason":""},"project_count":3,"in_flight_projects":0,"risk_projects":0,"service_items":0,"status_counts":{"ACTIVE":3}}` {
+	if got := string(project); got != `{"available":true,"tenant_id":"","snapshot_at":"","freshness":{"source_updated_at":"","synced_at":"","computed_at":"","sync_status":"","stale":false,"stale_reason":""},"project_count":3,"in_flight_projects":0,"risk_projects":0,"service_items":0,"status_counts":{"ACTIVE":3},"report_stage_counts":null}` {
 		t.Fatalf("unexpected project JSON: %s", got)
+	}
+}
+
+// TestProjectSnapshotReportStageCountsDistinguishesNotCollected 固定“未采集”与
+// “已采集且无分桶”的序列化差异：nil 必须是 null，空映射必须是 {}，否则调用方
+// 无法区分“旧数据未采集”和“0 个整改中”。
+func TestProjectSnapshotReportStageCountsDistinguishesNotCollected(t *testing.T) {
+	notCollected, err := json.Marshal(ProjectSnapshot{StatusCounts: map[string]int{}})
+	if err != nil {
+		t.Fatalf("marshal project snapshot: %v", err)
+	}
+	if !strings.Contains(string(notCollected), `"report_stage_counts":null`) {
+		t.Fatalf("uncollected counts JSON: %s", notCollected)
+	}
+	collected, err := json.Marshal(ProjectSnapshot{
+		StatusCounts:      map[string]int{},
+		ReportStageCounts: map[string]int{},
+	})
+	if err != nil {
+		t.Fatalf("marshal project snapshot: %v", err)
+	}
+	if !strings.Contains(string(collected), `"report_stage_counts":{}`) {
+		t.Fatalf("collected empty counts JSON: %s", collected)
+	}
+	withValues, err := json.Marshal(ProjectSnapshot{
+		StatusCounts:      map[string]int{},
+		ReportStageCounts: map[string]int{"RECTIFYING": 2, "": 1},
+	})
+	if err != nil {
+		t.Fatalf("marshal project snapshot: %v", err)
+	}
+	for _, fragment := range []string{`"report_stage_counts":{`, `"RECTIFYING":2`, `"":1`} {
+		if !strings.Contains(string(withValues), fragment) {
+			t.Fatalf("counts JSON %s missing %s", withValues, fragment)
+		}
 	}
 }

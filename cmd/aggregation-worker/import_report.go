@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/aggregation"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/integrationsync"
 )
 
 type importReportOptions struct {
@@ -21,6 +22,10 @@ type importReportOptions struct {
 // 返回值：已校验的配置；启用时缺少独立用途凭据或完整URL返回错误。
 func importReportOptionsFromEnv() (importReportOptions, error) {
 	o := importReportOptions{}
+	enabled, err := integrationsync.EnabledFromEnv(os.Getenv)
+	if err != nil || !enabled {
+		return o, err
+	}
 	if raw := os.Getenv("CONTRACT_IMPORT_SYNC_ENABLED"); raw != "" {
 		enabled, err := strconv.ParseBool(raw)
 		if err != nil {
