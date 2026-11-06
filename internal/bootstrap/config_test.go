@@ -141,3 +141,29 @@ func TestLoadConfigDashboardEmbedEnabled(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadConfigMetricsAccessToken 验证 /metrics 抓取令牌从 METRICS_ACCESS_TOKEN 读取，
+// 空白值等价于“未配置”（只允许回环抓取），不允许空白字符串冒充令牌。
+// 参数：t 为测试上下文。
+// 返回值：无。
+func TestLoadConfigMetricsAccessToken(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want string
+	}{
+		{raw: "", want: ""},
+		{raw: "  ", want: ""},
+		{raw: "scrape-token", want: "scrape-token"},
+		{raw: "  scrape-token  ", want: "scrape-token"},
+	} {
+		t.Setenv("OIDC_CODEC_KEY", testCodecKeyHex)
+		t.Setenv("METRICS_ACCESS_TOKEN", tc.raw)
+		config, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig() error = %v (METRICS_ACCESS_TOKEN=%q)", err, tc.raw)
+		}
+		if config.MetricsAccessToken != tc.want {
+			t.Fatalf("MetricsAccessToken = %q, want %q (METRICS_ACCESS_TOKEN=%q)", config.MetricsAccessToken, tc.want, tc.raw)
+		}
+	}
+}

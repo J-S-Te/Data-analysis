@@ -19,6 +19,7 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/alertworker"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/integrationsync"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/shutdown"
 )
 
 // main 启动受许可保护的本地聚合告警评估，不装配外部业务数据源。
@@ -30,6 +31,12 @@ func main() {
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// B2：关闭预算在启动期解析，非法值失败关闭（不静默退回默认值）。
+	drainBudget, err := shutdown.BudgetFromEnv(os.Getenv)
+	if err != nil {
+		logger.Error("alert-worker shutdown budget invalid", "error", err)
+		os.Exit(1)
+	}
 	if _, err := integrationsync.EnabledFromEnv(os.Getenv); err != nil {
 		logger.Error("integration sync configuration invalid", "error", err)
 		os.Exit(1)
@@ -98,7 +105,17 @@ func main() {
 		logger.Info("alert evaluation completed", "processed", count)
 		return
 	}
-	if err := alertworker.RunLoop(ctx, *interval, worker, logger); err != nil {
+	// 长驻路径：单循环放进可 join 的后台组件，收到信号后最多等预算时间，
+	// 超预算点名并非零退出（在途规则评估可能仍在写 alert_item）。
+	group := shutdown.New()
+	result := group.Run("alert-worker-loop", func() error {
+		return alertworker.RunLoop(ctx, *interval, worker, logger)
+	})
+	if err := group.Join(drainBudget); err != nil {
+		logger.Error("alert-worker shutdown incomplete", "error", err)
+		os.Exit(1)
+	}
+	if err := <-result; err != nil {
 		logger.Error("alert-worker stopped with error", "error", err)
 		os.Exit(1)
 	}

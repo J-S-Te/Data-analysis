@@ -13,12 +13,19 @@ import (
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/bootstrap"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/platformcatalog"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/shutdown"
 )
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
+	// B2：关闭预算在启动期解析，非法值失败关闭，避免配置错误静默退回默认值。
+	drainBudget, err := shutdown.BudgetFromEnv(os.Getenv)
+	if err != nil {
+		logger.Error("data-analysis shutdown budget invalid", "error", err)
+		os.Exit(1)
+	}
 	config, err := bootstrap.LoadConfig()
 	if err != nil {
 		logger.Error("data-analysis configuration failed", "error", err)
@@ -50,19 +57,43 @@ func main() {
 		os.Exit(1)
 	}
 	defer app.StopLicense()
-	go func() {
+	// HTTP 服务与 bootstrap 里的后台循环（事务内审计 outbox 投递）同属一个 join 集合：
+	// 收到 SIGTERM 后先 Shutdown 停止接新请求，再在统一预算内等两者退出。
+	serverResult := app.Background.Run("http-server", func() error {
 		logger.Info("dashboard-api listening", "addr", config.ListenAddr)
 		if err := app.Server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("dashboard-api server failed", "error", err)
-			os.Exit(1)
+			return err
 		}
-	}()
+		return nil
+	})
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = app.Server.Shutdown(ctx)
+	select {
+	case <-stop:
+	case serveErr := <-serverResult:
+		// 服务自行停止（外部关闭或监听失败）：监听失败仍按非零退出，其余走统一收尾。
+		if serveErr != nil {
+			logger.Error("dashboard-api server failed", "error", serveErr)
+			os.Exit(1)
+		}
+	}
+
+	// 单次预算同时约束 HTTP 排空与后台 join，避免两段串行把总时长放大到 2×budget。
+	deadline := time.Now().Add(drainBudget)
+	ctx, cancel := context.WithTimeout(context.Background(), drainBudget)
+	if err := app.Server.Shutdown(ctx); err != nil {
+		// 排空失败不改变退出码判断口径：是否“有组件没退出”由下面的 join 点名。
+		logger.Error("dashboard-api http shutdown incomplete", "error", err)
+	}
+	cancel()
+	if app.StopBackground != nil {
+		app.StopBackground()
+	}
+	if err := app.Background.Join(time.Until(deadline)); err != nil {
+		// 超预算必须点名未退出的组件并非零退出：不能把“投递循环还在跑”伪装成正常关闭。
+		logger.Error("dashboard-api shutdown incomplete", "error", err)
+		os.Exit(1)
+	}
 	logger.Info("dashboard-api stopped")
 }

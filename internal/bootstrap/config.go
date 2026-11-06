@@ -50,6 +50,9 @@ type Config struct {
 	AuditEnvironmentCode string
 	AuditWorkerID        string
 	AuditRequired        bool
+	// MetricsAccessToken 保护 /metrics（SEC-B4）：设置后抓取端必须携带
+	// Authorization: Bearer <token>；为空时只允许回环抓取（非回环 403，fail-closed）。
+	MetricsAccessToken string
 	// TrustedProxies 是唯一允许采信 X-Real-IP / X-Forwarded-For 的直接对端集合。
 	TrustedProxies []string
 
@@ -182,6 +185,7 @@ func LoadConfig() (Config, error) {
 		AuditWorkerID:        envOr("AUDIT_WORKER_ID", "dashboard-api"),
 		TrustedProxies:       commaList(envOr("APP_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")),
 		AuditRequired:        auditRequiredFromEnvironment(),
+		MetricsAccessToken:   strings.TrimSpace(os.Getenv("METRICS_ACCESS_TOKEN")),
 
 		IntegrationSyncEnabled:  integrationSyncEnabled,
 		DashboardEmbedEnabled:   embedEnabled,

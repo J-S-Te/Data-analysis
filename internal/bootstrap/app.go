@@ -15,6 +15,7 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/importreport"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/metrics"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/middleware"
 	adminapplication "github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin/application"
 	admininfrastructure "github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin/infrastructure"
@@ -32,6 +33,7 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/platformcatalog"
 	central "github.com/unified-identity-auth-platform/data-analysis/internal/sessiongovernance"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/response"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/shutdown"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/standardfacts"
 )
 
@@ -42,6 +44,11 @@ type App struct {
 	DB          *gorm.DB
 	Router      *gin.Engine
 	Server      *http.Server
+	// Background 收集随进程退出的后台循环（事务内审计 outbox 投递等）；
+	// dashboard-api 关闭时必须先 StopBackground 再 Background.Join，不能直接退进程。
+	Background *shutdown.Group
+	// StopBackground 取消 Background 中后台循环的运行上下文；nil 表示没有后台循环。
+	StopBackground context.CancelFunc
 }
 
 // New 使用给定 Config 创建数据库连接、OIDC 服务、嵌入桥和 API 路由，返回可运行的 App。
@@ -58,10 +65,15 @@ func New(config Config) (*App, error) {
 		return nil, err
 	}
 	licenseContext, stopLicense := context.WithCancel(context.Background())
+	// 后台循环使用独立可取消上下文：进程收到 SIGTERM 时必须能取消 outbox 投递，
+	// 否则 dashboard-api 只剩 HTTP Shutdown 有界，投递 goroutine 会在退出瞬间被硬杀。
+	backgroundContext, stopBackground := context.WithCancel(context.Background())
+	background := shutdown.New()
 	initialized := false
 	defer func() {
 		if !initialized {
 			stopLicense()
+			stopBackground()
 		}
 	}()
 	licenseCheck, err := commercial.Start(licenseContext)
@@ -87,14 +99,19 @@ func New(config Config) (*App, error) {
 		return nil, err
 	}
 	auditReporter := platformaudit.NewReporter(config.PlatformBaseURL, config.AuditClientID, config.AuditClientSecret, config.AuditApplicationCode, config.AuditEnvironmentCode)
+	// outbox store 同时服务投递循环与 /metrics 计数：两者必须读同一张表、同一租约口径。
+	auditStore := &auditoutbox.GORMStore{DB: db, Lease: 2 * time.Minute, MaxTries: 20}
 	// 批次 2：事务内审计 outbox 的投递循环；平台不可用时事件留在本地重试。
 	if auditReporter != nil {
 		auditDispatcher := &auditoutbox.Dispatcher{
-			Store:    &auditoutbox.GORMStore{DB: db, Lease: 2 * time.Minute, MaxTries: 20},
+			Store:    auditStore,
 			Reporter: auditReporter, WorkerID: "data-analysis-api-audit", Poll: 2 * time.Second,
 			BatchSize: 50, MaxAttempts: 20, MaxBackoff: 5 * time.Minute, Logger: slog.Default(),
 		}
-		go auditDispatcher.Run(ctx)
+		background.Run("audit-outbox-dispatcher", func() error {
+			auditDispatcher.Run(backgroundContext)
+			return nil
+		})
 	}
 	var centralClient central.Client
 	if config.CentralSessionEnabled {
@@ -133,6 +150,11 @@ func New(config Config) (*App, error) {
 
 	router := gin.New()
 	router.Use(middleware.RequestID(), gin.Recovery())
+	// C2：/metrics 固定挂在服务根路径，由 MetricsAccess 口径保护（token 或回环），
+	// 不参与会话鉴权、不写审计、不随 APP_PATH_PREFIX 变化。
+	mountMetrics(router, config.MetricsAccessToken, &metrics.Handler{
+		Outbox: auditStore, StartedAt: time.Now(), Logger: slog.Default(),
+	})
 	base := router.Group(strings.TrimRight(config.PathPrefix, "/"))
 	if reportVerifier != nil {
 		status := importreport.StatusHandler(db, reportVerifier, func(ctx context.Context) error { return licenseCheck.Allow(ctx, commercial.ReadHistory) })
@@ -236,7 +258,21 @@ func New(config Config) (*App, error) {
 
 	server := newHTTPServer(config.ListenAddr, router)
 	initialized = true
-	return &App{Config: config, DB: db, Router: router, Server: server, StopLicense: stopLicense}, nil
+	return &App{
+		Config: config, DB: db, Router: router, Server: server, StopLicense: stopLicense,
+		Background: background, StopBackground: stopBackground,
+	}, nil
+}
+
+// mountMetrics 在多路由根路径挂载只读指标端点。
+// 参数：router 为根路由；accessToken 为 METRICS_ACCESS_TOKEN（空表示仅回环）；handler 为指标渲染器。
+// 返回值：无。只保留一个权威挂载点：Prometheus 抓取地址是部署契约，
+// 再挂一份 APP_PATH_PREFIX 副本会让同一指标出现两个地址，并与接入网关的前缀规则漂移。
+func mountMetrics(router *gin.Engine, accessToken string, handler *metrics.Handler) {
+	if router == nil || handler == nil {
+		return
+	}
+	router.GET(metrics.Path, metrics.RequireAccess(accessToken), handler.Handle)
 }
 
 // InternalReportStatusPath 是合同导入报表状态机器接口的权威调用路径。
