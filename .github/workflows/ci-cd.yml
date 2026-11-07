@@ -23,6 +23,8 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       - run: sh scripts/license-core-sync.sh --check
+      - name: Verify session governance copies
+        run: sh scripts/check-session-governance-sha256.sh
       - run: go test ./...
       - run: go vet ./...
       - run: python3 scripts/test-deploy-path.py
