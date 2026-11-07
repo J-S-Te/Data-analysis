@@ -82,6 +82,13 @@ services:
       OIDC_SESSION_ABSOLUTE_TTL: ${OIDC_SESSION_ABSOLUTE_TTL:-8h}
       APP_PATH_PREFIX: ${APP_PATH_PREFIX}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      # /metrics 抓取令牌（SEC-B4）：为空时只允许回环抓取，非回环 403（fail-closed）。
+      METRICS_ACCESS_TOKEN: ${METRICS_ACCESS_TOKEN:-}
+      # 关闭预算（秒）：SIGTERM 后等待 HTTP 排空与后台循环退出的上限，默认 20s。
+      DATA_ANALYSIS_SHUTDOWN_DRAIN_SECONDS: ${DATA_ANALYSIS_SHUTDOWN_DRAIN_SECONDS:-}
+    # docker 默认 stop 宽限是 10s，小于默认 20s 预算：留 5s 余量，
+    # 否则编排层会在 join 结束前 SIGKILL，B2 的有界 join 变成空转。
+    stop_grace_period: 25s
     depends_on:
       dashboard-migrate:
         condition: service_completed_successfully
@@ -135,6 +142,10 @@ services:
       PROJECT_PROJECTION_URL: ${PROJECT_PROJECTION_URL:-http://project-api:8082/internal/v1/dashboard/projects/snapshot}
       PROJECT_PROJECTION_HTTP_TIMEOUT: ${PROJECT_PROJECTION_HTTP_TIMEOUT:-35s}
       AGGREGATION_ONCE: "true"
+      # 关闭预算（秒）：长驻模式下 SIGTERM 后等待在途轮次退出的上限，默认 20s。
+      DATA_ANALYSIS_SHUTDOWN_DRAIN_SECONDS: ${DATA_ANALYSIS_SHUTDOWN_DRAIN_SECONDS:-}
+    # 与 dashboard-api 同口径：长驻模式下 docker 默认 10s 宽限会截断 20s 预算。
+    stop_grace_period: 25s
     networks:
       - default
       - basic-platform-local
@@ -166,6 +177,10 @@ services:
       ALERT_CONFIRM_ROUNDS: ${ALERT_CONFIRM_ROUNDS:-2}
       ALERT_REOPEN_POLICY: ${ALERT_REOPEN_POLICY:-auto}
       ALERT_CLOSE_GUARD_RATIO: ${ALERT_CLOSE_GUARD_RATIO:-0.5}
+      # 关闭预算（秒）：SIGTERM 后等待在途规则评估退出的上限，默认 20s。
+      DATA_ANALYSIS_SHUTDOWN_DRAIN_SECONDS: ${DATA_ANALYSIS_SHUTDOWN_DRAIN_SECONDS:-}
+    # 同上：单循环 join 的 20s 预算需要大于 docker 默认 10s 宽限才有意义。
+    stop_grace_period: 25s
     depends_on:
       dashboard-migrate:
         condition: service_completed_successfully

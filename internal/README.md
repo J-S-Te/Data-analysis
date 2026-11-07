@@ -7,6 +7,8 @@
 | bootstrap | 配置、OIDC、库连接、API 路由与服务装配 | 嵌入桥地址/密钥缺失可导致启动失败 |
 | middleware、shared/auth | Cookie 会话、精确权限、可信租户、同源写校验 | 不能靠 UI 角色标签推断组织范围 |
 | auditoutbox、platformaudit | 字典/规则/同步/预警事务审计持久化与投递、请求审计客户端 | API 装配投递循环；请求级审计与事务 Outbox 仍是两条路径，配置与回执需部署侧确认 |
+| shutdown | 进程退出的有界 join：后台循环登记为命名组件，按统一预算等待，超预算点名未退出组件并由调用方非零退出 | 只做等待与点名，不做补偿；预算须小于编排层停止宽限（compose 已配 stop_grace_period 25s） |
+| metrics | dashboard-api 只读 `/metrics` 文本 exposition（审计 outbox 三态 + 进程信息），手写格式不引入 prometheus SDK | `METRICS_ACCESS_TOKEN` 为空时仅回环可访问，非回环 403；固定挂服务根路径，不随 `APP_PATH_PREFIX`；不做请求计数 |
 | platformcatalog | 发布应用授权目录 | 目录存在不代表用户已获权限 |
 | embedbridge | 短期令牌、单次入口消费、Metabase 资源代理 | 独立来源、租户锁定、资源白名单；不开放管理后台 |
 | aggregation | 合同/CRM 维表、项目报告/结算财务只读快照、合同/项目 API 快照、租约队列、签约/商机转化事实 | 不是 CDC；合同源删除不传播，队列成功不等于后续全部事实已重算 |

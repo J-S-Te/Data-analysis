@@ -16,6 +16,7 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/aggregation"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/integrationsync"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/shutdown"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
@@ -33,6 +34,12 @@ func main() {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
+	// B2：关闭预算在启动期解析，非法值失败关闭（不静默退回默认值）。
+	drainBudget, err := shutdown.BudgetFromEnv(os.Getenv)
+	if err != nil {
+		logger.Error("aggregation-worker shutdown budget invalid", "error", err)
+		os.Exit(1)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	integrationSyncEnabled, err := integrationsync.EnabledFromEnv(os.Getenv)
@@ -150,13 +157,7 @@ func main() {
 		if *once {
 			return
 		}
-		if err := aggregation.RunLoop(ctx, *interval, pass, logger); err != nil {
-			logger.Error("aggregation-worker stopped with error", "error", err)
-			os.Exit(1)
-		}
-		return
-	}
-	if *once {
+	} else if *once {
 		if err := pass.RunOnce(ctx); err != nil {
 			logger.Error("aggregation pass failed", "error", err)
 			os.Exit(1)
@@ -164,10 +165,27 @@ func main() {
 		logger.Info("aggregation pass completed")
 		return
 	}
-	if err := aggregation.RunLoop(ctx, *interval, pass, logger); err != nil {
+	// 长驻路径：轮次循环放进可 join 的后台组件，收到信号后最多等预算时间，
+	// 超预算点名单侧而非零退出（在途轮次可能仍在写聚合库）。
+	if err := runLoopWithDrain(ctx, *interval, pass, drainBudget, logger); err != nil {
 		logger.Error("aggregation-worker stopped with error", "error", err)
 		os.Exit(1)
 	}
+}
+
+// runLoopWithDrain 在预算内等待聚合轮次循环退出（B2）。
+// 参数：ctx 为信号上下文；interval 为轮次间隔；pass 为本进程已配置的同步通道；
+// drainBudget 为关闭预算；logger 为结构化日志器。
+// 返回值：循环自身错误；或超预算点名未退出组件的错误（调用方必须非零退出）。
+func runLoopWithDrain(ctx context.Context, interval time.Duration, pass aggregation.Pass, drainBudget time.Duration, logger *slog.Logger) error {
+	group := shutdown.New()
+	result := group.Run("aggregation-loop", func() error {
+		return aggregation.RunLoop(ctx, interval, pass, logger)
+	})
+	if err := group.Join(drainBudget); err != nil {
+		return fmt.Errorf("aggregation-worker shutdown incomplete: %w", err)
+	}
+	return <-result
 }
 
 func firstNonEmpty(values ...string) string {
