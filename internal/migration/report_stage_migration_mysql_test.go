@@ -205,8 +205,19 @@ func TestProjectReportStageMigrationOnExistingAndFreshDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply 000034 on existing database: %v", err)
 	}
-	if fmt.Sprint(reportStageAppliedVersions(applied)) != "[34]" {
-		t.Fatalf("incremental applied versions = %v, want [34]", reportStageAppliedVersions(applied))
+	// 增量必须恰好是 embed 里 000034 及其之后的全部版本（后续新增迁移不应让本断言失效）。
+	items, err := Load(migrations.Files)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	wantIncremental := make([]uint64, 0, len(items))
+	for _, item := range items {
+		if item.Version >= 34 {
+			wantIncremental = append(wantIncremental, item.Version)
+		}
+	}
+	if fmt.Sprint(reportStageAppliedVersions(applied)) != fmt.Sprint(wantIncremental) {
+		t.Fatalf("incremental applied versions = %v, want %v", reportStageAppliedVersions(applied), wantIncremental)
 	}
 	reportStageAssertSchema(t, oldDB)
 	// 历史行保持“未采集”，不回填、不伪造。
@@ -250,11 +261,17 @@ func TestProjectReportStageMigrationOnExistingAndFreshDatabase(t *testing.T) {
 		t.Fatalf("migrated writes = %q / default %q", newStage, defaultStage)
 	}
 	// DDL 中断后重跑同一迁移（版本未登记场景）必须安全：守卫只在前置对象缺失时 ALTER。
-	items, err := Load(migrations.Files)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
+	// 必须精确取 000034，不能用"最后一份迁移"——新增迁移会让重跑落到别的文件上。
+	var reportStageSQL string
+	for _, item := range items {
+		if item.Version == 34 {
+			reportStageSQL = item.SQL
+			break
+		}
 	}
-	reportStageSQL := items[len(items)-1].SQL
+	if reportStageSQL == "" {
+		t.Fatal("embedded migrations do not contain 000034")
+	}
 	if _, err := oldDB.ExecContext(ctx, reportStageSQL); err != nil {
 		t.Fatalf("rerun 000034 on migrated database: %v", err)
 	}
@@ -266,8 +283,8 @@ func TestProjectReportStageMigrationOnExistingAndFreshDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply full migrations on fresh database: %v", err)
 	}
-	if len(applied) != 34 {
-		t.Fatalf("fresh schema applied %v, want 34 migrations", reportStageAppliedVersions(applied))
+	if len(applied) != len(items) {
+		t.Fatalf("fresh schema applied %v, want %d migrations", reportStageAppliedVersions(applied), len(items))
 	}
 	freshDB := reportStageTestOpen(t, freshCfg)
 	reportStageAssertSchema(t, freshDB)
