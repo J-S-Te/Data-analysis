@@ -17,3 +17,6 @@
 .DS_Store
 
 .ai
+
+# 本地 AI 工具会话目录（.mimosa/ 为本机生成，不入 Git）
+.mimosa/
