@@ -112,6 +112,16 @@ func New(config Config) (*App, error) {
 			auditDispatcher.Run(backgroundContext)
 			return nil
 		})
+	} else {
+		// 审计发布器配置不完整时不会启动投递循环：事务内审计仍写入
+		// bi_audit_outbox，但没有任何循环把它送到平台，表会只增不减、
+		// 平台的数据分析审计也会静默缺失。保持既有"启动不 fail-fast"语义
+		// （是否必开由 PLATFORM_AUDIT_REQUIRED 与 /readyz 决定），
+		// 但必须留下可检索的 WARN。
+		slog.Warn("audit outbox dispatcher not started: PLATFORM_AUDIT_CLIENT_ID/AUDIT_INGEST_CLIENT_ID and matching secret incomplete; rows written to bi_audit_outbox will never be delivered to the platform until the audit publisher is configured",
+			"table", "bi_audit_outbox", "dispatcher", "disabled",
+			"impact", "transactional audit events accumulate locally and are not visible on the platform",
+			"readyz_field", "audit_outbox_dispatcher")
 	}
 	var centralClient central.Client
 	if config.CentralSessionEnabled {
@@ -172,7 +182,8 @@ func New(config Config) (*App, error) {
 			return
 		}
 		if config.AuditRequired && auditReporter == nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not_ready", "audit": "disabled"})
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not_ready", "audit": "disabled",
+				"audit_outbox_dispatcher": auditOutboxDispatcherState(auditReporter), "audit_outbox_required": config.AuditRequired})
 			return
 		}
 		auditStatus := "disabled"
@@ -187,6 +198,11 @@ func New(config Config) (*App, error) {
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ready",
 			"audit":  auditStatus,
+			// B4：审计 Outbox 投递器的启动状态必须可观测。投递循环只在审计发布器
+			// 配置完整时启动，配置缺失时事务审计仍写入 bi_audit_outbox 却永不投递。
+			// 可选审计未配置时只由这两个字段表达降级，不新造状态值、不新增 503。
+			"audit_outbox_dispatcher": auditOutboxDispatcherState(auditReporter),
+			"audit_outbox_required":   config.AuditRequired,
 			"capabilities": gin.H{
 				"dashboard_embed":  gin.H{"enabled": config.DashboardEmbedEnabled, "state": embedState},
 				"finance_source":   gin.H{"mode": config.FinanceSource, "state": "ready"},
@@ -328,6 +344,16 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 func dashboardSyncState(enabled bool) string {
 	if enabled {
 		return "ready"
+	}
+	return "disabled"
+}
+
+// auditOutboxDispatcherState 报告审计 Outbox 投递器是否随进程启动。
+// 投递循环只在审计发布器非空时启动（见 auditReporter 装配处），因此两者同源；
+// 返回 running|disabled，供 /readyz 的 audit_outbox_dispatcher 字段使用。
+func auditOutboxDispatcherState(reporter platformaudit.Reporter) string {
+	if reporter != nil {
+		return "running"
 	}
 	return "disabled"
 }

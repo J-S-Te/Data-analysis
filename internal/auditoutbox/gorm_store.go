@@ -2,6 +2,7 @@ package auditoutbox
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"time"
@@ -9,6 +10,10 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+// purgeBatchLimit 是单批清理的行数上限：一次删除只处理固定行数，
+// 避免百万级已投递行落进同一个长事务把 bi_audit_outbox 锁住。
+const purgeBatchLimit = 1000
 
 // GORMStore 用 bi_audit_outbox 表实现领取与回写。
 //
@@ -122,6 +127,36 @@ func (s *GORMStore) MarkFailed(ctx context.Context, id, code string, retryAt, no
 	}
 	return s.DB.WithContext(ctx).Model(&outboxRow{}).Where("id = ?", id).
 		Updates(map[string]any{"delivery_status": status, "next_attempt_at": retryAt, "locked_at": nil, "last_error": code}).Error
+}
+
+// PurgeDelivered 删除 delivery_status=delivered 且 delivered_at 早于 cutoff 的行，
+// 单次调用最多删除 batchSize 行（上限 purgeBatchLimit），调用方循环到返回 0 为止。
+//
+// 只删已成功投递的行：pending/retry/processing 是尚未送达的审计证据，
+// failed 是待排障的终态证据，都必须保留。
+//
+// 实现上先用带 LIMIT 的查询取一批主键、再按主键删除：两条语句都有界，
+// 不会出现无界 DELETE 造成的长事务与表锁；同时避免依赖方言的
+// DELETE ... LIMIT（sqlite 单测不支持，MySQL 与测试会语义分叉）。
+func (s *GORMStore) PurgeDelivered(ctx context.Context, cutoff time.Time, batchSize int) (int64, error) {
+	if s == nil || s.DB == nil {
+		return 0, errors.New("audit outbox store is not configured")
+	}
+	if batchSize < 1 || batchSize > purgeBatchLimit {
+		batchSize = purgeBatchLimit
+	}
+	ids := make([]string, 0, batchSize)
+	if err := s.DB.WithContext(ctx).Model(&outboxRow{}).
+		Where("delivery_status = ? AND delivered_at IS NOT NULL AND delivered_at < ?", "delivered", cutoff.UTC()).
+		Order("delivered_at ASC, id ASC").Limit(batchSize).Pluck("id", &ids).Error; err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	// 删除时再次限定 delivered：并发轮次里行状态若已被改回，不能被误删。
+	result := s.DB.WithContext(ctx).Where("id IN ? AND delivery_status = ?", ids, "delivered").Delete(&outboxRow{})
+	return result.RowsAffected, result.Error
 }
 
 func deref(value *string) string {
