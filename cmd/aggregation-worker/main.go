@@ -173,15 +173,26 @@ func main() {
 	}
 }
 
-// runLoopWithDrain 在预算内等待聚合轮次循环退出（B2）。
-// 参数：ctx 为信号上下文；interval 为轮次间隔；pass 为本进程已配置的同步通道；
-// drainBudget 为关闭预算；logger 为结构化日志器。
+// runLoopWithDrain 运行聚合循环，并在收到关闭信号后有界等待在途轮次。
+// 参数：ctx 控制取消；interval 为间隔；pass 为通道；drainBudget 为预算；logger 记录日志。
 // 返回值：循环自身错误；或超预算点名未退出组件的错误（调用方必须非零退出）。
-func runLoopWithDrain(ctx context.Context, interval time.Duration, pass aggregation.Pass, drainBudget time.Duration, logger *slog.Logger) error {
+func runLoopWithDrain(
+	ctx context.Context,
+	interval time.Duration,
+	pass aggregation.Pass,
+	drainBudget time.Duration,
+	logger *slog.Logger,
+) error {
 	group := shutdown.New()
 	result := group.Run("aggregation-loop", func() error {
 		return aggregation.RunLoop(ctx, interval, pass, logger)
 	})
+	// 关闭预算只在信号到达后启动；同时观察循环结果，避免启动校验失败后空挂。
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+	}
 	if err := group.Join(drainBudget); err != nil {
 		return fmt.Errorf("aggregation-worker shutdown incomplete: %w", err)
 	}

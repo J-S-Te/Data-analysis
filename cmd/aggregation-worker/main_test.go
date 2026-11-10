@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +14,60 @@ import (
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// TestRunLoopWithDrainKeepsRunningBeforeCancellation 验证健康循环跨越关闭预算仍持续执行。
+// 参数：t 为测试上下文，通道仅在内存中计数，不访问业务依赖。
+// 返回值：无；提前退出、停止执行或取消后未及时结束时失败。
+func TestRunLoopWithDrainKeepsRunningBeforeCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var rounds atomic.Int64
+	pass := aggregation.Pass{SyncSources: func(context.Context) error {
+		rounds.Add(1)
+		return nil
+	}}
+	result := make(chan error, 1)
+	go func() {
+		result <- runLoopWithDrain(ctx, time.Millisecond, pass, 20*time.Millisecond, discardLogger())
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("healthy loop exited before cancellation: %v", err)
+	case <-time.After(80 * time.Millisecond):
+	}
+	if rounds.Load() < 2 {
+		t.Fatal("healthy loop did not execute multiple rounds")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("canceled healthy loop returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("healthy loop did not exit after cancellation")
+	}
+}
+
+// TestRunLoopWithDrainReturnsEarlyLoopError 验证循环自身报错不必等待外部关闭信号。
+// 参数：t 为测试上下文，零间隔触发真实循环的启动校验错误。
+// 返回值：无；错误丢失或入口仍等待取消时失败。
+func TestRunLoopWithDrainReturnsEarlyLoopError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- runLoopWithDrain(ctx, 0, aggregation.Pass{}, time.Second, discardLogger())
+	}()
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "interval must be positive") {
+			t.Fatalf("early loop error = %v, want invalid interval", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("loop error remained hidden while waiting for cancellation")
+	}
 }
 
 // B2：收到关闭信号后在途轮次超过预算时必须点名 aggregation-loop 并返回错误，
