@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -22,9 +23,9 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shutdown"
 )
 
-// main 启动受许可保护的本地聚合告警评估，不装配外部业务数据源。
-// 参数：无；配置来自环境和命令行。
-// 返回值：无；配置或许可初始化失败时非零退出。
+// main 用途：装配告警任务，并将循环及关闭失败映射为非零进程退出。
+// 参数：无；读取命令参数和当前运行配置。
+// 返回值：无；配置、执行或关闭失败时终止进程。
 func main() {
 	once := flag.Bool("once", envBool("ALERT_WORKER_ONCE"), "run one alert evaluation pass and exit")
 	interval := flag.Duration("interval", envDuration("ALERT_WORKER_INTERVAL", 5*time.Minute), "alert evaluation interval")
@@ -107,18 +108,36 @@ func main() {
 	}
 	// 长驻路径：单循环放进可 join 的后台组件，收到信号后最多等预算时间，
 	// 超预算点名并非零退出（在途规则评估可能仍在写 alert_item）。
-	group := shutdown.New()
-	result := group.Run("alert-worker-loop", func() error {
-		return alertworker.RunLoop(ctx, *interval, worker, logger)
-	})
-	if err := group.Join(drainBudget); err != nil {
-		logger.Error("alert-worker shutdown incomplete", "error", err)
-		os.Exit(1)
-	}
-	if err := <-result; err != nil {
+	if err := runLoopWithDrain(ctx, *interval, worker, drainBudget, logger); err != nil {
 		logger.Error("alert-worker stopped with error", "error", err)
 		os.Exit(1)
 	}
+}
+
+// runLoopWithDrain 运行告警循环，并在收到关闭信号后有界等待在途评估。
+// 参数：ctx 控制取消；interval 为间隔；worker 为评估器；drainBudget 为预算；logger 记录日志。
+// 返回值：循环自身错误或点名未退出组件的关闭超时错误，由调用方非零退出。
+func runLoopWithDrain(
+	ctx context.Context,
+	interval time.Duration,
+	worker *alertworker.Worker,
+	drainBudget time.Duration,
+	logger *slog.Logger,
+) error {
+	group := shutdown.New()
+	result := group.Run("alert-worker-loop", func() error {
+		return alertworker.RunLoop(ctx, interval, worker, logger)
+	})
+	// 关闭预算只在信号到达后启动；同时观察循环结果，避免启动校验失败后空挂。
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+	}
+	if err := group.Join(drainBudget); err != nil {
+		return fmt.Errorf("alert-worker shutdown incomplete: %w", err)
+	}
+	return <-result
 }
 
 func envBool(key string) bool {
