@@ -104,12 +104,56 @@ ON DUPLICATE KEY UPDATE
 - 部署项：合同库只读账号需 `SELECT con_approval_instance`；`DASHBOARD_APPROVAL_SOURCE`
   需加入 dashboard-api 的部署环境（compose/Secret），未下发时默认 `status`。
 
+## 完整源快照与硬删除对账（2026-11-11）
+
+合同、CRM 客户/商机、审批投影现在分别使用 `REPEATABLE READ` + `READ ONLY`
+源事务，保持每批 500 行的主键游标扫描。CRM 两张源表共享同一源事务；合同与审批
+继续独立执行，审批表不可读不撤销已完成的合同同步。
+
+- 迁移 `000036_dimension_sync_keys.sql` 新增 `dimension_sync_key`，只存租户、
+  128 位随机 run token、维表名称、源主键/审批所属合同及创建时间，不复制业务内容。
+- 既有 `guardedDimUpsert` 的 `updated_at` 守卫保持不变。每批全部 upsert 成功后暂存
+  该批主键，只有完整扫描、权限检查和源事务提交都成功后才执行删除。
+- 聚合库在同一个 `aggregationWrite` 事务内执行租户限定的 `NOT EXISTS` 删除与
+  当前 run 暂存清理；CRM 两张维表一起提交。取消、许可失败、源读取/提交失败、
+  队列旧持有者或提交前租约失效都会拒绝删除或回滚当前删除事务。
+- 成功空源可以删除本租户对应维表全部镜像；其他租户不变。审批对账使用
+  `(contract_id, approval_id)` 复合键，不能用审批ID单独近似。
+- 来源锁仍由定时/手工队列入口持有；`runDimensionSnapshot` 必须在既有来源锁内调用。
+  来源失败的暂存不作为新轮次集合复用。下一次持有同一来源锁时，仅回收该来源
+  超过 24 小时的旧暂存，每轮最多 500 项；不会清理其他正在同步来源的暂存。
+- `sync_source.last_success_at` 仅在完整同步及删除对账成功后推进，后续失败不清空。
+  手工队列终态与任务完成时间共用同一数据库时钟，首次手工成功也能建立成功凭据；
+  失败、暂停或失去租约不会推进或清空成功凭据。
+  `contract_import_history`、历史合同发布凭据、项目投影代次均不在本对账清理范围。
+
+## API快照留存（2026-11-11）
+
+`PruneSnapshotHistory` 只允许 `api_contract_dashboard` 和 `api_project_dashboard`，
+所有查询与删除均限定可信租户。默认策略：
+
+- 保留近 7 个业务日跨度内的所有明细；
+- 保留当前业务月及前 23 个月中每月最后一条快照；
+- 无论快照年龄多大，保留全局最新；相同 `snapshot_at` 使用 `id DESC` 稳定选取最后一条。
+
+业务月界在注入的 `DASHBOARD_TIMEZONE` 计算后转为 UTC 查询，nil 时区按 UTC。
+每次调用固定读取本租户 `MAX(id)` 高水位，月末检查点和删除候选均不超过该水位，
+并发写入的新快照即使携带旧时间也不会在本轮被删除。每批最多 500 项、每轮最多
+20 批，达到预算后剩余候选留待下一轮。每批事务前后检查取消与权限守卫；
+`Runner.PruneSnapshotHistory` 额外复用 `aggregationWrite` 的队列租约行锁与提交前复核。
+公共函数的 guard 可用于独立API同步通道，队列执行器应调用 Runner 方法。
+
+`SnapshotRetentionPolicy` 的零值使用 `7/24/500/20`。配置范围依次为
+`RecentDays=1..3660`、`TrendMonths=1..120`、`BatchSize=1..500`、`MaxBatches=1..20`；
+非法值返回错误，不隐式放宽清理预算。该 helper 不执行调度接线，轮次由启动装配调用。
+不清理标准财务批次、业务快照、审计表或历史合同发布凭据。
+
 ## 已知残余风险（有 updated_at 防护后仍存在）
 
 - **源库时间不可信**：若来源系统对同一事务内多行写入相同 `updated_at`，或来源时钟回拨，
   以 `updated_at` 为版本号无法区分先后；这需要来源提供单调版本列才能进一步收紧。
-- **删除语义**：全量同步不处理来源硬删除（维表行保留），与修复前一致。
-- **跨表一致性**：合同/客户/商机分别提交，轮次中间失败会留下部分更新（修复前一致）。
+- **源快照的时点**：删除对账反映本轮 RR 快照；源库在快照开始后提交的新增/删除由下一轮收敛。
+- **跨表一致性**：既有 upsert 仍逐行提交，轮次中途失败可能留下部分更新，但绝不按部分主键集合删除。CRM 客户/商机删除在同一个聚合库事务提交。
 
 ## 验证
 
@@ -134,3 +178,11 @@ ON DUPLICATE KEY UPDATE
   即使最新一轮失败仍允许。
 - `internal/migration/approval_sync_run_migration_test.go`：三份迁移的编号、守卫式可重入、
   不得出现破坏性语句。
+
+- `dimension_reconciliation_test.go`：成功集合/空源删除、复合键、租户隔离、读取/提交/
+  取消/许可失败保留、CRM删除原子性、提交前许可回滚、队列旧租约拒绝、500项暂存回收；
+- `snapshot_retention_test.go`：北京月界、近7天明细、完整24月趋势、同时间ID排序、
+  全局最新、固定高水位、批次预算、非法表/策略及权限失败回滚；
+- `TestDimensionSnapshotRealMySQLRepeatableRead`：需显式隔离的
+  `UIP_BI_DIM_SYNC_TEST_DSN_FILE`，验证MySQL跨批RR、源只读约束及删除反连接；
+  无DSN时显式跳过，不能用SQLite结果替代MySQL验收。

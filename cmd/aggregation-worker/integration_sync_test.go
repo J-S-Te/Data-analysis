@@ -88,12 +88,23 @@ func TestIntegrationSyncDisabledRegistersNoExternalTasks(t *testing.T) {
 	}
 }
 
-// TestIntegrationSyncEnabledKeepsExistingTaskRegistration 验证启用模式保留既有全部同步与队列入口。
+// TestIntegrationSyncEnabledKeepsExistingTaskRegistration 验证执行器统一管理来源且不重复同步API。
 // 参数：t 为测试上下文。
 // 返回值：无；默认兼容模式漏装任务时失败。
 func TestIntegrationSyncEnabledKeepsExistingTaskRegistration(t *testing.T) {
 	pass := integrationPass(true, &aggregation.Runner{}, &aggregation.APISyncRunner{}, func(context.Context) error { return nil }, func(string) string { return "http://synthetic-service" }, func(context.Context) error { return nil })
-	if !pass.Configured() || pass.SyncJobs == nil || pass.SyncSources == nil || pass.SyncImportReport == nil || pass.SyncContractDashboard == nil || pass.SyncProjectDashboard == nil {
-		t.Fatal("enabled integration lost existing callbacks")
+	if !pass.Configured() || pass.SyncJobs == nil || pass.SyncSources == nil || pass.SyncImportReport == nil || pass.SyncContractDashboard != nil || pass.SyncProjectDashboard != nil {
+		t.Fatal("执行器来源/队列丢失或重复装配API回调")
+	}
+}
+
+// TestAPIOnlyPassKeepsLegacyCallbacks 验证无完整执行器时仍兼容独立API入口。
+// 参数：t 为配置测试上下文。
+// 返回值：无；独立API同步被意外移除时失败。
+func TestAPIOnlyPassKeepsLegacyCallbacks(t *testing.T) {
+	pass := integrationPass(true, nil, &aggregation.APISyncRunner{}, nil,
+		func(string) string { return "http://synthetic-service" }, nil)
+	if pass.SyncContractDashboard == nil || pass.SyncProjectDashboard == nil || !pass.Configured() {
+		t.Fatal("独立API兼容入口丢失")
 	}
 }

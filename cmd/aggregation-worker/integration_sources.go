@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/aggregation"
+	"time"
 )
 
 // integrationReadSources 仅在外部同步明确启用时读取业务库DSN。
@@ -14,6 +16,9 @@ func integrationReadSources(enabled bool, getenv func(string) string) map[string
 		return sources
 	}
 	for _, code := range aggregationSourceCodes {
+		if code == "settlement" && getenv("DASHBOARD_FINANCE_SOURCE") == "standard" {
+			continue
+		}
 		if dsn := getenv(readDSNEnv(code)); dsn != "" {
 			sources[code] = dsn
 		}
@@ -43,11 +48,29 @@ func integrationPass(
 		}
 		pass.SyncJobs = runner.RunQueued
 	}
-	if api != nil && getenv("CONTRACT_INTERNAL_URL") != "" {
+	if runner == nil && api != nil && getenv("CONTRACT_INTERNAL_URL") != "" {
 		pass.SyncContractDashboard = api.SyncContractDashboard
 	}
-	if api != nil && getenv("PROJECT_INTERNAL_URL") != "" {
+	if runner == nil && api != nil && getenv("PROJECT_INTERNAL_URL") != "" {
 		pass.SyncProjectDashboard = api.SyncProjectDashboard
 	}
 	return pass
+}
+
+// attachSnapshotRetention 将有界留存放在本轮来源与队列执行后，保持关闭模式不写旧快照。
+// 参数：pass 为已配置轮次，runner 为租户执行器，policy 为启动期校验策略。
+// 返回值：无；来源未启用或没有执行器时保持原轮次不变。
+func attachSnapshotRetention(pass *aggregation.Pass, runner *aggregation.Runner, policy aggregation.SnapshotRetentionPolicy) {
+	if runner == nil || !pass.Configured() {
+		return
+	}
+	pass.PruneSnapshots = func(ctx context.Context) error {
+		var failures []error
+		for _, table := range []string{"api_contract_dashboard", "api_project_dashboard"} {
+			if err := runner.PruneSnapshotHistory(ctx, table, time.Now().UTC(), policy); err != nil {
+				failures = append(failures, err)
+			}
+		}
+		return errors.Join(failures...)
+	}
 }

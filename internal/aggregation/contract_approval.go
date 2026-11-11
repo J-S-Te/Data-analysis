@@ -90,13 +90,19 @@ func (r *Runner) syncContractApprovalFromSource(ctx context.Context, dsn string)
 	return r.syncContractApprovalFrom(ctx, src.WithContext(ctx).Where("tenant_id = ?", r.tenantID))
 }
 
-// syncContractApprovalFrom 从已限定的源连接读取审批实例并 upsert 到 dim_contract_approval。
-// 参数：ctx 为许可/取消上下文，src 为已按租户限定的 con_approval_instance 只读连接。
-// 返回值：读取或写入失败返回错误；来源为空时是正常结果。
-//
-// 只投影看板需要的列（不镜像 nodes_json/runtime_state_json 等审批内容），
-// 且只按租户读取，不跨租户聚合。
+// syncContractApprovalFrom 完整读取只读RR审批快照后执行独立删除对账。
+// 参数：ctx 为许可/取消上下文，src 为合同审批只读连接。
+// 返回值：读取、提交或删除失败返回错误；成功空源正常对账，不影响合同通道。
 func (r *Runner) syncContractApprovalFrom(ctx context.Context, src *gorm.DB) error {
+	return r.runDimensionSnapshot(ctx, src, ContractApprovalSource, func(snapshot *gorm.DB, run string) error {
+		return r.syncContractApprovalSnapshot(ctx, snapshot, run)
+	})
+}
+
+// syncContractApprovalSnapshot 分批同步最小审批投影并暂存复合主键。
+// 参数：ctx 为权限上下文，src 为限定租户的只读RR事务，run 为独立轮次令牌。
+// 返回值：读取、写入或暂存失败返回错误，不对部分集合删除。
+func (r *Runner) syncContractApprovalSnapshot(ctx context.Context, src *gorm.DB, run string) error {
 	total := 0
 	err := scanSourceBatches(src, "con_approval_instance",
 		contractApprovalSourceColumns,
@@ -119,7 +125,11 @@ func (r *Runner) syncContractApprovalFrom(ctx context.Context, src *gorm.DB) err
 				total += end - i
 				slog.Info("dim_contract_approval upserted", "rows", end-i)
 			}
-			return nil
+			keys := make([]string, 0, len(rows))
+			for _, row := range rows {
+				keys = append(keys, approvalReconciliationKey(row.ContractID, row.ID))
+			}
+			return r.stageDimensionKeys(ctx, run, "dim_contract_approval", keys)
 		})
 	if err != nil {
 		return err

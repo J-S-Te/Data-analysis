@@ -1,0 +1,295 @@
+openapi: 3.0.3
+info:
+  title: 数据分析看板相关接口契约
+  version: 0.1.0
+  description: >-
+    仅记录项目下钻、趋势、报告/财务快照与当前身份接口，并非整个应用的完整接口目录。
+    与源码一同维护；认证、权限、许可和审计门禁均以实际运行结果为准。
+servers:
+  - url: /data_analysis/api/v1
+    description: 默认公开路径；部署时由 APP_PATH_PREFIX 决定前缀。
+security:
+  - browserSession: []
+paths:
+  /dashboard/projects:
+    get:
+      operationId: listDashboardProjects
+      summary: 分页读取可信范围内的项目明细
+      description: >-
+        需要 dashboard.project.view。租户及 TENANT/ORG/TEAM 范围来自服务端可信主体，
+        不接受客户端租户、组织、团队或角色声明扩权。同一只读 Repeatable Read 事务核验
+        成功发布凭据并读取同一 snapshot_id 的项目。无成功投影或无可信可见范围时
+        available=false；成功发布但范围内为空时 available=true、items=[]、total=0。
+        不提供不存在的项目编号，不以项目状态估算报告版本。
+      x-required-permission: dashboard.project.view
+      parameters:
+        - name: page
+          in: query
+          description: 页码；缺失、解析失败或小于 1 时按 1 处理。
+          schema: {type: integer, minimum: 1, default: 1}
+        - name: page_size
+          in: query
+          description: 每页项数；缺失、解析失败、小于 1 或大于 100 时按 20 处理。
+          schema: {type: integer, minimum: 1, maximum: 100, default: 20}
+      responses:
+        '200':
+          description: 已核验的分页结果，未发布不等同于空业务。
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: {$ref: '#/components/schemas/ProjectDetails'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/ReadFailed'}
+        '501': {$ref: '#/components/responses/Unavailable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /dashboard/trend:
+    get:
+      operationId: getDashboardTrend
+      summary: 读取最近 12 个月趋势
+      description: >-
+        需要 dashboard.overview.view。合同、项目分别按主体权限及可信范围读取；
+        overview 权限不会隐式授予合同或项目来源权限。contract_available 与
+        project_available 必须分别判断，不能把未知来源展示成 0。多币种不得相加，
+        contract_amount_minor 仅在兼容单币种口径中有意义，金额展示应按 currency_totals。
+      x-required-permission: dashboard.overview.view
+      responses:
+        '200':
+          description: 月度趋势点。
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: {$ref: '#/components/schemas/TrendPoint'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/ReadFailed'}
+        '501': {$ref: '#/components/responses/Unavailable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /dashboard/report:
+    get:
+      operationId: getReportDashboard
+      summary: 读取报告原生快照
+      description: >-
+        需要 dashboard.report.view 和显式可信 TENANT 范围；ORG/TEAM/SELF/NONE 不读取租户总量。
+        读取项目权威报告版本统计，不通过项目阶段推算。没有首次成功快照时 available=false，
+        后续来源失败保留旧快照并标记陈旧，不伪造业务零值。
+      x-required-permission: dashboard.report.view
+      responses:
+        '200': {$ref: '#/components/responses/BusinessSnapshot'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/ReadFailed'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /dashboard/finance:
+    get:
+      operationId: getFinanceDashboard
+      summary: 读取唯一来源的财务原生快照
+      description: >-
+        需要 dashboard.finance.view 和显式可信 TENANT 范围。integration 读取结算快照，
+        standard 仅读取已发布标准经营事实，不混加或跨来源回退。
+        金额按原币种最小单位表示；回款不等同于收入。没有首次成功发布时 available=false。
+      x-required-permission: dashboard.finance.view
+      responses:
+        '200': {$ref: '#/components/responses/BusinessSnapshot'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/ReadFailed'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /auth/me:
+    get:
+      operationId: getCurrentDashboardIdentity
+      summary: 返回可信会话身份、权限与数据范围
+      description: >-
+        scope_mode、organization_ids、team_ids 均来自服务端验签及会话复核后的主体。
+        页面不得根据角色名称推导组织、团队或租户范围，也不得用客户端缓存声明扩权。
+      responses:
+        '200':
+          description: 当前会话身份；权限及范围只能作为服务端判定的投影展示。
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: {$ref: '#/components/schemas/AuthMe'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+components:
+  securitySchemes:
+    browserSession:
+      type: apiKey
+      in: cookie
+      name: data_analysis_session
+      description: 浏览器服务端会话 Cookie；当前主体由服务端认证，不是机器 OAuth Token。
+  responses:
+    BusinessSnapshot:
+      description: 权威来源业务快照；available=false 表示尚无可信成功发布。
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - type: object
+                properties:
+                  data: {$ref: '#/components/schemas/BusinessSnapshot'}
+    Unauthenticated:
+      description: 会话缺失、失效或身份无效。
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    Forbidden:
+      description: 缺少接口权限或当前可信数据范围不允许读取。
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    ReadFailed:
+      description: 来源快照非法或读取依赖失败，不返回固定成功或假零值。
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+    Unavailable:
+      description: 接口能力、会话依赖、许可或必要审计通道不可用。
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorEnvelope'}
+  schemas:
+    SuccessEnvelope:
+      type: object
+      required: [code, message, request_id, data]
+      properties:
+        code: {type: string, enum: [OK]}
+        message: {type: string}
+        request_id: {type: string}
+        data: {}
+    ErrorEnvelope:
+      type: object
+      required: [code, message, request_id]
+      properties:
+        code: {type: string}
+        message: {type: string}
+        request_id: {type: string}
+    DataFreshness:
+      type: object
+      required: [source_updated_at, synced_at, computed_at, sync_status, stale, stale_reason]
+      properties:
+        source_updated_at:
+          type: string
+          description: 源业务最近更新时间；未知为空串，不用本次查询时间代替。
+        synced_at:
+          type: string
+          description: 最近成功同步或本地快照写入时间；未知为空串。
+        computed_at: {type: string, description: 本次读取计算时间，不是源更新时间。}
+        sync_status:
+          type: string
+          enum: [SUCCESS, FAILED, RUNNING, PENDING, SNAPSHOT, UNKNOWN, '']
+        stale: {type: boolean}
+        stale_reason: {type: string, description: 陈旧或未发布原因；无原因时为空串。}
+    ProjectDetail:
+      type: object
+      required: [project_id, name, status, manager, owner_org_id, service_items, report_stage, risk, in_flight]
+      properties:
+        project_id: {type: string}
+        name: {type: string}
+        status: {type: string}
+        manager: {type: string}
+        owner_org_id: {type: string}
+        service_items: {type: integer, minimum: 0}
+        report_stage: {type: string, description: 来源实际报告阶段，不表示报告版本数量。}
+        risk: {type: boolean}
+        in_flight: {type: boolean}
+    ProjectDetails:
+      type: object
+      required: [available, items, total, page, page_size, freshness]
+      properties:
+        available: {type: boolean}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/ProjectDetail'}
+        total: {type: integer, format: int64, minimum: 0}
+        page: {type: integer, minimum: 1}
+        page_size: {type: integer, minimum: 1, maximum: 100}
+        freshness: {$ref: '#/components/schemas/DataFreshness'}
+    ContractCurrencyTotal:
+      type: object
+      required: [currency, amount_minor, contracts]
+      properties:
+        currency: {type: string, description: 原币种代码，禁止隐式换汇或跨币种求和。}
+        amount_minor: {type: integer, format: int64}
+        contracts: {type: integer, format: int64, minimum: 0}
+    TrendPoint:
+      type: object
+      required: [period, contract_available, project_available, contract_amount_minor, contract_count, project_count, currency_totals]
+      properties:
+        period: {type: string, description: 业务月，YYYY-MM。}
+        contract_available: {type: boolean, description: 当月合同来源是否可用，false 不能展示为业务0。}
+        project_available: {type: boolean, description: 当月项目来源是否可用，false 不能展示为业务0。}
+        contract_amount_minor: {type: integer, format: int64, description: 旧单币种兼容值；多币种用currency_totals。}
+        contract_count: {type: integer, format: int64, minimum: 0}
+        project_count: {type: integer, format: int64, minimum: 0}
+        currency_totals:
+          type: array
+          nullable: true
+          items: {$ref: '#/components/schemas/ContractCurrencyTotal'}
+    BusinessSnapshot:
+      type: object
+      required: [available, tenant_id, snapshot_at, metrics, missing_metrics, basis, freshness]
+      properties:
+        available: {type: boolean}
+        tenant_id: {type: string, description: 可信主体所属租户。}
+        snapshot_at: {type: string, description: 本地已发布快照时间；未发布时为空。}
+        metrics: {type: object, additionalProperties: true, description: 按报告或财务契约返回的权威指标，缺失不补零。}
+        missing_metrics:
+          type: array
+          nullable: true
+          items: {type: string}
+        basis: {type: string, description: 已接入统计口径或不可用原因。}
+        source_code: {type: string, description: 可选来源标识，旧快照允许缺失。}
+        source_updated_at: {type: string, description: 可选源业务更新时间，未知不虚构。}
+        source_snapshot_at: {type: string, description: 可选上游生成快照时间，与本地写入时间区分。}
+        freshness: {$ref: '#/components/schemas/DataFreshness'}
+    AuthMe:
+      type: object
+      required: [capabilities, user_id, tenant_id, display_name, username, roles, scope_mode, organization_ids, team_ids, permissions, role_config_hash, authz_revision, expires_at, idle_timeout_seconds, idle_remaining_ms]
+      properties:
+        capabilities:
+          type: object
+          required: [dashboard_embed_enabled]
+          properties:
+            dashboard_embed_enabled: {type: boolean}
+        user_id: {type: string}
+        tenant_id: {type: string}
+        display_name: {type: string}
+        username: {type: string}
+        roles:
+          type: array
+          nullable: true
+          items: {type: string}
+        scope_mode:
+          type: string
+          description: 服务端可信范围；缺失或未知时不得推断为全租户。
+          enum: [TENANT, ORG, TEAM, SELF, NONE, '']
+        organization_ids:
+          type: array
+          items: {type: string}
+        team_ids:
+          type: array
+          items: {type: string}
+        permissions:
+          type: array
+          items: {type: string}
+        role_config_hash: {type: string}
+        authz_revision: {type: integer, format: int64, minimum: 0}
+        expires_at: {type: integer, format: int64, description: 认证绝对到期Unix秒。}
+        idle_timeout_seconds: {type: integer, format: int64, minimum: 0}
+        idle_remaining_ms: {type: integer, format: int64, minimum: 0}

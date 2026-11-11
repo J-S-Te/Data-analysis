@@ -257,13 +257,17 @@ func New(config Config) (*App, error) {
 	api.GET("/dictionary/metrics/:code/versions", middleware.RequirePermission("dictionary.view"), dictHandler.History)
 
 	adminHandler := adminhttp.NewHandler(adminapplication.NewService(admininfrastructure.NewGORMRepository(db)))
-	dashboardHandler := dashboardhttp.NewHandler(dashboardapplication.NewService(dashboardinfrastructure.NewGORMRepositoryWithApprovalSource(db, dashboardLocation, config.DashboardApprovalSource).WithFinanceSource(config.FinanceSource)))
+	dashboardRepository := dashboardinfrastructure.NewGORMRepositoryWithApprovalSource(
+		db, dashboardLocation, config.DashboardApprovalSource,
+	).WithFinanceSource(config.FinanceSource).WithIntegrationSyncEnabled(config.IntegrationSyncEnabled)
+	dashboardHandler := dashboardhttp.NewHandler(dashboardapplication.NewService(dashboardRepository))
 	api.GET("/dashboard/contract-import-history", middleware.RequirePermission("dashboard.contract.view"), importreport.HistoryHandler(db))
 	api.GET("/dashboard/contract", middleware.RequirePermission("dashboard.contract.view"), dashboardHandler.Contract)
 	api.GET("/dashboard/project", middleware.RequirePermission("dashboard.project.view"), dashboardHandler.Project)
 	api.GET("/dashboard/report", middleware.RequirePermission("dashboard.report.view"), dashboardHandler.Business("report"))
 	api.GET("/dashboard/finance", middleware.RequirePermission("dashboard.finance.view"), dashboardHandler.Business("finance"))
 	api.GET("/dashboard/contracts", middleware.RequirePermission("dashboard.contract.view"), dashboardHandler.Contracts)
+	api.GET("/dashboard/projects", middleware.RequirePermission("dashboard.project.view"), dashboardHandler.Projects)
 	api.GET("/dashboard/trend", middleware.RequirePermission("dashboard.overview.view"), dashboardHandler.Trend)
 	api.GET("/admin/sources", middleware.RequirePermission("aggregation.manage"), requireIntegrationSync(config.IntegrationSyncEnabled), adminHandler.ListSources)
 	api.POST("/admin/sources/:id/trigger", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("aggregation.manage"), requireIntegrationSync(config.IntegrationSyncEnabled), func(c *gin.Context) { adminHandler.TriggerSource(c, c.Param("id")) })

@@ -89,9 +89,34 @@ type ContractDetail struct {
 
 // TrendPoint 表示一个月度趋势点。
 type TrendPoint struct {
+	ContractAvailable   bool                    `json:"contract_available"`
+	ProjectAvailable    bool                    `json:"project_available"`
 	Period              string                  `json:"period"`
 	ContractAmountMinor int64                   `json:"contract_amount_minor"`
 	ContractCount       int64                   `json:"contract_count"`
 	ProjectCount        int64                   `json:"project_count"`
 	CurrencyTotals      []ContractCurrencyTotal `json:"currency_totals"`
+}
+
+// ProjectDetail 为已发布项目投影的脱敏明细。
+type ProjectDetail struct {
+	ProjectID    string `json:"project_id"`
+	Name         string `json:"name"`
+	Status       string `json:"status"`
+	Manager      string `json:"manager"`
+	OwnerOrgID   string `json:"owner_org_id"`
+	ServiceItems int    `json:"service_items"`
+	ReportStage  string `json:"report_stage"`
+	Risk         bool   `json:"risk"`
+	InFlight     bool   `json:"in_flight"`
+}
+
+// ProjectDetails 保留无成功投影与可信空集合的区别。
+type ProjectDetails struct {
+	Available bool            `json:"available"`
+	Items     []ProjectDetail `json:"items"`
+	Total     int64           `json:"total"`
+	Page      int             `json:"page"`
+	PageSize  int             `json:"page_size"`
+	Freshness DataFreshness   `json:"freshness"`
 }
