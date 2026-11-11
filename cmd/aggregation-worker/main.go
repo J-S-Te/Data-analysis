@@ -24,6 +24,9 @@ import (
 // main 启动受许可保护的聚合执行进程。
 // 参数：无，配置由环境和命令行提供。
 // 返回值：无，初始化或单轮失败时进程非零退出。
+// main 校验来源配置并启动受许可保护的聚合轮次。
+// 参数：无；配置来自命令行及运行环境。
+// 返回值：无；配置或执行故障以非零退出状态报告。
 func main() {
 	once := flag.Bool("once", os.Getenv("AGGREGATION_ONCE") == "true", "run a single sync pass and exit")
 	interval := flag.Duration("interval", 60*time.Second, "loop interval (ignored with --once)")
@@ -57,6 +60,11 @@ func main() {
 		logger.Error("project projection configuration invalid", "error", err)
 		os.Exit(1)
 	}
+	businessSources, err := businessSourcesFromEnv(integrationSyncEnabled, os.Getenv)
+	if err != nil {
+		logger.Error("business dashboard configuration invalid", "error", err)
+		os.Exit(1)
+	}
 	licenseCheck, err := commercial.Start(ctx)
 	if err != nil {
 		logger.Error("commercial license configuration invalid")
@@ -84,7 +92,9 @@ func main() {
 		os.Exit(1)
 	}
 	var runner *aggregation.Runner
-	if len(sources) > 0 || projection.URL != "" || importOptions.Enabled {
+	hasAPISource := integrationSyncEnabled && (os.Getenv("CONTRACT_INTERNAL_URL") != "" ||
+		os.Getenv("PROJECT_INTERNAL_URL") != "" || businessSources.ReportURL != "" || businessSources.FinanceURL != "")
+	if len(sources) > 0 || projection.URL != "" || importOptions.Enabled || hasAPISource {
 		runner, err = aggregation.NewRunner(aggDSN, os.Getenv("OIDC_TENANT_ID"), sources)
 		if err != nil {
 			logger.Error("aggregation runner failed", "error", err)
@@ -128,9 +138,12 @@ func main() {
 				ClientID: os.Getenv("PROJECT_MACHINE_CLIENT_ID"), ClientSecret: os.Getenv("PROJECT_MACHINE_CLIENT_SECRET"),
 				Scope: firstNonEmpty(os.Getenv("PROJECT_MACHINE_TOKEN_SCOPE"), "dashboard.project.read"),
 			},
-			ContractInternalURL: os.Getenv("CONTRACT_INTERNAL_URL"),
-			ProjectInternalURL:  os.Getenv("PROJECT_INTERNAL_URL"),
-			TenantID:            os.Getenv("OIDC_TENANT_ID"),
+			ContractInternalURL:  os.Getenv("CONTRACT_INTERNAL_URL"),
+			ProjectInternalURL:   os.Getenv("PROJECT_INTERNAL_URL"),
+			ProjectReportURL:     businessSources.ReportURL,
+			SettlementFinanceURL: businessSources.FinanceURL,
+			SettlementCredential: businessSources.FinanceCredential,
+			TenantID:             os.Getenv("OIDC_TENANT_ID"),
 		})
 	}
 	if runner != nil {
@@ -148,6 +161,7 @@ func main() {
 		importSync = func(ctx context.Context) error { return runner.SyncImportReport(ctx, importAPI, importOptions.URL) }
 	}
 	pass := integrationPass(integrationSyncEnabled, runner, apiSync, importSync, os.Getenv, checkBusiness)
+	attachSnapshotRetention(&pass, runner, businessSources.Retention)
 	if !pass.Configured() {
 		// 无任何同步通道：once 模式单次执行后退出合理；长驻模式必须保持
 		// 存活等待配置（RunLoop 对空 pass 安全），否则容器会陷入重启循环。

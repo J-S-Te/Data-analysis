@@ -112,11 +112,14 @@ func financeFixture(t *testing.T) *gorm.DB {
 	t.Helper()
 	db := newScanTestDB(t)
 	for _, sql := range []string{
-		`CREATE TABLE settlement_receivable (tenant_id TEXT,currency TEXT,original_amount DECIMAL,received_allocated_amount DECIMAL,open_amount DECIMAL,due_date TEXT,recognition_status TEXT)`,
-		`CREATE TABLE settlement_receipt (tenant_id TEXT,currency TEXT,amount DECIMAL,receipt_date TEXT,status TEXT)`,
+		`CREATE TABLE settlement_receivable (tenant_id TEXT,currency TEXT,original_amount DECIMAL,received_allocated_amount DECIMAL,open_amount DECIMAL,due_date TEXT,recognition_status TEXT,contract_snapshot_id TEXT DEFAULT 'released')`,
+		`CREATE TABLE settlement_receipt (tenant_id TEXT,currency TEXT,amount DECIMAL,receipt_date TEXT,status TEXT,id TEXT DEFAULT '')`,
+		`CREATE TABLE settlement_contract_snapshot (id TEXT,tenant_id TEXT,migration_state TEXT)`,
+		`CREATE TABLE settlement_import_fact (tenant_id TEXT,contract_snapshot_id TEXT,target_business_id TEXT,fact_type TEXT)`,
+		`INSERT INTO settlement_contract_snapshot VALUES ('released','a','RELEASED'),('released','other','RELEASED'),('held','a','HOLD')`,
 		// 上海 cutoff 2025-10-04 时 2025-10-03 已逾期；UTC cutoff 2025-10-03 时两笔都不算逾期。
-		`INSERT INTO settlement_receivable VALUES ('a','CNY',100,0,100,'2025-10-03','CONFIRMED'),('a','CNY',200,0,200,'2025-10-04','CONFIRMED')`,
-		`INSERT INTO settlement_receipt VALUES ('a','CNY',70,'2026-01-15','AVAILABLE')`,
+		`INSERT INTO settlement_receivable (tenant_id,currency,original_amount,received_allocated_amount,open_amount,due_date,recognition_status) VALUES ('a','CNY',100,0,100,'2025-10-03','CONFIRMED'),('a','CNY',200,0,200,'2025-10-04','CONFIRMED')`,
+		`INSERT INTO settlement_receipt (tenant_id,currency,amount,receipt_date,status) VALUES ('a','CNY',70,'2026-01-15','AVAILABLE')`,
 	} {
 		if err := db.Exec(sql).Error; err != nil {
 			t.Fatal(err)

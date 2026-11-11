@@ -16,13 +16,15 @@ type Pass struct {
 	SyncJobs              func(context.Context) error
 	SyncContractDashboard func(context.Context) error
 	SyncProjectDashboard  func(context.Context) error
+	PruneSnapshots        func(context.Context) error
 }
 
 // Configured 判定当前聚合链路是否含可执行同步入口。
 // 参数：无。
 // 返回值：至少一个来源或历史摘要通道已配置时为true。
 func (p Pass) Configured() bool {
-	return p.SyncImportReport != nil || p.SyncSources != nil || p.SyncContractDashboard != nil || p.SyncProjectDashboard != nil
+	return p.SyncImportReport != nil || p.SyncSources != nil || p.SyncContractDashboard != nil ||
+		p.SyncProjectDashboard != nil || p.PruneSnapshots != nil
 }
 
 // RunOnce 串行执行已配置通道，并汇总各通道错误。
@@ -38,6 +40,7 @@ func (p Pass) RunOnce(ctx context.Context) error {
 		{name: "queued sync jobs", run: p.SyncJobs},
 		{name: "contract dashboard API", run: p.SyncContractDashboard},
 		{name: "project dashboard API", run: p.SyncProjectDashboard},
+		{name: "snapshot retention", run: p.PruneSnapshots},
 	}
 	var runErrors []error
 	for _, task := range tasks {

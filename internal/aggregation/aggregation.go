@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -105,8 +106,8 @@ type SyncSource struct {
 	// 看板 DASHBOARD_APPROVAL_SOURCE=instances 的升级门禁依赖“首次成功”证据。
 	LastSuccessAt *time.Time `gorm:"column:last_success_at"`
 	LastError     *string    `gorm:"column:last_error"`
-	CreatedAt      time.Time  `gorm:"column:created_at"`
-	UpdatedAt      time.Time  `gorm:"column:updated_at"`
+	CreatedAt     time.Time  `gorm:"column:created_at"`
+	UpdatedAt     time.Time  `gorm:"column:updated_at"`
 }
 
 // TableName 返回 sync_source 表名，供 GORM 映射与 SQL 查询使用。
@@ -323,12 +324,27 @@ func (r *Runner) RunQueued(ctx context.Context) error {
 	return r.runLeasedQueue(ctx)
 }
 
+// runSource 在现有来源锁和租约内选择已配置通道，禁止失败后暗中切换来源。
+// 参数：ctx 为当前执行权限，code 为固定来源编码，dsn 为可选只读数据库来源。
+// 返回值：单来源执行错误；其他来源由轮次继续独立处理。
 func (r *Runner) runSource(ctx context.Context, code, dsn string) error {
 	if err := r.checkLicense(ctx); err != nil {
 		return err
 	}
 	if code == "project_management" {
 		return r.syncProject(ctx, dsn)
+	}
+	if r.ProjectAPI != nil {
+		if code == "contract_dashboard" {
+			return r.ProjectAPI.SyncContractDashboard(ctx)
+		}
+		if code == "project_dashboard" {
+			return r.ProjectAPI.SyncProjectDashboard(ctx)
+		}
+	}
+	if code == "settlement" && r.ProjectAPI != nil && r.ProjectAPI.options.SettlementFinanceURL != "" {
+		return r.syncBusinessHTTP(ctx, "finance", r.ProjectAPI.options.SettlementFinanceURL,
+			r.ProjectAPI.options.SettlementCredential)
 	}
 	if dsn == "" {
 		return fmt.Errorf("source %s is not configured", code)
@@ -354,6 +370,9 @@ func (r *Runner) runSource(ctx context.Context, code, dsn string) error {
 	}
 }
 
+// mark 更新本轮同步状态并仅在成功时推进持久成功凭据。
+// 参数：ctx 为权限上下文，code/status 为来源和状态，runAt 为轮次开始，errMsg 为失败摘要。
+// 返回值：无；状态更新受许可、租约和轮次时间防护。
 func (r *Runner) mark(ctx context.Context, code string, status string, runAt time.Time, errMsg *string) {
 	updates := map[string]interface{}{"last_status": status, "last_run_at": runAt, "updated_at": time.Now().UTC()}
 	if status == statusSuccess {
@@ -473,8 +492,15 @@ func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 		return fmt.Errorf("get contract source connection pool: %w", err)
 	}
 	defer closeSourceConnectionPool(sqlDB, "contract_management")
-	src = src.WithContext(ctx).Where("tenant_id = ?", r.tenantID)
+	return r.runDimensionSnapshot(ctx, src, "contract_management", func(snapshot *gorm.DB, run string) error {
+		return r.syncContractSnapshot(ctx, snapshot, run)
+	})
+}
 
+// syncContractSnapshot 分批写入同一完整合同快照，并暂存本轮主键集合。
+// 参数：ctx 为许可/取消上下文，src 为限定租户的只读RR事务，run 为本轮令牌。
+// 返回值：任一批读取、写入或暂存失败返回错误，禁止删除对账。
+func (r *Runner) syncContractSnapshot(ctx context.Context, src *gorm.DB, run string) error {
 	type sourceRow struct {
 		OriginKind      string
 		TenantID        string
@@ -540,7 +566,11 @@ func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 				}
 				slog.Info("dim_contract upserted", "rows", len(batch), "updated_at", now.Format(time.RFC3339))
 			}
-			return nil
+			keys := make([]string, 0, len(rows))
+			for _, row := range rows {
+				keys = append(keys, row.ID)
+			}
+			return r.stageDimensionKeys(ctx, run, "dim_contract", keys)
 		}); err != nil {
 		return err
 	}
@@ -550,7 +580,9 @@ func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 	return nil
 }
 
-// syncCRM 客户与商机库 → dim_customer / dim_opportunity。
+// syncCRM 在同一只读RR快照完整同步客户与商机后进行原子删除对账。
+// 参数：ctx 为许可/取消上下文，dsn 为显式配置的CRM只读连接。
+// 返回值：任一源表或删除对账失败返回错误，不按部分集合删除。
 func (r *Runner) syncCRM(ctx context.Context, dsn string) error {
 	src, err := gorm.Open(mysql.Open(dsn), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
@@ -561,8 +593,15 @@ func (r *Runner) syncCRM(ctx context.Context, dsn string) error {
 		return fmt.Errorf("get CRM source connection pool: %w", err)
 	}
 	defer closeSourceConnectionPool(sqlDB, "customer_and_opportunity")
-	src = src.WithContext(ctx).Where("tenant_id = ?", r.tenantID)
+	return r.runDimensionSnapshot(ctx, src, "customer_and_opportunity", func(snapshot *gorm.DB, run string) error {
+		return r.syncCRMSnapshot(ctx, snapshot, run)
+	})
+}
 
+// syncCRMSnapshot 分批同步同一CRM快照中的客户和商机并暂存主键。
+// 参数：ctx 为权限上下文，src 为限定租户的只读RR事务，run 为本轮令牌。
+// 返回值：任一表读取、写入或暂存失败返回错误，不发布删除。
+func (r *Runner) syncCRMSnapshot(ctx context.Context, src *gorm.DB, run string) error {
 	// 客户
 	type customerRow struct {
 		ID           uint64
@@ -600,7 +639,11 @@ func (r *Runner) syncCRM(ctx context.Context, dsn string) error {
 				}
 				slog.Info("dim_customer upserted", "rows", len(rows[i:end]))
 			}
-			return nil
+			keys := make([]string, 0, len(rows))
+			for _, row := range rows {
+				keys = append(keys, strconv.FormatUint(row.ID, 10))
+			}
+			return r.stageDimensionKeys(ctx, run, "dim_customer", keys)
 		}); err != nil {
 		return err
 	}
@@ -650,7 +693,11 @@ func (r *Runner) syncCRM(ctx context.Context, dsn string) error {
 				}
 				slog.Info("dim_opportunity upserted", "rows", len(rows[i:end]))
 			}
-			return nil
+			keys := make([]string, 0, len(rows))
+			for _, row := range rows {
+				keys = append(keys, strconv.FormatUint(row.ID, 10))
+			}
+			return r.stageDimensionKeys(ctx, run, "dim_opportunity", keys)
 		}); err != nil {
 		return err
 	}
@@ -731,7 +778,9 @@ func ulid() string {
 	return string(b)
 }
 
-// configuredSources is the shared registry for scheduled and queued producers.
+// configuredSources 为定时和手工队列返回同一组已配置来源。
+// 参数：无。
+// 返回值：不含凭据的来源选择映射；API通道使用空DSN并由固定路由执行。
 func (r *Runner) configuredSources() map[string]string {
 	sources := make(map[string]string, len(r.sources)+1)
 	for code, dsn := range r.sources {
@@ -739,6 +788,20 @@ func (r *Runner) configuredSources() map[string]string {
 	}
 	if r.ProjectProjection.URL != "" {
 		sources["project_management"] = r.sources["project_management"]
+	}
+	if r.ProjectAPI != nil {
+		if r.ProjectAPI.options.ContractInternalURL != "" {
+			sources["contract_dashboard"] = ""
+		}
+		if r.ProjectAPI.options.ProjectInternalURL != "" {
+			sources["project_dashboard"] = ""
+		}
+		if r.ProjectAPI.options.ProjectReportURL != "" {
+			sources["project_management"] = r.sources["project_management"]
+		}
+		if r.ProjectAPI.options.SettlementFinanceURL != "" {
+			sources["settlement"] = r.sources["settlement"]
+		}
 	}
 	return sources
 }

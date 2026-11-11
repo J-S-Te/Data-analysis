@@ -32,7 +32,7 @@ func scopedContractFixture(t *testing.T) *gorm.DB {
 			opportunity_id TEXT, project_id TEXT, updated_at DATETIME)`,
 		`CREATE TABLE sync_source (
 			id TEXT, tenant_id TEXT, subsystem_code TEXT, db_schema TEXT, enabled BOOLEAN,
-			last_watermark DATETIME, last_run_at DATETIME, last_status TEXT, last_error TEXT, updated_at DATETIME)`,
+			last_success_at DATETIME, last_watermark DATETIME, last_run_at DATETIME, last_status TEXT, last_error TEXT, updated_at DATETIME)`,
 	} {
 		if err := db.Exec(ddl).Error; err != nil {
 			t.Fatal(err)
@@ -46,6 +46,10 @@ func scopedContractFixture(t *testing.T) *gorm.DB {
 // 返回值：无，写入失败终止用例。
 func insertScopedContract(t *testing.T, db *gorm.DB, origin, tenant, contract, status, endDate, owner, org string) {
 	t.Helper()
+	if err := db.Exec(`INSERT INTO sync_source(id,tenant_id,subsystem_code,enabled,last_status,last_success_at,updated_at)
+ SELECT ?,?,'contract_management',1,'SUCCESS',?,? WHERE NOT EXISTS(SELECT 1 FROM sync_source WHERE tenant_id=? AND subsystem_code='contract_management')`, "contract-"+tenant, tenant, time.Now().UTC(), time.Now().UTC(), tenant).Error; err != nil {
+		t.Fatal(err)
+	}
 	var end any
 	if endDate != "" {
 		end = endDate

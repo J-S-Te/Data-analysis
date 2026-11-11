@@ -8,13 +8,22 @@ import (
 	"time"
 )
 
+// TestFinanceStatisticsActualBalancesCurrencyAndMonth 验证财务净额、币种、月份及释放状态。
+// 参数：t 为隔离统计测试上下文。
+// 返回值：无；跨租户、HOLD或作废数据影响金额时失败。
 func TestFinanceStatisticsActualBalancesCurrencyAndMonth(t *testing.T) {
 	db := newScanTestDB(t)
 	for _, sql := range []string{
-		`CREATE TABLE settlement_receivable (tenant_id TEXT,currency TEXT,original_amount DECIMAL,received_allocated_amount DECIMAL,open_amount DECIMAL,due_date TEXT,recognition_status TEXT)`,
-		`CREATE TABLE settlement_receipt (tenant_id TEXT,currency TEXT,amount DECIMAL,receipt_date TEXT,status TEXT)`,
-		`INSERT INTO settlement_receivable VALUES ('a','CNY',1000,200,800,'2026-01-01','CONFIRMED'),('a','USD',200,100,100,'2026-10-09','CONFIRMED'),('other','CNY',9999,9999,0,'2026-01-01','CONFIRMED'),('a','CNY',9999,0,9999,'2026-01-01','PENDING')`,
-		`INSERT INTO settlement_receipt VALUES ('a','CNY',10.01,'2026-10-01','AVAILABLE'),('a','CNY',20,'2026-10-05','FULLY_ALLOCATED'),('a','CNY',100,'2026-09-30','AVAILABLE'),('a','CNY',9999,'2026-10-05','VOID'),('other','CNY',9999,'2026-10-05','AVAILABLE')`,
+		`CREATE TABLE settlement_receivable (tenant_id TEXT,currency TEXT,original_amount DECIMAL,received_allocated_amount DECIMAL,open_amount DECIMAL,due_date TEXT,recognition_status TEXT,contract_snapshot_id TEXT DEFAULT 'released')`,
+		`CREATE TABLE settlement_receipt (tenant_id TEXT,currency TEXT,amount DECIMAL,receipt_date TEXT,status TEXT,id TEXT DEFAULT '')`,
+		`CREATE TABLE settlement_contract_snapshot (id TEXT,tenant_id TEXT,migration_state TEXT)`,
+		`CREATE TABLE settlement_import_fact (tenant_id TEXT,contract_snapshot_id TEXT,target_business_id TEXT,fact_type TEXT)`,
+		`INSERT INTO settlement_contract_snapshot VALUES ('released','a','RELEASED'),('released','other','RELEASED'),('held','a','HOLD')`,
+		`INSERT INTO settlement_receivable (tenant_id,currency,original_amount,received_allocated_amount,open_amount,due_date,recognition_status) VALUES ('a','CNY',1000,200,800,'2026-01-01','CONFIRMED'),('a','USD',200,100,100,'2026-10-09','CONFIRMED'),('other','CNY',9999,9999,0,'2026-01-01','CONFIRMED'),('a','CNY',9999,0,9999,'2026-01-01','PENDING')`,
+		`INSERT INTO settlement_receipt (tenant_id,currency,amount,receipt_date,status) VALUES ('a','CNY',10.01,'2026-10-01','AVAILABLE'),('a','CNY',20,'2026-10-05','FULLY_ALLOCATED'),('a','CNY',100,'2026-09-30','AVAILABLE'),('a','CNY',9999,'2026-10-05','VOID'),('other','CNY',9999,'2026-10-05','AVAILABLE')`,
+		`INSERT INTO settlement_receivable VALUES ('a','CNY',100,0,100,'2026-01-01','CONFIRMED','held')`,
+		`INSERT INTO settlement_receipt VALUES ('a','CNY',100,'2026-10-02','AVAILABLE','held-receipt')`,
+		`INSERT INTO settlement_import_fact VALUES ('a','held','held-receipt','RECEIPT')`,
 	} {
 		if err := db.Exec(sql).Error; err != nil {
 			t.Fatal(err)

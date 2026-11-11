@@ -133,8 +133,9 @@ func TestContractTeamScopeUsesOnlyTeamIDsAndFailsClosed(t *testing.T) {
 			if snapshot.TotalContracts != tc.wantCount || snapshot.TotalAmountMinor != tc.wantAmount {
 				t.Fatalf("contract=%+v available=%v, want contracts=%d amount=%d", snapshot, available, tc.wantCount, tc.wantAmount)
 			}
-			if available != (tc.wantCount > 0) {
-				t.Fatalf("available=%v, want %v", available, tc.wantCount > 0)
+			wantAvailable := tc.wantCount > 0 || tc.name == "team with unknown id is empty"
+			if available != wantAvailable {
+				t.Fatalf("available=%v, want %v", available, wantAvailable)
 			}
 		})
 	}

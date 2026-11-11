@@ -116,3 +116,36 @@ func (handler *Handler) Trend(c *gin.Context) {
 	}
 	response.OK(c, points)
 }
+
+// Projects 返回当前租户可信范围内的项目分页明细。
+// 参数：c 为带可信主体的 HTTP 上下文，分页参数通过查询字符串提供。
+// 返回值：无；响应包含成功投影标记、列表、总数和分页信息。
+func (handler *Handler) Projects(c *gin.Context) {
+	principal, ok := auth.FromContext(c.Request.Context())
+	if !ok {
+		response.Error(c, apperror.ErrUnauthenticated)
+		return
+	}
+	service, ok := handler.service.(interface {
+		Projects(context.Context, string, int, int) (domain.ProjectDetails, error)
+	})
+	if !ok {
+		response.Error(c, apperror.New(501, "PROJECT_DETAIL_UNAVAILABLE", "项目明细暂不可用"))
+		return
+	}
+	var page, pageSize int
+	_, _ = fmt.Sscan(c.DefaultQuery("page", "1"), &page)
+	_, _ = fmt.Sscan(c.DefaultQuery("page_size", "20"), &pageSize)
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 20
+	}
+	result, err := service.Projects(c.Request.Context(), principal.TenantID, page, pageSize)
+	if err != nil {
+		response.Error(c, apperror.Wrap(err, 500, "PROJECT_DETAIL_FAILED", "项目明细加载失败"))
+		return
+	}
+	response.OK(c, result)
+}

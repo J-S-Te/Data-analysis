@@ -16,6 +16,9 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+// TestDashboardOrganizationAndTeamScopeOnMySQL 验证真实隔离数据库的范围与水位。
+// 参数：t 为测试上下文，仅使用显式测试DSN。
+// 返回值：无；范围、成功凭据或趋势不一致时失败。
 func TestDashboardOrganizationAndTeamScopeOnMySQL(t *testing.T) {
 	dsn := strings.TrimSpace(os.Getenv("DASHBOARD_TEST_DSN"))
 	if dsn == "" {
@@ -42,8 +45,9 @@ func TestDashboardOrganizationAndTeamScopeOnMySQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err = db.Exec(`INSERT INTO dim_contract(tenant_id,contract_id,contract_number,title,contract_type,service_type,owner_user_id,status,amount_minor,end_date,start_date,owner_org_id,updated_at) VALUES
-		(?, 'c-a', 'HT-A', 'A 合同', 'test', 'test', 'test-owner', 'ACTIVE', 10000, '2026-10-18', '2026-10-01', 'org-a', ?),
-		(?, 'c-b', 'HT-B', 'B 合同', 'test', 'test', 'test-owner', 'ACTIVE', 20000, '2026-10-18', '2026-10-02', 'org-b', ?)`, tenant, now, tenant, now).Error; err != nil {
+		(?, 'c-a', 'HT-A', 'A 合同', 'test', 'test', 'test-owner', 'ACTIVE', 10000, '2026-10-18', ?, 'org-a', ?),
+		(?, 'c-b', 'HT-B', 'B 合同', 'test', 'test', 'test-owner', 'ACTIVE', 20000, '2026-10-18', ?, 'org-b', ?)`, tenant, now.In(scopedContractBusinessLocation(t)).Format("2006-01-02"), now,
+		tenant, now.In(scopedContractBusinessLocation(t)).Format("2006-01-02"), now).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err = db.Exec(`INSERT INTO dim_project(tenant_id,project_id,name,customer,contract,status,health,owner_org_id,snapshot_id,risk,in_flight,service_items,source_updated_at,created_at,updated_at) VALUES
@@ -53,14 +57,14 @@ func TestDashboardOrganizationAndTeamScopeOnMySQL(t *testing.T) {
 	if err = db.Exec(`DELETE FROM sync_source WHERE tenant_id=?`, tenant).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err = db.Exec(`INSERT INTO sync_source(id,tenant_id,subsystem_code,db_schema,db_host,read_account_ref,created_at,enabled,last_run_at,last_status,updated_at)
-		VALUES (?, ?, 'contract_management', ?, 'test.invalid', 'test-only', ?, 1, ?, 'SUCCESS', ?)
-		ON DUPLICATE KEY UPDATE last_run_at=VALUES(last_run_at), last_status=VALUES(last_status), enabled=VALUES(enabled), updated_at=VALUES(updated_at)`, tenant, tenant, tenant, now, now, now).Error; err != nil {
+	if err = db.Exec(`INSERT INTO sync_source(id,tenant_id,subsystem_code,db_schema,db_host,read_account_ref,created_at,enabled,last_run_at,last_status,last_success_at,updated_at)
+		VALUES (?, ?, 'contract_management', ?, 'test.invalid', 'test-only', ?, 1, ?, 'SUCCESS', ?, ?)
+		ON DUPLICATE KEY UPDATE last_run_at=VALUES(last_run_at), last_status=VALUES(last_status), last_success_at=VALUES(last_success_at), enabled=VALUES(enabled), updated_at=VALUES(updated_at)`, tenant, tenant, tenant, now, now, now, now).Error; err != nil {
 		t.Fatal(err)
 	}
 	publishTestProjection(t, db, tenant, 2)
 	repository := NewGORMRepositoryWithLocation(db, scopedContractBusinessLocation(t))
-	orgCtx := auth.WithPrincipal(context.Background(), auth.Principal{TenantID: tenant, UserID: "sales-director", ScopeMode: "ORG", OrganizationIDs: []string{"org-a"}})
+	orgCtx := auth.WithPrincipal(context.Background(), auth.Principal{TenantID: tenant, UserID: "sales-director", ScopeMode: "ORG", Permissions: map[string]struct{}{"dashboard.contract.view": {}, "dashboard.project.view": {}}, OrganizationIDs: []string{"org-a"}})
 	contract, available, err := repository.LatestContract(orgCtx, tenant)
 	if err != nil || !available || contract.TotalAmountMinor != 10000 || contract.TotalContracts != 1 {
 		t.Fatalf("org contract=%+v available=%v err=%v", contract, available, err)

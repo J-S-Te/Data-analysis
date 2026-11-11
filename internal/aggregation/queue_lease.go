@@ -215,11 +215,12 @@ func queueSourceError(err error) string {
 	return string(runes[:queueSourceErrorLimit-3]) + "..."
 }
 
-// markQueueSource 在队列任务终态事务内推进 sync_source 水位（BIZ-DATA-03），
-// 使管理员手工触发（队列）的同步与定时 RunOnce 写同一份状态。
-// 与 Runner.mark 保持同一防回退条件：仅当已有水位不新于本轮开始时间时才覆盖，
-// 迟到的旧工作器不能回退更新一轮的结果。暂停与租约丢失不调用本函数。
-func (r *Runner) markQueueSource(tx *gorm.DB, code string, roundStart time.Time, runErr error) error {
+// markQueueSource 在队列终态事务内推进来源状态与真实成功凭据，拒绝旧轮次回退。
+// 参数：tx 为终态事务，code 为来源，roundStart/finishedAt 为数据库起止时间，runErr 为执行结果。
+// 返回值：水位写入失败返回错误；失败保留既有成功时间，暂停与租约失效不调用本函数。
+func (r *Runner) markQueueSource(
+	tx *gorm.DB, code string, roundStart, finishedAt time.Time, runErr error,
+) error {
 	if code == "" {
 		return nil
 	}
@@ -227,12 +228,17 @@ func (r *Runner) markQueueSource(tx *gorm.DB, code string, roundStart time.Time,
 	if runErr != nil {
 		updates["last_status"] = statusFailed
 		updates["last_error"] = queueSourceError(runErr)
+	} else {
+		updates["last_success_at"] = finishedAt
 	}
 	return tx.Model(&SyncSource{}).
 		Where("tenant_id = ? AND subsystem_code = ? AND (last_run_at IS NULL OR last_run_at <= ?)", r.tenantID, code, roundStart).
 		Updates(updates).Error
 }
 
+// finishQueueJob 在有效租约行锁内提交任务终态与来源成功凭据。
+// 参数：ctx 为终态上下文，l 为持有者租约，runErr 为执行错误，pause 表示保留任务等待重放。
+// 返回值：租约失效或事务失败返回错误，任务与来源状态一起提交或回滚。
 func (r *Runner) finishQueueJob(ctx context.Context, l queueLease, runErr error, pause bool) error {
 	return r.aggDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		leaseCtx := context.WithValue(ctx, queueLeaseKey{}, l)
@@ -271,7 +277,13 @@ func (r *Runner) finishQueueJob(ctx context.Context, l queueLease, runErr error,
 		if current.StartedAt != nil {
 			roundStart = *current.StartedAt
 		}
-		if err := r.markQueueSource(tx, current.SubsystemCode, roundStart, runErr); err != nil {
+		sourceErr := runErr
+		var approvalErr *ContractApprovalError
+		if current.SubsystemCode == "contract_management" && errors.As(runErr, &approvalErr) {
+			// 合同已完整发布；审批通道已独立记录失败，队列仍保留部分失败终态。
+			sourceErr = nil
+		}
+		if err := r.markQueueSource(tx, current.SubsystemCode, roundStart, now, sourceErr); err != nil {
 			return fmt.Errorf("finish queue job: mark source watermark: %w", err)
 		}
 		return nil

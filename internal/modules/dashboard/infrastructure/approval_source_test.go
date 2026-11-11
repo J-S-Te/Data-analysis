@@ -18,7 +18,6 @@ func approvalFixture(t *testing.T) *gorm.DB {
 	t.Helper()
 	db := scopedContractFixture(t)
 	for _, ddl := range []string{
-		`ALTER TABLE sync_source ADD COLUMN last_success_at DATETIME`,
 		`CREATE TABLE dim_contract_approval (
 			tenant_id TEXT, contract_id TEXT, approval_id TEXT, kind TEXT, status TEXT,
 			started_at DATETIME, completed_at DATETIME, updated_at DATETIME,

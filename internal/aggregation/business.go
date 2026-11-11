@@ -73,11 +73,17 @@ type businessRow struct {
 
 func (businessRow) TableName() string { return "business_dashboard_snapshot" }
 
+// storeBusiness 原子保存本租户来源快照，真实来源时间不被本地同步时间覆盖。
+// 参数：ctx 为许可/租约上下文，section 为指标分区，value 为已验证的完整快照。
+// 返回值：持久化或权限错误；拒绝同来源水位倒退并保留既有快照。
 func (r *Runner) storeBusiness(ctx context.Context, section string, value domain.BusinessSnapshot) error {
 	if err := r.checkLicense(ctx); err != nil {
 		return err
 	}
 	value.Available, value.TenantID = true, r.tenantID
+	if value.SourceCode == "" {
+		value.SourceCode = businessSourceCode(section)
+	}
 	now := time.Now().UTC()
 	value.SnapshotAt = now.Format(time.RFC3339Nano)
 	encoded, err := json.Marshal(value)
@@ -85,6 +91,9 @@ func (r *Runner) storeBusiness(ctx context.Context, section string, value domain
 		return err
 	}
 	return r.aggregationWrite(ctx, func(tx *gorm.DB) error {
+		if err := verifyBusinessWatermark(tx, r.tenantID, section, value); err != nil {
+			return err
+		}
 		return tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "tenant_id"}, {Name: "section"}}, DoUpdates: clause.AssignmentColumns([]string{"snapshot_at", "payload"})}).Create(&businessRow{r.tenantID, section, now, string(encoded)}).Error
 	})
 }
@@ -201,14 +210,30 @@ func financeStatistics(ctx context.Context, db *gorm.DB, tenant string, now time
 		CollectionRate     *float64 `json:"collection_rate"`
 	}
 	var rows []currencyTotals
-	if err := db.WithContext(ctx).Table("settlement_receivable").Select("currency, ROUND(SUM(original_amount)*100) original_minor, ROUND(SUM(received_allocated_amount)*100) allocated_minor, ROUND(SUM(open_amount)*100) open_minor, ROUND(SUM(CASE WHEN due_date < ? THEN open_amount ELSE 0 END)*100) over90_minor", cutoff).Where("tenant_id = ? AND recognition_status = 'CONFIRMED'", tenant).Group("currency").Order("currency").Scan(&rows).Error; err != nil {
+	if err := db.WithContext(ctx).Table("settlement_receivable AS r").
+		Joins("JOIN settlement_contract_snapshot cs ON cs.id=r.contract_snapshot_id AND cs.tenant_id=r.tenant_id").
+		Select(`r.currency, ROUND(SUM(r.original_amount)*100) original_minor,
+            ROUND(SUM(r.received_allocated_amount)*100) allocated_minor,
+            ROUND(SUM(r.open_amount)*100) open_minor,
+            ROUND(SUM(CASE WHEN r.due_date < ? THEN r.open_amount ELSE 0 END)*100) over90_minor`, cutoff).
+		Where("r.tenant_id=? AND r.recognition_status='CONFIRMED' AND cs.migration_state='RELEASED'", tenant).
+		Group("r.currency").Order("r.currency").Scan(&rows).Error; err != nil {
 		return domain.BusinessSnapshot{}, err
 	}
 	var receipts []struct {
 		Currency string
 		Minor    int64
 	}
-	if err := db.WithContext(ctx).Table("settlement_receipt").Select("currency, ROUND(SUM(amount)*100) minor").Where("tenant_id = ? AND status IN ('AVAILABLE','PARTIALLY_ALLOCATED','FULLY_ALLOCATED') AND receipt_date >= ? AND receipt_date < ?", tenant, monthStart.Format("2006-01-02"), monthStart.AddDate(0, 1, 0).Format("2006-01-02")).Group("currency").Order("currency").Scan(&receipts).Error; err != nil {
+	if err := db.WithContext(ctx).Table("settlement_receipt AS rc").
+		Select("rc.currency, ROUND(SUM(rc.amount)*100) minor").
+		Where(`rc.tenant_id=? AND rc.status IN ('AVAILABLE','PARTIALLY_ALLOCATED','FULLY_ALLOCATED')
+            AND rc.receipt_date >= ? AND rc.receipt_date < ?
+            AND NOT EXISTS (SELECT 1 FROM settlement_import_fact f
+                JOIN settlement_contract_snapshot cs ON cs.id=f.contract_snapshot_id AND cs.tenant_id=f.tenant_id
+                WHERE f.tenant_id=rc.tenant_id AND f.target_business_id=rc.id AND f.fact_type='RECEIPT'
+                    AND cs.migration_state <> 'RELEASED')`, tenant,
+			monthStart.Format("2006-01-02"), monthStart.AddDate(0, 1, 0).Format("2006-01-02")).
+		Group("rc.currency").Order("rc.currency").Scan(&receipts).Error; err != nil {
 		return domain.BusinessSnapshot{}, err
 	}
 	byCurrency := map[string]int{}
@@ -231,20 +256,25 @@ func financeStatistics(ctx context.Context, db *gorm.DB, tenant string, now time
 	if rows == nil {
 		rows = []currencyTotals{}
 	}
-	return domain.BusinessSnapshot{Metrics: map[string]any{"currencies": rows, "month": monthStart.Format("2006-01"), "as_of_date": asOfDate}, MissingMetrics: []string{"recognized_income", "department_cost"}, Basis: "按币种分别计算，金额为分；回款率=已核销回款/原始应收；账龄按到期日超过90天的未清余额；本月已登记回款不是收入确认；as_of_date、90天账龄截止日与本月前缀按业务日时区（DASHBOARD_TIMEZONE，默认 Asia/Shanghai）计算，存储时间戳仍为 UTC。"}, nil
+	return domain.BusinessSnapshot{Metrics: map[string]any{"currencies": rows, "month": monthStart.Format("2006-01"), "as_of_date": asOfDate}, MissingMetrics: []string{"recognized_income", "department_cost"}, Basis: "按币种分别计算，金额为分；只计RELEASED合同的CONFIRMED应收及非HOLD有效回款；回款率=已核销回款/原始应收；账龄按到期日超过90天的未清余额；本月已登记回款不是收入确认；as_of_date、90天账龄截止日与本月前缀按业务日时区（DASHBOARD_TIMEZONE，默认 Asia/Shanghai）计算，存储时间戳仍为 UTC。"}, nil
 }
 
-// syncProject publishes the API projection and optional report independently.
-// Report statistics never serve as evidence that a complete projection exists.
+// syncProject 分别同步完整项目投影和报告指标，报告不作为投影完整性的凭据。
+// 参数：ctx 为许可/租约上下文，dsn 为可选历史只读通道。
+// 返回值：各已配置通道错误；API配置后失败不切换到其他来源伪造成功。
 func (r *Runner) syncProject(ctx context.Context, dsn string) error {
 	var projectionErr, reportErr error
 	if r.ProjectProjection.URL != "" {
 		projectionErr = r.syncProjectProjection(ctx)
 	}
-	if dsn != "" {
+	apiConfigured := r.ProjectAPI != nil && r.ProjectAPI.options.ProjectReportURL != ""
+	if apiConfigured {
+		reportErr = r.syncBusinessHTTP(ctx, "report", r.ProjectAPI.options.ProjectReportURL,
+			r.ProjectAPI.options.ProjectCredential)
+	} else if dsn != "" {
 		reportErr = r.syncBusiness(ctx, "project_management", dsn)
 	}
-	if r.ProjectProjection.URL == "" && dsn == "" {
+	if r.ProjectProjection.URL == "" && dsn == "" && !apiConfigured {
 		return errors.New("project source is not configured")
 	}
 	return errors.Join(projectionErr, reportErr)

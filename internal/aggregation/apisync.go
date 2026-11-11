@@ -26,11 +26,14 @@ type APISyncOptions struct {
 	MachineTokenAudience string
 	ContractCredential   MachineCredential
 	ProjectCredential    MachineCredential
+	SettlementCredential MachineCredential
 	// 子系统 internal 接口
-	ContractInternalURL string
-	ProjectInternalURL  string
-	TenantID            string
-	HTTPTimeout         time.Duration
+	ContractInternalURL  string
+	ProjectInternalURL   string
+	ProjectReportURL     string
+	SettlementFinanceURL string
+	TenantID             string
+	HTTPTimeout          time.Duration
 }
 
 // MachineCredential 是单个上游读取用途的最小权限凭据。
@@ -325,6 +328,9 @@ func (r *APISyncRunner) syncContractDashboard(ctx context.Context, sink contract
 	})
 }
 
+// persistContractDashboard 在有效许可与租约下发布已校验合同快照。
+// 参数：ctx 为本轮上下文，snapshot 为匹配本租户的来源统计。
+// 返回值：许可、租约或数据库错误，失败不发布快照。
 func (r *APISyncRunner) persistContractDashboard(ctx context.Context, snapshot contractDashboardSnapshot) error {
 	if err := r.checkLicense(ctx); err != nil {
 		return err
@@ -337,19 +343,19 @@ func (r *APISyncRunner) persistContractDashboard(ctx context.Context, snapshot c
 	if err != nil {
 		return err
 	}
-	if err := r.db.Exec(`INSERT INTO api_contract_dashboard
+	if err := r.writeAPISnapshot(ctx, `INSERT INTO api_contract_dashboard
 (tenant_id, snapshot_at, total_amount_minor, currency_totals_json, total_contracts, approval_contracts, active_contracts, expired_contracts, source)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'contract-api')`,
 		snapshot.TenantID, snapshot.SnapshotAt, snapshot.TotalAmountMinor, string(currencyTotals), snapshot.TotalContracts,
-		snapshot.ApprovalContracts, snapshot.ActiveContracts, snapshot.ExpiredContracts).Error; err != nil {
+		snapshot.ApprovalContracts, snapshot.ActiveContracts, snapshot.ExpiredContracts); err != nil {
 		return err
 	}
 	return nil
 }
 
-// SyncProjectDashboard 调项目系统 internal/dashboard，写 api_project_dashboard 快照。
-// 返回错误的典型触发条件包括：项目内置接口未配置、租户 ID 未配置、机器令牌获取失败、
-// 内部接口非 200、JSON 反序列化失败，或数据库写入失败。
+// SyncProjectDashboard 读取项目机器接口并在许可与租约内发布快照。
+// 参数：ctx 为本轮请求、取消和队列租约上下文。
+// 返回值：来源配置、认证、响应或持久化错误；失败保留上次快照。
 func (r *APISyncRunner) SyncProjectDashboard(ctx context.Context) error {
 	if err := r.checkLicense(ctx); err != nil {
 		return err
@@ -413,11 +419,11 @@ func (r *APISyncRunner) SyncProjectDashboard(ctx context.Context) error {
 	if err := r.checkLicense(ctx); err != nil {
 		return err
 	}
-	if err := r.db.Exec(`INSERT INTO api_project_dashboard
+	if err := r.writeAPISnapshot(ctx, `INSERT INTO api_project_dashboard
 (tenant_id, snapshot_at, project_count, in_flight_projects, risk_projects, service_items, status_counts_json, report_stage_counts_json, source)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'project-api')`,
 		r.options.TenantID, now, payload.Data.ProjectCount, payload.Data.InFlightProjects,
-		payload.Data.RiskProjects, payload.Data.ServiceItems, string(statusJSON), reportStageJSON).Error; err != nil {
+		payload.Data.RiskProjects, payload.Data.ServiceItems, string(statusJSON), reportStageJSON); err != nil {
 		return err
 	}
 	return nil

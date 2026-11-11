@@ -109,3 +109,17 @@ func (service *Service) Trend(ctx context.Context, tenantID string, months int) 
 	}
 	return points, nil
 }
+
+// Projects 返回当前可信范围的已发布项目分页明细。
+// 参数：ctx 为会话上下文，tenantID 为租户，page/pageSize 为分页请求。
+// 返回值：带可用性及来源水位的项目明细；未配置或读取失败时返回错误。
+func (service *Service) Projects(ctx context.Context, tenantID string, page, pageSize int) (domain.ProjectDetails, error) {
+	repository, ok := service.snapshots.(interface {
+		ListProjects(context.Context, string, int, int) (domain.ProjectDetails, error)
+	})
+	if !ok {
+		return domain.ProjectDetails{}, errors.New("project detail repository is not configured")
+	}
+	page, pageSize = normalizeContractDetailPagination(page, pageSize)
+	return repository.ListProjects(ctx, tenantID, page, pageSize)
+}

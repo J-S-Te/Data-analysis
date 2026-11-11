@@ -21,6 +21,7 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/aggregation"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard/application"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard/domain"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/auth"
 )
 
 // DashboardTimezone 是看板“今天/到期”业务日的默认时区。
@@ -30,8 +31,9 @@ const DashboardTimezone = "Asia/Shanghai"
 
 // GORMRepository 从 MySQL 视图读取物化看板快照。
 type GORMRepository struct {
-	db            *gorm.DB
-	financeSource string
+	db                     *gorm.DB
+	financeSource          string
+	integrationSyncEnabled *bool
 	// location 是“今天/到期”业务日所在时区；为零值时按 UTC 处理。
 	location *time.Location
 	// approvalSource 是“审批中”口径；零值按 status（源状态 pending 近似）处理，
@@ -109,6 +111,8 @@ func (repository *GORMRepository) businessDate(now time.Time) string {
 }
 
 // LatestContract 返回租户最新合同聚合。
+// 参数：ctx 含可信会话范围，tenantID 为租户。
+// 返回值：快照、成功凭据标记及依赖错误。
 func (repository *GORMRepository) LatestContract(ctx context.Context, tenantID string) (domain.ContractSnapshot, bool, error) {
 	scope := scopeFor(ctx, tenantID)
 	if scope.mode != "TENANT" {
@@ -153,10 +157,7 @@ func (repository *GORMRepository) LatestContract(ctx context.Context, tenantID s
 		TenantID: row.TenantID, SnapshotAt: row.SnapshotAt, TotalAmountMinor: row.TotalAmountMinor, CurrencyTotals: currencyTotals,
 		// 全租户分支读取接口持久快照：snapshot_at 是该快照的写入时间，
 		// computed_at 另列本次查询时间，既有 snapshot_at 语义保持不变。
-		Freshness: application.BuildFreshness(application.FreshnessInput{
-			PersistedSnapshot:   true,
-			PersistedSnapshotAt: row.SnapshotAt,
-		}, time.Now().UTC()),
+		Freshness:      repository.apiSnapshotFreshness(ctx, tenantID, "contract_dashboard", row.SnapshotAt),
 		TotalContracts: row.TotalContracts, ApprovalContracts: row.ApprovalContracts,
 		ActiveContracts: row.ActiveContracts, ExpiredContracts: row.ExpiredContracts,
 		OpportunityCount: funnel.OpportunityCount, WonContractCount: funnel.WonContractCount, DiscountBuckets: buckets,
@@ -167,6 +168,8 @@ func (repository *GORMRepository) LatestContract(ctx context.Context, tenantID s
 }
 
 // LatestProject 返回租户最新项目聚合。
+// 参数：ctx 含可信会话范围，tenantID 为租户。
+// 返回值：快照、可用标记及持久化错误。
 func (repository *GORMRepository) LatestProject(ctx context.Context, tenantID string) (domain.ProjectSnapshot, bool, error) {
 	scope := scopeFor(ctx, tenantID)
 	if scope.mode != "TENANT" {
@@ -208,10 +211,7 @@ func (repository *GORMRepository) LatestProject(ctx context.Context, tenantID st
 	}
 	return domain.ProjectSnapshot{
 		TenantID: row.TenantID, SnapshotAt: row.SnapshotAt,
-		Freshness: application.BuildFreshness(application.FreshnessInput{
-			PersistedSnapshot:   true,
-			PersistedSnapshotAt: row.SnapshotAt,
-		}, time.Now().UTC()),
+		Freshness:        repository.apiSnapshotFreshness(ctx, tenantID, "project_dashboard", row.SnapshotAt),
 		ProjectCount:     row.ProjectCount,
 		InFlightProjects: row.InFlightProjects, RiskProjects: row.RiskProjects,
 		ServiceItems: row.ServiceItems, StatusCounts: statusCounts,
@@ -281,7 +281,9 @@ func (repository *GORMRepository) projectTrendArgs(now time.Time, tenantID strin
 	return []any{offset, offset, tenantID, repository.businessMonthWindowStart(now, months), months}
 }
 
-// ListTrend 返回最近若干月的合同和项目趋势；缺失月份由前端按空值展示。
+// ListTrend 返回按来源权限隔离的原币种合同与项目月度趋势。
+// 参数：ctx 含可信权限与范围，tenantID 为租户，months 为月份上限。
+// 返回值：月度事实列表及数据库错误，未授权来源不参与查询。
 func (repository *GORMRepository) ListTrend(ctx context.Context, tenantID string, months int) ([]domain.TrendPoint, error) {
 	if months < 1 || months > 24 {
 		months = 12
@@ -296,11 +298,14 @@ func (repository *GORMRepository) ListTrend(ctx context.Context, tenantID string
 		Amount   int64
 		Count    int64
 	}
-	err := repository.db.WithContext(ctx).Table("fct_contract_signing f").
-		Select("f.period_month period, f.currency, COALESCE(SUM(f.sign_amount_minor),0) amount, COALESCE(SUM(f.contract_count),0) count").
-		Where("f.tenant_id = ?", tenantID).Group("f.period_month, f.currency").Order("f.period_month DESC").Limit(months * 8).Scan(&contractFacts).Error
-	if err != nil {
-		return nil, err
+	var err error
+	if sourcePermitted(ctx, "dashboard.contract.view") {
+		err = repository.db.WithContext(ctx).Table("fct_contract_signing f").
+			Select("f.period_month period, f.currency, COALESCE(SUM(f.sign_amount_minor),0) amount, COALESCE(SUM(f.contract_count),0) count").
+			Where("f.tenant_id = ?", tenantID).Group("f.period_month, f.currency").Order("f.period_month DESC").Limit(months * 8).Scan(&contractFacts).Error
+		if err != nil {
+			return nil, err
+		}
 	}
 	contractRows := trendRowsByCurrency(contractFacts, months)
 	// 每轮聚合均写入项目快照。将 SQL 窗口
@@ -313,8 +318,10 @@ func (repository *GORMRepository) ListTrend(ctx context.Context, tenantID string
 	// 业务月：snapshot_at 是 UTC 墙钟，先 CONVERT_TZ 到业务时区再取月前缀；
 	// 偏移以绑定参数传入（不硬编码 +08:00）。窗口下界同样取业务月边界。
 	now := time.Now()
-	if err := repository.db.WithContext(ctx).Raw(projectTrendQuery, repository.projectTrendArgs(now, tenantID, months)...).Scan(&projects).Error; err != nil {
-		return nil, err
+	if sourcePermitted(ctx, "dashboard.project.view") {
+		if err := repository.db.WithContext(ctx).Raw(projectTrendQuery, repository.projectTrendArgs(now, tenantID, months)...).Scan(&projects).Error; err != nil {
+			return nil, err
+		}
 	}
 	projectByPeriod := make(map[string]int, len(projects))
 	for _, item := range projects {
@@ -365,7 +372,30 @@ func applyOrgScope(query *gorm.DB, scope queryScope, column string) *gorm.DB {
 // 参数：ctx 为读取上下文，scope 为已解析的可信范围。
 // 返回值：范围快照、可用标记及读取错误；历史和未知来源不计入。
 func (repository *GORMRepository) scopedContract(ctx context.Context, scope queryScope) (domain.ContractSnapshot, bool, error) {
+	result := domain.ContractSnapshot{DiscountBuckets: map[string]int64{}}
+	available := false
+	err := repository.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		reader := *repository
+		reader.db = tx
+		var err error
+		result, available, err = reader.readScopedContract(ctx, scope)
+		return err
+	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	return result, available, err
+}
+
+// readScopedContract 在调用方的一致性快照内读取合同、商机及成功凭据。
+// 参数：ctx 为查询上下文，scope 为可信主体范围。
+// 返回值：范围快照、成功发布标记及依赖错误。
+func (repository *GORMRepository) readScopedContract(ctx context.Context, scope queryScope) (domain.ContractSnapshot, bool, error) {
 	if !scope.contractRowsVisible() {
+		return domain.ContractSnapshot{DiscountBuckets: map[string]int64{}}, false, nil
+	}
+	watermark, known, err := repository.syncWatermark(ctx, scope.tenantID, "contract_management")
+	if err != nil {
+		return domain.ContractSnapshot{}, false, err
+	}
+	if !known || successfulWatermark(watermark) == nil {
 		return domain.ContractSnapshot{DiscountBuckets: map[string]int64{}}, false, nil
 	}
 	var row struct {
@@ -401,7 +431,7 @@ func (repository *GORMRepository) scopedContract(ctx context.Context, scope quer
 	}
 	today := repository.businessDate(time.Now())
 	scoped := applyContractScope(repository.db.WithContext(ctx).Table("dim_contract").Where("origin_kind = 'NORMAL'").Where("tenant_id = ?", scope.tenantID), scope)
-	err := scoped.Select(`COALESCE(SUM(amount_minor),0) AS total_amount_minor, COUNT(*) AS total_contracts,
+	err = scoped.Select(`COALESCE(SUM(amount_minor),0) AS total_amount_minor, COUNT(*) AS total_contracts,
 			`+repository.approvalCountExpr()+`,
 			COALESCE(SUM(CASE WHEN status='archived' OR (status IN ('active','in_progress','pending_pay') AND (end_date IS NULL OR end_date >= ?)) THEN 1 ELSE 0 END),0) AS active_contracts,
 			COALESCE(SUM(CASE WHEN status IN ('active','in_progress','pending_pay') AND end_date IS NOT NULL AND end_date < ? THEN 1 ELSE 0 END),0) AS expired_contracts,
@@ -425,23 +455,40 @@ func (repository *GORMRepository) scopedContract(ctx context.Context, scope quer
 	// 组织/团队范围读的是异步同步的 dim_contract：源更新时间、同步水位和
 	// 本次计算时间分别来自 dim_contract.updated_at、sync_source 和 time.Now()。
 	// 同步失败/停用/超时只标记陈旧，不隐藏已同步数据。
-	freshness := repository.scopedFreshness(ctx, scope.tenantID, "contract_management", application.ParseDashboardTimestamp(stringValue(row.SourceUpdatedAt)))
+	freshness := repository.buildFreshness(application.FreshnessInput{
+		SourceUpdatedAt: application.ParseDashboardTimestamp(stringValue(row.SourceUpdatedAt)),
+		LastSuccessAt:   successfulWatermark(watermark), SyncStatus: watermark.LastStatus,
+		SyncSourceKnown: true, SyncEnabled: watermark.Enabled,
+	}, time.Now().UTC())
+	opportunityCount, wonCount, conversionAvailable, err := repository.scopedConversion(ctx, scope)
+	if err != nil {
+		return domain.ContractSnapshot{}, false, err
+	}
+	if conversionAvailable {
+		crmFreshness, err := repository.scopedConversionFreshness(ctx, scope)
+		if err != nil {
+			return domain.ContractSnapshot{}, false, err
+		}
+		freshness = mergeScopedConversionFreshness(freshness, crmFreshness)
+	}
 	snapshotAt := freshness.SourceUpdatedAt
 	if snapshotAt == "" {
 		snapshotAt = freshness.SyncedAt
 	}
 	return domain.ContractSnapshot{
-		Available: row.TotalContracts > 0, TenantID: scope.tenantID, SnapshotAt: snapshotAt, Freshness: freshness,
+		Available: true, TenantID: scope.tenantID, SnapshotAt: snapshotAt, Freshness: freshness,
 		TotalAmountMinor: row.TotalAmountMinor, CurrencyTotals: currencyTotals, TotalContracts: row.TotalContracts,
 		ApprovalContracts: row.ApprovalContracts, ActiveContracts: row.ActiveContracts, ExpiredContracts: row.ExpiredContracts,
-		DiscountBuckets: map[string]int64{}, ConversionAvailable: false,
-		ConversionBasis:           "按组织/团队范围聚合；转化率需合同与商机同粒度事实后开放。",
-		DiscountUnavailableReason: "按组织/团队范围尚无折扣分桶事实。",
-	}, row.TotalContracts > 0, nil
+		DiscountBuckets: map[string]int64{}, ConversionAvailable: conversionAvailable,
+		OpportunityCount: opportunityCount, WonContractCount: wonCount,
+		ConversionBasis:           "分母为当前范围有效商机；分子为同范围有效普通合同佐证的已签约去重商机。",
+		DiscountUnavailableReason: "尚无权威标准报价及币种基准，不能计算商业折扣。",
+	}, true, nil
 }
 
-// scopedProject reads the publication marker and its dimension rows in one RR
-// snapshot, so a concurrent atomic publish cannot mix generations.
+// scopedProject 在只读RR事务内读取同一发布代次的项目聚合。
+// 参数：ctx 为会话上下文，scope 为可信范围。
+// 返回值：聚合快照、成功发布标记及读取错误。
 func (repository *GORMRepository) scopedProject(ctx context.Context, scope queryScope) (domain.ProjectSnapshot, bool, error) {
 	// 组织/团队范围实时聚合已发布的 dim_project，两个分组口径（status /
 	// report_stage）都来自同一代次；report_stage 用空映射起步，旧行落 '' 桶。
@@ -450,7 +497,7 @@ func (repository *GORMRepository) scopedProject(ctx context.Context, scope query
 		return result, false, nil
 	}
 	result.TenantID = scope.tenantID
-	result.Freshness = application.BuildFreshness(application.FreshnessInput{}, time.Now().UTC())
+	result.Freshness = repository.buildFreshness(application.FreshnessInput{}, time.Now().UTC())
 	available := false
 	err := repository.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var state aggregation.ProjectProjectionState
@@ -506,7 +553,7 @@ func (repository *GORMRepository) scopedProject(ctx context.Context, scope query
 		if known {
 			enabled = watermark.Enabled
 		}
-		result.Freshness = application.BuildFreshness(application.FreshnessInput{SourceUpdatedAt: sourceAt, LastSuccessAt: state.LastSuccessAt, SyncStatus: state.Status, SyncSourceKnown: true, SyncEnabled: enabled}, time.Now().UTC())
+		result.Freshness = repository.buildFreshness(application.FreshnessInput{SourceUpdatedAt: sourceAt, LastSuccessAt: state.LastSuccessAt, SyncStatus: state.Status, SyncSourceKnown: true, SyncEnabled: enabled}, time.Now().UTC())
 		result.SnapshotAt = result.Freshness.SourceUpdatedAt
 		result.Available = true
 		available = true
@@ -518,16 +565,20 @@ func (repository *GORMRepository) scopedProject(ctx context.Context, scope query
 // syncWatermark 是 sync_source 中对应子系统最近一次同步的水位。
 // last_watermark 当前没有写入方，因此使用 last_run_at + last_status 作为既有水位。
 type syncWatermark struct {
-	LastRunAt  *string `gorm:"column:last_run_at"`
-	LastStatus string  `gorm:"column:last_status"`
-	Enabled    bool    `gorm:"column:enabled"`
+	LastSuccessAt *string `gorm:"column:last_success_at"`
+	LastWatermark *string `gorm:"column:last_watermark"`
+	LastRunAt     *string `gorm:"column:last_run_at"`
+	LastStatus    string  `gorm:"column:last_status"`
+	Enabled       bool    `gorm:"column:enabled"`
 }
 
-// syncWatermark 返回指定租户/子系统最近一次登记的水位；没有记录时 known=false。
+// syncWatermark 读取指定租户和来源的尝试状态及独立成功水位。
+// 参数：ctx 为读取上下文，tenantID 为租户，subsystemCode 为来源代码。
+// 返回值：水位、存在标记及数据库错误；缺记录不伪造成功。
 func (repository *GORMRepository) syncWatermark(ctx context.Context, tenantID, subsystemCode string) (syncWatermark, bool, error) {
 	var row syncWatermark
 	err := repository.db.WithContext(ctx).Table("sync_source").
-		Select("last_run_at, last_status, enabled").
+		Select("last_run_at, last_status, last_success_at, last_watermark, enabled").
 		Where("tenant_id = ? AND subsystem_code = ?", tenantID, subsystemCode).
 		Order("updated_at DESC, id DESC").
 		Take(&row).Error
@@ -548,7 +599,7 @@ func (repository *GORMRepository) scopedFreshness(ctx context.Context, tenantID,
 		slog.Warn("dashboard sync watermark unavailable", "subsystem", subsystemCode, "error", err)
 		known = false
 	}
-	return application.BuildFreshness(application.FreshnessInput{
+	return repository.buildFreshness(application.FreshnessInput{
 		SourceUpdatedAt: sourceUpdatedAt,
 		LastSyncAt:      application.ParseDashboardTimestamp(stringValue(watermark.LastRunAt)),
 		SyncStatus:      watermark.LastStatus,
@@ -579,11 +630,14 @@ func (repository *GORMRepository) scopedTrend(ctx context.Context, scope querySc
 	}
 	// start_date 是 DATE（无时区），但回退分支 DATE(updated_at) 是 UTC 日，
 	// 必须先换算到业务时区再取月前缀，否则签约月会落在上一个月。
-	err := applyContractScope(repository.db.WithContext(ctx).Table("dim_contract").Where("origin_kind = 'NORMAL'").Where("tenant_id = ?", scope.tenantID), scope).
-		Select(contractSigningPeriodExpr(repository.db.Dialector.Name())+" AS period, currency, COALESCE(SUM(amount_minor),0) AS amount, COUNT(*) AS count", repository.businessOffset(time.Now())).
-		Group("period,currency").Order("period DESC").Limit(months * 8).Scan(&contractFacts).Error
-	if err != nil {
-		return nil, err
+	var err error
+	if sourcePermitted(ctx, "dashboard.contract.view") {
+		err = applyContractScope(repository.db.WithContext(ctx).Table("dim_contract").Where("origin_kind = 'NORMAL'").Where("tenant_id = ?", scope.tenantID), scope).
+			Select(contractSigningPeriodExpr(repository.db.Dialector.Name())+" AS period, currency, COALESCE(SUM(amount_minor),0) AS amount, COUNT(*) AS count", repository.businessOffset(time.Now())).
+			Group("period,currency").Order("period DESC").Limit(months * 8).Scan(&contractFacts).Error
+		if err != nil {
+			return nil, err
+		}
 	}
 	contractRows := trendRowsByCurrency(contractFacts, months)
 	projectByPeriod, err := repository.projectCreationTrend(ctx, scope)
@@ -593,6 +647,9 @@ func (repository *GORMRepository) scopedTrend(ctx context.Context, scope querySc
 	return mergeTrendPoints(contractRows, projectByPeriod, months), nil
 }
 
+// trendRowsByCurrency 将月度事实按币种保留，不产生混币总金额。
+// 参数：facts 为按月份排序的原币种事实，months 为月份上限。
+// 返回值：月度趋势，兼容总额只在单币种时赋值。
 func trendRowsByCurrency(facts []struct {
 	Period   string
 	Currency string
@@ -604,11 +661,10 @@ func trendRowsByCurrency(facts []struct {
 	for _, fact := range facts {
 		point := byPeriod[fact.Period]
 		if point == nil {
-			point = &domain.TrendPoint{Period: fact.Period}
+			point = &domain.TrendPoint{Period: fact.Period, ContractAvailable: true}
 			byPeriod[fact.Period] = point
 			order = append(order, fact.Period)
 		}
-		point.ContractAmountMinor += fact.Amount
 		point.ContractCount += fact.Count
 		point.CurrencyTotals = append(point.CurrencyTotals, domain.ContractCurrencyTotal{Currency: fact.Currency, AmountMinor: fact.Amount, Contracts: fact.Count})
 	}
@@ -617,7 +673,12 @@ func trendRowsByCurrency(facts []struct {
 		if len(rows) >= months {
 			break
 		}
-		rows = append(rows, *byPeriod[period])
+		point := byPeriod[period]
+		// 兼容单币种旧字段；多币种没有可相加的总金额。
+		if len(point.CurrencyTotals) == 1 {
+			point.ContractAmountMinor = point.CurrencyTotals[0].AmountMinor
+		}
+		rows = append(rows, *point)
 	}
 	return rows
 }
@@ -628,13 +689,14 @@ func mergeTrendPoints(contractRows []domain.TrendPoint, projectByPeriod map[stri
 	byPeriod := make(map[string]domain.TrendPoint, len(contractRows)+len(projectByPeriod))
 	for _, row := range contractRows {
 		row.ProjectCount = int64(projectByPeriod[row.Period])
+		_, row.ProjectAvailable = projectByPeriod[row.Period]
 		byPeriod[row.Period] = row
 	}
 	for period, projectCount := range projectByPeriod {
 		if _, exists := byPeriod[period]; exists {
 			continue
 		}
-		byPeriod[period] = domain.TrendPoint{Period: period, ProjectCount: int64(projectCount)}
+		byPeriod[period] = domain.TrendPoint{Period: period, ProjectCount: int64(projectCount), ProjectAvailable: true}
 	}
 	periods := make([]string, 0, len(byPeriod))
 	for period := range byPeriod {
@@ -654,7 +716,7 @@ func mergeTrendPoints(contractRows []domain.TrendPoint, projectByPeriod map[stri
 // projectCreationTrend uses source creation months only after a complete publish.
 func (repository *GORMRepository) projectCreationTrend(ctx context.Context, scope queryScope) (map[string]int, error) {
 	counts := map[string]int{}
-	if !scope.projectRowsVisible() {
+	if !scope.projectRowsVisible() || !sourcePermitted(ctx, "dashboard.project.view") {
 		return counts, nil
 	}
 	err := repository.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -688,4 +750,35 @@ func (repository *GORMRepository) projectCreationTrend(ctx context.Context, scop
 }
 func projectPublished(state aggregation.ProjectProjectionState) bool {
 	return state.LastSuccessAt != nil && state.PublishedRunID != "" && state.PublishedSnapshotID != "" && state.PublishedSourceSnapshotAt != nil && len(state.PublishedChecksumSHA256) == 64
+}
+
+// sourcePermitted 在趋势组合接口中逐来源检查真实会话权限。
+// 参数：ctx 为主体上下文，permission 为来源看板查看权限。
+// 返回值：有主体时仅授权来源可见；无主体兼容模块内部调用。
+func sourcePermitted(ctx context.Context, permission string) bool {
+	principal, ok := auth.FromContext(ctx)
+	if !ok {
+		return true
+	}
+	return principal.HasPermission(permission)
+}
+
+// WithIntegrationSyncEnabled 为业务快照注入外部同步总开关。
+// 参数：enabled 为已校验的运行配置。
+// 返回值：当前仓储；停用仍保留旧快照及最后成功水位。
+func (repository *GORMRepository) WithIntegrationSyncEnabled(enabled bool) *GORMRepository {
+	repository.integrationSyncEnabled = &enabled
+	return repository
+}
+
+// buildFreshness 叠加外部同步停用状态，保留所有真实来源时间。
+// 参数：input 为独立来源凭据，now 为本次计算时间。
+// 返回值：时间与陈旧信息；总开关停用时不伪装新鲜。
+func (repository *GORMRepository) buildFreshness(input application.FreshnessInput, now time.Time) domain.DataFreshness {
+	result := application.BuildFreshness(input, now)
+	if repository.integrationSyncEnabled != nil && !*repository.integrationSyncEnabled {
+		result.Stale = true
+		result.StaleReason = "业务来源同步已停用，展示上次成功数据。"
+	}
+	return result
 }

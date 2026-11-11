@@ -39,7 +39,7 @@ func freshnessTestDB(t *testing.T) *gorm.DB {
 			owner_org_id TEXT, snapshot_id TEXT, risk BOOLEAN, in_flight BOOLEAN, service_items INTEGER, source_updated_at DATETIME, created_at DATETIME, updated_at DATETIME)`,
 		`CREATE TABLE sync_source (
 			id TEXT, tenant_id TEXT, subsystem_code TEXT, db_schema TEXT, enabled BOOLEAN,
-			last_watermark DATETIME, last_run_at DATETIME, last_status TEXT, last_error TEXT, updated_at DATETIME)`,
+			last_success_at DATETIME, last_watermark DATETIME, last_run_at DATETIME, last_status TEXT, last_error TEXT, updated_at DATETIME)`,
 		`CREATE TABLE api_contract_dashboard (
 			tenant_id TEXT, snapshot_at TEXT, total_amount_minor INTEGER, currency_totals_json TEXT,
 			total_contracts INTEGER, approval_contracts INTEGER, active_contracts INTEGER, expired_contracts INTEGER)`,
@@ -79,8 +79,8 @@ func TestScopedContractFreshnessSeparatesSourceSyncAndComputedTimes(t *testing.T
 		t.Fatal(err)
 	}
 	if err := db.Exec(`INSERT INTO sync_source
-		(id, tenant_id, subsystem_code, db_schema, enabled, last_run_at, last_status, updated_at)
-		VALUES ('s-1', ?, 'contract_management', 'contract_management', 1, ?, 'SUCCESS', ?)`, tenant, syncedAt, syncedAt).Error; err != nil {
+		(id, tenant_id, subsystem_code, db_schema, enabled, last_run_at, last_status, last_success_at, updated_at)
+		VALUES ('s-1', ?, 'contract_management', 'contract_management', 1, ?, 'SUCCESS', ?, ?)`, tenant, syncedAt, syncedAt, syncedAt).Error; err != nil {
 		t.Fatal(err)
 	}
 
@@ -124,8 +124,8 @@ func TestScopedContractFreshnessMarksFailedSourceSyncStale(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := db.Exec(`INSERT INTO sync_source
-		(id, tenant_id, subsystem_code, db_schema, enabled, last_run_at, last_status, updated_at)
-		VALUES ('s-2', ?, 'contract_management', 'contract_management', 1, ?, 'FAILED', ?)`, tenant, time.Now().UTC().Add(-time.Hour), time.Now().UTC()).Error; err != nil {
+		(id, tenant_id, subsystem_code, db_schema, enabled, last_run_at, last_status, last_success_at, updated_at)
+		VALUES ('s-2', ?, 'contract_management', 'contract_management', 1, ?, 'FAILED', ?, ?)`, tenant, time.Now().UTC().Add(-time.Hour), sourceAt, time.Now().UTC()).Error; err != nil {
 		t.Fatal(err)
 	}
 	snapshot, available, err := repository.LatestContract(orgScopeContext(tenant, "org-a"), tenant)
@@ -135,8 +135,8 @@ func TestScopedContractFreshnessMarksFailedSourceSyncStale(t *testing.T) {
 	if !snapshot.Freshness.Stale || !strings.Contains(snapshot.Freshness.StaleReason, "失败") {
 		t.Fatalf("freshness=%+v, want stale failed-sync reason", snapshot.Freshness)
 	}
-	if snapshot.Freshness.SyncedAt != "" {
-		t.Fatalf("synced_at=%q, want empty for failed sync", snapshot.Freshness.SyncedAt)
+	if snapshot.Freshness.SyncedAt == "" {
+		t.Fatalf("synced_at=%q, want retained success for failed sync", snapshot.Freshness.SyncedAt)
 	}
 	if snapshot.SnapshotAt != snapshot.Freshness.SourceUpdatedAt {
 		t.Fatalf("snapshot_at=%q, want source update time", snapshot.SnapshotAt)
