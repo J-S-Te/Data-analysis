@@ -374,6 +374,8 @@ func (r *Runner) runSource(ctx context.Context, code, dsn string) error {
 // 参数：ctx 为权限上下文，code/status 为来源和状态，runAt 为轮次开始，errMsg 为失败摘要。
 // 返回值：无；状态更新受许可、租约和轮次时间防护。
 func (r *Runner) mark(ctx context.Context, code string, status string, runAt time.Time, errMsg *string) {
+	// DATETIME(3) 会四舍五入更细的小数；统一截断避免同轮终态比较落空。
+	runAt = runAt.UTC().Truncate(time.Millisecond)
 	updates := map[string]interface{}{"last_status": status, "last_run_at": runAt, "updated_at": time.Now().UTC()}
 	if status == statusSuccess {
 		// 持久化“曾经成功”：后续失败不清除，供看板 instances 口径的升级门禁使用。
