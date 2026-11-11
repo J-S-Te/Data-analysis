@@ -19,11 +19,19 @@ func NewCatalogService(dbs ...*gorm.DB) *CatalogService {
 	return &CatalogService{db: db}
 }
 
-// Get 返回已发布指标字典，不暴露可变存储。
+// Get 返回已发布指标字典及当前看板能力说明。
+// 参数：无。
+// 返回值：独立字典视图；口径确认与实际数据能力分别说明。
 func (service *CatalogService) Get() domain.Catalog {
 	return domain.Catalog{
 		Version: "2026-07-28", Source: "Data-analysis/数据看板与统计分析子系统·指标字典（模板）.md",
-		Status: "BUILTIN_CATALOG", Note: "目录版本是内置口径发布日期；各指标version是租户定义版本。指标定义维护不自动接入统计计算；只有绑定受控执行器的指标可启用", Metrics: builtinMetrics(),
+		Status: "BUILTIN_CATALOG", Note: "目录版本是内置口径发布日期；各指标version是租户定义版本。" +
+			"状态‘已确认’表示定义口径，不表示统计来源已经接入；定义维护不自动改变原生看板计算。" +
+			"当前原生看板支持合同与项目统计、有效报告版本及编制完成至签发的P50、" +
+			"分币种应收、净核销回款和超过90天的未清余额；报告周期仅统计完整且非负的样本。" +
+			"折扣缺权威标准报价与币种基准；工时、设备使用、首次审核通过、投诉、" +
+			"收入确认和部门成本等事实未接入时明确不可计算，不补零。" +
+			"只有绑定受控执行器的字典指标可启用。", Metrics: builtinMetrics(),
 	}
 }
 
