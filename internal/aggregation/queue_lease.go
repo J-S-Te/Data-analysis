@@ -283,6 +283,10 @@ func (r *Runner) finishQueueJob(ctx context.Context, l queueLease, runErr error,
 			// 合同已完整发布；审批通道已独立记录失败，队列仍保留部分失败终态。
 			sourceErr = nil
 		}
+		// 新指标已在payload事务内发布成功水位，终态不得再分次推进。
+		if isMetricSource(current.SubsystemCode) && sourceErr == nil {
+			return nil
+		}
 		if err := r.markQueueSource(tx, current.SubsystemCode, roundStart, now, sourceErr); err != nil {
 			return fmt.Errorf("finish queue job: mark source watermark: %w", err)
 		}
@@ -290,6 +294,9 @@ func (r *Runner) finishQueueJob(ctx context.Context, l queueLease, runErr error,
 	})
 }
 
+// executeQueueJob 执行持租约任务并提交终态，新增指标失败必须返回调用方。
+// 参数：ctx为轮次上下文，job/l为任务及租约，三个时长控制有效期，run为来源执行器。
+// 返回值：基础设施、许可或新指标执行错误；旧来源沿既有任务终态语义。
 func (r *Runner) executeQueueJob(ctx context.Context, job SyncJob, l queueLease, duration, heartbeat, timeout time.Duration, run func(context.Context, string, string) error) error {
 	jobCtx, cancel := context.WithTimeout(context.WithValue(ctx, queueLeaseKey{}, l), timeout)
 	defer cancel()
@@ -347,6 +354,9 @@ func (r *Runner) executeQueueJob(ctx context.Context, job SyncJob, l queueLease,
 			return runErr
 		}
 		return pauseErr
+	}
+	if isMetricSource(job.SubsystemCode) {
+		return runErr
 	}
 	return nil
 }

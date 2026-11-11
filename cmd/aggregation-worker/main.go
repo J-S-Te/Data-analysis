@@ -16,14 +16,12 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/aggregation"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/integrationsync"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/metricfacts"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shutdown"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
-// main 启动受许可保护的聚合执行进程。
-// 参数：无，配置由环境和命令行提供。
-// 返回值：无，初始化或单轮失败时进程非零退出。
 // main 校验来源配置并启动受许可保护的聚合轮次。
 // 参数：无；配置来自命令行及运行环境。
 // 返回值：无；配置或执行故障以非零退出状态报告。
@@ -48,6 +46,11 @@ func main() {
 	integrationSyncEnabled, err := integrationsync.EnabledFromEnv(os.Getenv)
 	if err != nil {
 		logger.Error("integration sync configuration invalid", "error", err)
+		os.Exit(1)
+	}
+	metricFactsEnabled, err := metricfacts.EnabledFromEnv(os.Getenv)
+	if err != nil {
+		logger.Error("metric facts configuration invalid", "error", err)
 		os.Exit(1)
 	}
 	importOptions, err := importReportOptionsFromEnv()
@@ -142,6 +145,7 @@ func main() {
 			ProjectInternalURL:   os.Getenv("PROJECT_INTERNAL_URL"),
 			ProjectReportURL:     businessSources.ReportURL,
 			SettlementFinanceURL: businessSources.FinanceURL,
+			MetricFactsEnabled:   metricFactsEnabled,
 			SettlementCredential: businessSources.FinanceCredential,
 			TenantID:             os.Getenv("OIDC_TENANT_ID"),
 		})

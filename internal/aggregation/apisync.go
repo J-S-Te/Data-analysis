@@ -32,6 +32,7 @@ type APISyncOptions struct {
 	ProjectInternalURL   string
 	ProjectReportURL     string
 	SettlementFinanceURL string
+	MetricFactsEnabled   bool
 	TenantID             string
 	HTTPTimeout          time.Duration
 }

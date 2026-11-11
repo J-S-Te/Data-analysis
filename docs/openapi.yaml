@@ -11,6 +11,49 @@ servers:
 security:
   - browserSession: []
 paths:
+  /dashboard/metrics:
+    get:
+      operationId: getDashboardMetricFacts
+      summary: 读取可信范围内的业务确认指标
+      description: >-
+        按 section 要求对应 dashboard.<section>.view，租户及组织/团队/本人范围来自
+        服务端可信主体。在同一个只读 RR 事务中读取完整发布快照及来源状态，先过滤
+        范围再统计；不返回原始业务行。未发布 available=false，完整空集才是真实零。
+        零分母比例为 null；历史缺口、待审和差异单列。金额以最小币种整数分币种返回。
+        来源失败或采集关闭保留旧快照并标记 stale。详见 docs/metric-facts.md。
+      parameters:
+        - name: section
+          in: query
+          required: true
+          schema: {type: string, enum: [contract, project, report, finance]}
+        - name: period
+          in: query
+          description: 北京业务月YYYY-MM；合同缺省全部，其余缺省本月。拒绝重复及未知参数。
+          schema: {type: string, pattern: '^\d{4}-(0[1-9]|1[0-2])$'}
+      responses:
+        '200':
+          description: 安全统计、发布可用性及真实来源状态。
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [available, section, period, stale, stale_reason]
+                        properties:
+                          available: {type: boolean}
+                          section: {type: string}
+                          period: {type: string}
+                          stale: {type: boolean}
+                          stale_reason: {type: string}
+                          first_pass_rate: {type: number, nullable: true}
+        '400': {description: 分区、月份、重复或未知参数非法。}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
   /dashboard/projects:
     get:
       operationId: listDashboardProjects

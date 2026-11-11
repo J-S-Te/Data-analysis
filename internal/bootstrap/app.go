@@ -15,6 +15,7 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/importreport"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/metricfacts"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/metrics"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/middleware"
 	adminapplication "github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin/application"
@@ -239,6 +240,7 @@ func New(config Config) (*App, error) {
 
 	mountDashboardEmbedRoutes(api, base, bridge, config, licenseCheck)
 	(&standardfacts.Handler{Store: &standardfacts.Store{DB: db, LicenseCheck: licenseCheck}, FinanceSource: config.FinanceSource}).Register(api)
+	(&metricfacts.Handler{Store: &metricfacts.Store{DB: db}, IntegrationEnabled: config.IntegrationSyncEnabled && config.MetricFactsSyncEnabled}).Register(api)
 
 	// 业务桩（聚合库表就绪后生效）
 	alertHandler := alertshttp.NewHandler(alertsapplication.NewService(alertsinfrastructure.NewGORMRepository(db)))
