@@ -33,6 +33,42 @@ func TestNativeModeSkipsBridgeInitialization(t *testing.T) {
 	}
 }
 
+// TestDashboardEmbedReadyRequiresCompleteConfig 固定能力降级边界：
+// 开关打开但缺少任一嵌入前提时，不得向浏览器宣告可嵌入。
+func TestDashboardEmbedReadyRequiresCompleteConfig(t *testing.T) {
+	complete := Config{
+		DashboardEmbedEnabled:   true,
+		MetabaseInternalURL:     "http://metabase:3000",
+		MetabaseEmbeddingSecret: "test-only",
+		EmbedPublicOrigin:       "https://embed.example.com",
+		DashboardIDs: map[string]string{
+			"overview": "2", "contract": "2", "project": "3", "report": "4", "finance": "5",
+		},
+	}
+	if !dashboardEmbedReady(complete) {
+		t.Fatal("complete embed config should be ready")
+	}
+	if dashboardEmbedReady(Config{DashboardEmbedEnabled: false, DashboardIDs: complete.DashboardIDs}) {
+		t.Fatal("disabled embed must not be ready")
+	}
+	for name, mutate := range map[string]func(*Config){
+		"missing-url":    func(cfg *Config) { cfg.MetabaseInternalURL = "" },
+		"missing-secret": func(cfg *Config) { cfg.MetabaseEmbeddingSecret = "" },
+		"missing-origin": func(cfg *Config) { cfg.EmbedPublicOrigin = "" },
+		"missing-id":     func(cfg *Config) { cfg.DashboardIDs["finance"] = "" },
+	} {
+		cfg := complete
+		cfg.DashboardIDs = map[string]string{}
+		for key, value := range complete.DashboardIDs {
+			cfg.DashboardIDs[key] = value
+		}
+		mutate(&cfg)
+		if dashboardEmbedReady(cfg) {
+			t.Fatalf("%s: incomplete embed config must not be ready", name)
+		}
+	}
+}
+
 type embedTestAuthenticator struct{ principal auth.Principal }
 
 // Authenticate 以隔离测试主体模拟已验证会话，不接触真实身份服务。

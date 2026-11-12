@@ -75,6 +75,31 @@ paths:
         '500': {$ref: '#/components/responses/ReadFailed'}
         '501': {$ref: '#/components/responses/Unavailable'}
         '503': {$ref: '#/components/responses/Unavailable'}
+  /dashboard/contract-regions:
+    get:
+      operationId: getContractRegions
+      summary: 读取签约事实的区域×币种聚合
+      description: >-
+        需要 dashboard.contract.view。仅全租户范围可安全计算：签约事实按客户区域
+        聚合后已无合同行级 owner_org_id，ORG/TEAM/SELF/NONE 返回 available=false，
+        不得退化为全租户汇总。金额按币种分行返回，不跨币种合计；空数据返回 []，
+        不能用 0 冒充来源缺失或范围不支持。
+      x-required-permission: dashboard.contract.view
+      responses:
+        '200':
+          description: 区域分布可用性信封。
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: {$ref: '#/components/schemas/ContractRegionDistribution'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/ReadFailed'}
+        '503': {$ref: '#/components/responses/Unavailable'}
   /dashboard/report:
     get:
       operationId: getReportDashboard
@@ -220,6 +245,23 @@ components:
         page: {type: integer, minimum: 1}
         page_size: {type: integer, minimum: 1, maximum: 100}
         freshness: {$ref: '#/components/schemas/DataFreshness'}
+    ContractRegionTotal:
+      type: object
+      required: [region, currency, amount_minor, contract_count]
+      properties:
+        region: {type: string, description: 客户区域；来源缺失单列“未知”。}
+        currency: {type: string, description: 原币种代码，禁止隐式换汇或跨币种求和。}
+        amount_minor: {type: integer, format: int64, description: 已生效合同签约金额，最小货币单位。}
+        contract_count: {type: integer, format: int64, minimum: 0}
+    ContractRegionDistribution:
+      type: object
+      required: [available, items, basis]
+      properties:
+        available: {type: boolean, description: 当前可信范围与来源授权是否可计算区域分布。}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/ContractRegionTotal'}
+        basis: {type: string, description: 统计口径；不可用时说明原因，不能把空列表解释为零业务。}
     ContractCurrencyTotal:
       type: object
       required: [currency, amount_minor, contracts]

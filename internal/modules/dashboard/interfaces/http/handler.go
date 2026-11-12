@@ -26,6 +26,7 @@ type dashboardQueryService interface {
 type advancedDashboardService interface {
 	Contracts(context.Context, string, int, int) ([]domain.ContractDetail, int64, error)
 	Trend(context.Context, string, int) ([]domain.TrendPoint, error)
+	ContractRegions(context.Context, string) (domain.ContractRegionDistribution, error)
 }
 
 // Handler 通过 Gin 暴露看板读取用例，不导入 GORM。
@@ -115,6 +116,32 @@ func (handler *Handler) Trend(c *gin.Context) {
 		return
 	}
 	response.OK(c, points)
+}
+
+// ContractRegions 返回签约事实按客户区域×币种的聚合（字典指标 1.3 区域分布）。
+// 金额不跨币种合计：多币种租户按行返回，前端不做跨币种相加。
+// 参数：c 为当前HTTP上下文。
+// 返回值：无；以可用性信封输出区域聚合，非全租户范围明确不可用。
+func (handler *Handler) ContractRegions(c *gin.Context) {
+	principal, ok := auth.FromContext(c.Request.Context())
+	if !ok {
+		response.Error(c, apperror.ErrUnauthenticated)
+		return
+	}
+	service, ok := handler.service.(advancedDashboardService)
+	if !ok {
+		response.Error(c, apperror.New(501, "DASHBOARD_REGIONS_UNAVAILABLE", "区域分布暂不可用"))
+		return
+	}
+	distribution, err := service.ContractRegions(c.Request.Context(), principal.TenantID)
+	if err != nil {
+		response.Error(c, apperror.Wrap(err, 500, "DASHBOARD_REGIONS_FAILED", "区域分布加载失败"))
+		return
+	}
+	if distribution.Items == nil {
+		distribution.Items = []domain.ContractRegionTotal{}
+	}
+	response.OK(c, distribution)
 }
 
 // Projects 返回当前租户可信范围内的项目分页明细。

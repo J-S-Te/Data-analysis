@@ -46,8 +46,10 @@ func TestContractKeepsTenantBoundaryAtApplicationLayer(t *testing.T) {
 
 type advancedSnapshotRepositoryStub struct {
 	snapshotRepositoryStub
-	page     int
-	pageSize int
+	page       int
+	pageSize   int
+	regions    domain.ContractRegionDistribution
+	regionsErr error
 }
 
 func (stub *advancedSnapshotRepositoryStub) ListContracts(_ context.Context, _ string, page, pageSize int) ([]domain.ContractDetail, int64, error) {
@@ -57,6 +59,10 @@ func (stub *advancedSnapshotRepositoryStub) ListContracts(_ context.Context, _ s
 
 func (stub *advancedSnapshotRepositoryStub) ListTrend(context.Context, string, int) ([]domain.TrendPoint, error) {
 	return nil, nil
+}
+
+func (stub *advancedSnapshotRepositoryStub) ContractRegions(context.Context, string) (domain.ContractRegionDistribution, error) {
+	return stub.regions, stub.regionsErr
 }
 
 func TestContractsNormalizesPaginationBeforeRepositoryCall(t *testing.T) {
@@ -86,6 +92,25 @@ func TestTrendReturnsEmptyArrayWhenNoData(t *testing.T) {
 	}
 	if len(points) != 0 {
 		t.Fatalf("points = %d，want 0", len(points))
+	}
+}
+
+// TestContractRegionsReturnsEmptyItemsArray 固定区域信封契约：不可用或零数据时
+// items 必须是 []，不能序列化成 null；可用性说明必须保留。
+func TestContractRegionsReturnsEmptyItemsArray(t *testing.T) {
+	service := NewService(&advancedSnapshotRepositoryStub{regions: domain.ContractRegionDistribution{
+		Available: false,
+		Basis:     "当前范围不支持",
+	}})
+	distribution, err := service.ContractRegions(context.Background(), "tenant-1")
+	if err != nil {
+		t.Fatalf("regions: %v", err)
+	}
+	if distribution.Items == nil || len(distribution.Items) != 0 {
+		t.Fatalf("items = %#v, want empty array", distribution.Items)
+	}
+	if distribution.Available || distribution.Basis != "当前范围不支持" {
+		t.Fatalf("availability envelope lost: %#v", distribution)
 	}
 }
 
