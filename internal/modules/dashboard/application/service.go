@@ -27,6 +27,7 @@ type Service struct{ snapshots SnapshotRepository }
 type advancedRepository interface {
 	ListContracts(context.Context, string, int, int) ([]domain.ContractDetail, int64, error)
 	ListTrend(context.Context, string, int) ([]domain.TrendPoint, error)
+	ContractRegions(context.Context, string) (domain.ContractRegionDistribution, error)
 }
 
 const (
@@ -108,6 +109,26 @@ func (service *Service) Trend(ctx context.Context, tenantID string, months int) 
 		points = []domain.TrendPoint{}
 	}
 	return points, nil
+}
+
+// ContractRegions 返回签约事实按客户区域×币种的聚合（字典指标 1.3 区域分布）。
+// 金额不跨币种合计：多币种租户按行返回，前端不做跨币种相加。
+// 参数：ctx 为请求上下文，tenantID 为租户。
+// 返回值：带可用性说明的区域聚合；仓储未配置时返回错误。
+func (service *Service) ContractRegions(ctx context.Context, tenantID string) (domain.ContractRegionDistribution, error) {
+	repository, ok := service.snapshots.(advancedRepository)
+	if !ok {
+		return domain.ContractRegionDistribution{}, errors.New("contract region repository is not configured")
+	}
+	distribution, err := repository.ContractRegions(ctx, tenantID)
+	if err != nil {
+		return domain.ContractRegionDistribution{}, err
+	}
+	// 契约：items 永远返回数组，空数据返回 [] 而不是 null。
+	if distribution.Items == nil {
+		distribution.Items = []domain.ContractRegionTotal{}
+	}
+	return distribution, nil
 }
 
 // Projects 返回当前可信范围的已发布项目分页明细。

@@ -192,9 +192,13 @@ func New(config Config) (*App, error) {
 			auditStatus = "enabled"
 		}
 		// C14：能力维度快照；嵌入开关与财务来源是模式事实，不影响整体就绪。
+		// 开关打开但配置不完整时能力状态为 unconfigured，会话能力同步降级为原生模式。
 		embedState := "disabled"
 		if config.DashboardEmbedEnabled {
-			embedState = "ready"
+			embedState = "unconfigured"
+			if dashboardEmbedReady(config) {
+				embedState = "ready"
+			}
 		}
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ready",
@@ -213,11 +217,12 @@ func New(config Config) (*App, error) {
 	})
 	base.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 
+	embedReady := dashboardEmbedReady(config)
 	authHandler := oidc.NewHandler(authService, oidc.HTTPOptions{
 		CookieName:            "data_analysis_session",
 		PublicOrigin:          config.PublicOrigin,
 		SecureCookie:          config.SecureCookie,
-		DashboardEmbedEnabled: &config.DashboardEmbedEnabled,
+		DashboardEmbedEnabled: &embedReady,
 	})
 	base.GET("/auth/login", authHandler.Login)
 	base.GET("/auth/callback", authHandler.Callback)
@@ -269,6 +274,7 @@ func New(config Config) (*App, error) {
 	api.GET("/dashboard/report", middleware.RequirePermission("dashboard.report.view"), dashboardHandler.Business("report"))
 	api.GET("/dashboard/finance", middleware.RequirePermission("dashboard.finance.view"), dashboardHandler.Business("finance"))
 	api.GET("/dashboard/contracts", middleware.RequirePermission("dashboard.contract.view"), dashboardHandler.Contracts)
+	api.GET("/dashboard/contract-regions", middleware.RequirePermission("dashboard.contract.view"), dashboardHandler.ContractRegions)
 	api.GET("/dashboard/projects", middleware.RequirePermission("dashboard.project.view"), dashboardHandler.Projects)
 	api.GET("/dashboard/trend", middleware.RequirePermission("dashboard.overview.view"), dashboardHandler.Trend)
 	api.GET("/admin/sources", middleware.RequirePermission("aggregation.manage"), requireIntegrationSync(config.IntegrationSyncEnabled), adminHandler.ListSources)
