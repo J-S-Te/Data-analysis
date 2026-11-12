@@ -86,6 +86,8 @@ Metabase 内网地址或嵌入密钥缺失会令当前 API 装配失败；仅缺
 
 `DASHBOARD_SNAPSHOT_RECENT_DAYS=7`、`DASHBOARD_SNAPSHOT_TREND_MONTHS=24`、`DASHBOARD_SNAPSHOT_BATCH_SIZE=500`、`DASHBOARD_SNAPSHOT_MAX_BATCHES=20` 控制有界 API 摘要留存：保留近 7 天全部、近 24 个业务月的月末快照与全局最新，逐轮清理旧冗余。范围分别为 1..3660、24..120、1..500、1..20；显式 0 或非法值在外部同步启用时拒绝启动。清理按租户及固定表白名单执行，不删除标准财务批次、审计、历史合同发布凭据或月度事实。
 
+合同区域分布 `GET /dashboard/contract-regions` 读取 `fct_contract_signing` 的客户区域×币种聚合；只有全租户范围可安全计算，ORG/TEAM/SELF 明确返回 `available=false` 与原因，不能退化为全租户汇总。金额不跨币种合计，空数据返回 `items=[]`。
+
 项目下钻 `GET /dashboard/projects` 使用可信会话租户及 TENANT/ORG/TEAM 范围，分页默认 1/20、上限 100，同一只读 RR 快照核验成功投影与读取列表；无发布或无可信范围返回 `available=false`，成功空集合为 true 且 items 为空。趋势以 `contract_available`、`project_available` 分别表示当月来源是否可用，多币种金额仅在 `currency_totals` 中分币种展示，不相加。报告、财务可附 `source_code`、`source_updated_at`、`source_snapshot_at` 与 `freshness`；源业务更新时间、源生成快照时间、本地成功同步时间和本次查询时间不可互相替代。`GET /auth/me` 返回可信 `scope_mode`、`organization_ids` 及 `team_ids`，页面不得从角色名推断范围。本轮相关接口契约见 [OpenAPI](docs/openapi.yaml)，该文件仅覆盖列出的接口，并非全 API 目录。
 
 ### 数据库迁移约束

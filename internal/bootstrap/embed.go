@@ -1,12 +1,35 @@
 package bootstrap
 
 import (
+	"strings"
+
 	"github.com/gin-gonic/gin"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/embedbridge"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/middleware"
 	"gorm.io/gorm"
 )
+
+// dashboardEmbedReady 判定嵌入能力是否具备全部运行前提。
+// 仅打开开关不足以签发能力：Metabase 地址、嵌入密钥、独立公开来源和五个看板 ID
+// 缺一都会让前端拿到 503。此处在会话能力层直接降级为原生模式，避免可选嵌入选
+// 在每次进入总览/报告/财务时显示错误卡片。
+// 参数：config 为已装载的服务配置。
+// 返回值：开关关闭或任一前提缺失时 false。
+func dashboardEmbedReady(config Config) bool {
+	if !config.DashboardEmbedEnabled {
+		return false
+	}
+	if strings.TrimSpace(config.MetabaseInternalURL) == "" || strings.TrimSpace(config.MetabaseEmbeddingSecret) == "" || strings.TrimSpace(config.EmbedPublicOrigin) == "" {
+		return false
+	}
+	for _, code := range []string{"overview", "contract", "project", "report", "finance"} {
+		if strings.TrimSpace(config.DashboardIDs[code]) == "" {
+			return false
+		}
+	}
+	return true
+}
 
 // newDashboardEmbedBridge 仅在启用模式构造嵌入桥，原生模式不读取嵌入凭据。
 // 参数：db 为令牌存储，config 为服务配置，check 为原商业许可检查。

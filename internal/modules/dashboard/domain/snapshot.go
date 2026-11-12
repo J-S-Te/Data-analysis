@@ -60,6 +60,24 @@ type ContractSnapshot struct {
 	DiscountBuckets           map[string]int64        `json:"discount_buckets"`
 }
 
+// ContractRegionTotal 是签约事实按客户区域×币种的聚合（字典指标 1.3 区域分布的数据来源）。
+// 金额不跨币种合计：多币种租户按行展示，前端不做跨币种相加。
+type ContractRegionTotal struct {
+	Region        string `json:"region"`
+	Currency      string `json:"currency"`
+	AmountMinor   int64  `json:"amount_minor"`
+	ContractCount int64  `json:"contract_count"`
+}
+
+// ContractRegionDistribution 是区域分布的可用性信封。
+// Available=false 表示当前可信范围或来源授权不支持该统计；此时 Items 必为空，
+// Basis 说明原因，调用方不得把空列表解释成“全部区域为 0”。
+type ContractRegionDistribution struct {
+	Available bool                  `json:"available"`
+	Items     []ContractRegionTotal `json:"items"`
+	Basis     string                `json:"basis"`
+}
+
 // ProjectSnapshot 是单个租户最新项目看板聚合。
 // StatusCounts 始终初始化为非 nil 映射，保证 API 值稳定。
 // ReportStageCounts 只在“该快照已采集报告阶段”时非 nil：nil 表示未采集
