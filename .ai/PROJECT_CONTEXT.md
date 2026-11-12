@@ -14,7 +14,7 @@
 - 合同与项目原生摘要页展示真实聚合数据；报告/财务也已接入原生 business_dashboard_snapshot，并保留独立 Metabase 嵌入。报告来源 PROJECT_READ_DSN，财务来源 SETTLEMENT_READ_DSN，均只读；缺失指标明确不可用，不填演示零值。
 - 指标字典读取使用 dictionary.view，维护使用 dictionary.manage（目录 data-analysis-v2）；编码不可变，新建默认停用，版本冲突拒绝写入，删除保留墓碑和不可变历史。内置与已登记引用保护；历史接口返回最近 200 条。
 - 浏览器会话为“空闲 + 绝对”双期限：OIDC_SESSION_IDLE_TTL（默认 30m）只由 POST /api/v1/auth/activity 续期，普通业务请求只刷新 last_seen_at；OIDC_SESSION_ABSOLUTE_TTL（默认 8h）为登录后绝对到期，Cookie 到期与之一致。000024 迁移为 da_oidc_sessions 增加 last_interactive_at，旧行 NULL 按 created_at 兼容；/api/v1/auth/me 追加 idle_timeout_seconds/idle_remaining_ms。
-- migration 13 增加字典启用/来源/删除状态、历史快照与引用登记表。数据库读取失败显式返回错误，不静默回退。自定义公式仅口径说明，不执行任意计算；当前仅已确认且与内置定义一致的 2.1 绑定 PROJECT_STATUS_COUNTS_V1，其他未绑定指标不可启用。字典启停不动态改变既有固定看板计算。
+- migration 13 增加字典启用/来源/删除状态、历史快照与引用登记表。数据库读取失败显式返回错误，不静默回退。自定义公式仅口径说明，不执行任意计算；2026-11-12目录发布13项受控身份：1.1–1.5、2.1/2.4/2.5、3.2/3.3、4.1/4.6/4.7；只有已确认且与发布定义一致才可启用。2.1保留既有默认，新获得资格默认关闭，租户显式状态保留。3.1提交至签发仍无匹配计算而未绑定。字典启停不改变看板计算、展示或权限，不保证来源当前可用。
 
 ## 关键入口
 
@@ -26,7 +26,7 @@
 - `internal/embedbridge/`：Metabase 嵌入 token 与代理。
 - `migrations/`：版本化聚合库 Schema，当前至 000020（预警归属范围）；运行时禁止 AutoMigrate。
 
-合同/项目 freshness 分列源更新、成功同步与查询计算时间；失败/停用/未知/运行中/待首次或超过48小时标陈旧。全租户持久快照保留 snapshot_at 与 SNAPSHOT 语义，按写入时间超过48小时标陈旧；缺失、非法或未来写入时间也标陈旧，无快照行仍不可用；dim_project 无写入方，组织/团队项目摘要不能借报告水位当最新。合同签约事实默认 active/in_progress/pending_pay/completed，按 start_date 月和币种归集；转化要求有效商机已签约且有关联有效合同，组织/团队漏斗未开放。折扣、报告首过率/投诉、收入确认和成本仍未实现。
+合同/项目 freshness 分列源更新、成功同步与查询计算时间；失败/停用/未知/运行中/待首次或超过48小时标陈旧。全租户持久快照保留 snapshot_at 与 SNAPSHOT 语义，按写入时间超过48小时标陈旧；缺失、非法或未来写入时间也标陈旧，无快照行仍不可用；dim_project 无写入方，组织/团队项目摘要不能借报告水位当最新。合同签约事实默认 active/in_progress/pending_pay/completed，按 start_date 月和币种归集；转化要求有效商机已签约且有关联有效合同，组织/团队漏斗未开放。经营事实新增链路已实现折扣、完整首轮终决通过率、退回决定原因、资源实际/容量及净确认收入/成本；读取入口为internal/metricfacts与GET /dashboard/metrics。字典3.2按首轮终决、3.3按决定次数、4.1按当前累计、4.6/4.7按不含税净成本，与旧模板差异见指标字典2026-11-12说明；投诉暂缓。交付/项目周期、返工率、完整账龄、开票未回款TOP10及部门/个人产值仍缺完整字典计算出口。
 
 ## 验证方式
 

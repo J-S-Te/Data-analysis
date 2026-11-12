@@ -1,7 +1,6 @@
 package application
 
 import (
-	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -9,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	mysqlDriver "github.com/go-sql-driver/mysql"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"regexp"
 	"sort"
 	"strings"
@@ -89,6 +89,10 @@ func builtin(code string) (domain.Metric, bool) {
 	}
 	return domain.Metric{}, false
 }
+
+// builtinMetrics 派生内置资格并保留既有项目状态指标的默认启用行为。
+// 参数：无。
+// 返回值：发布目录副本；新增资格默认关闭，租户覆盖另行读取。
 func builtinMetrics() []domain.Metric {
 	out := append([]domain.Metric(nil), publishedMetrics...)
 	for i := range out {
@@ -97,20 +101,26 @@ func builtinMetrics() []domain.Metric {
 		out[i].Version = 1
 		out[i].Origin = "BUILTIN"
 		out[i] = derived(out[i])
-		out[i].Enabled = out[i].CanEnable
+		out[i].Enabled = out[i].CanEnable && out[i].Code == "2.1"
 	}
 	return out
 }
+
+// derived 根据受控身份与发布口径计算启用资格，忽略客户端伪造的派生字段。
+// 参数：m为内置或租户覆盖定义，包含其显式启用状态。
+// 返回值：服务端派生定义；未确认或口径漂移时清除身份并禁用。
 func derived(m domain.Metric) domain.Metric {
 	m.CalculationBinding = ""
 	m.CanEnable = false
 	m.EnableBlockReason = ""
-	// 项目状态计数由原生项目快照读取器提供。
-	if m.Origin == "BUILTIN" && m.Code == "2.1" && m.Status == "已确认" {
-		for _, b := range publishedMetrics {
-			if b.Code == m.Code && sameCalculation(m, b) {
-				m.CalculationBinding = "PROJECT_STATUS_COUNTS_V1"
-				m.CanEnable = true
+	if m.Origin == "BUILTIN" && m.Status == "已确认" {
+		if binding, ok := controlledBindings[m.Code]; ok {
+			for _, published := range publishedMetrics {
+				if published.Code == m.Code && sameCalculation(m, published) {
+					m.CalculationBinding = binding
+					m.CanEnable = true
+					break
+				}
 			}
 		}
 	}
@@ -121,14 +131,17 @@ func derived(m domain.Metric) domain.Metric {
 	return m
 }
 
-// enableBlockReason 说明指标为何不能启用：口径未确认、口径偏离发布版本，
-// 或该指标尚未接入受控计算执行器。原因由服务端计算，前端只做展示映射。
+// enableBlockReason 解释未接入、未确认或口径漂移导致的启用阻断。
+// 参数：m为未获得启用资格的指标定义。
+// 返回值：供既有前端展示的稳定原因码。
 func enableBlockReason(m domain.Metric) string {
-	if m.Origin == "BUILTIN" && m.Code == "2.1" {
-		if m.Status != "已确认" {
-			return "METRIC_STATUS_UNCONFIRMED"
+	if m.Origin == "BUILTIN" {
+		if _, controlled := controlledBindings[m.Code]; controlled {
+			if m.Status != "已确认" {
+				return "METRIC_STATUS_UNCONFIRMED"
+			}
+			return "CALCULATION_DEFINITION_DRIFT"
 		}
-		return "CALCULATION_DEFINITION_DRIFT"
 	}
 	return "CALCULATION_BINDING_MISSING"
 }
