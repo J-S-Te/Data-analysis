@@ -12,9 +12,12 @@ import (
 )
 
 type gormRule struct {
-	RuleCode      string `gorm:"column:rule_code"`
-	Severity      string `gorm:"column:severity"`
-	ThresholdJSON []byte `gorm:"column:threshold_json"`
+	RuleCode      string  `gorm:"column:rule_code"`
+	Severity      string  `gorm:"column:severity"`
+	ThresholdJSON []byte  `gorm:"column:threshold_json"`
+	ScopeJSON     []byte  `gorm:"column:scope_json"`
+	EffectiveFrom *string `gorm:"column:effective_from"`
+	EffectiveTo   *string `gorm:"column:effective_to"`
 }
 
 // GormStore 使用版本化迁移创建的 alert_rule、alert_item 和 dim_contract 表。
@@ -35,7 +38,7 @@ func (s *GormStore) ListEnabledRules(ctx context.Context) ([]Rule, error) {
 	var rows []gormRule
 	if err := s.db.WithContext(ctx).
 		Table("alert_rule").
-		Select("rule_code, severity, threshold_json").
+		Select("rule_code, severity, threshold_json, scope_json, effective_from, effective_to").
 		Where("tenant_id = ? AND enabled = ?", s.tenantID, true).
 		Order("rule_code").
 		Find(&rows).Error; err != nil {
@@ -47,6 +50,9 @@ func (s *GormStore) ListEnabledRules(ctx context.Context) ([]Rule, error) {
 			Code:          row.RuleCode,
 			Severity:      row.Severity,
 			ThresholdJSON: row.ThresholdJSON,
+			ScopeJSON:     row.ScopeJSON,
+			EffectiveFrom: row.EffectiveFrom,
+			EffectiveTo:   row.EffectiveTo,
 		})
 	}
 	return rules, nil
@@ -79,18 +85,21 @@ func (s *GormStore) FindContractExpiryCandidates(
 	}
 	var candidates []ContractExpiryCandidate
 	err := s.db.WithContext(ctx).
-		Table("dim_contract").Where("origin_kind = 'NORMAL'").
-		Select(`tenant_id, owner_org_id, contract_id AS target_ref,
-CONCAT('合同「', title, '」将在 ', DATE_FORMAT(end_date, '%Y-%m-%d'), ' 到期') AS title,
-end_date AS due_date,
-(end_date >= DATE(?) AND end_date <= DATE_ADD(DATE(?), INTERVAL ? DAY)) AS in_window`,
+		Table("dim_contract AS c").
+		Joins("LEFT JOIN dim_customer AS dc ON dc.tenant_id = c.tenant_id AND dc.customer_id = c.crm_customer_id").
+		Where("c.origin_kind = 'NORMAL'").
+		Select(`c.tenant_id, c.owner_org_id, c.contract_id AS target_ref,
+CONCAT('合同「', c.title, '」将在 ', DATE_FORMAT(c.end_date, '%Y-%m-%d'), ' 到期') AS title,
+c.end_date AS due_date,
+COALESCE(dc.customer_type, '') AS customer_type, c.amount_minor,
+(c.end_date >= DATE(?) AND c.end_date <= DATE_ADD(DATE(?), INTERVAL ? DAY)) AS in_window`,
 			evaluatedAt, evaluatedAt, days).
-		Where("end_date IS NOT NULL").
-		Where("tenant_id = ?", s.tenantID).
-		Where("end_date >= DATE_SUB(DATE(?), INTERVAL ? DAY)", evaluatedAt, days).
-		Where("end_date <= DATE_ADD(DATE(?), INTERVAL ? DAY)", evaluatedAt, days).
-		Where("status NOT IN ?", []string{"COMPLETED", "ARCHIVED", "TERMINATED"}).
-		Order("tenant_id, end_date, contract_id").
+		Where("c.end_date IS NOT NULL").
+		Where("c.tenant_id = ?", s.tenantID).
+		Where("c.end_date >= DATE_SUB(DATE(?), INTERVAL ? DAY)", evaluatedAt, days).
+		Where("c.end_date <= DATE_ADD(DATE(?), INTERVAL ? DAY)", evaluatedAt, days).
+		Where("c.status NOT IN ?", []string{"COMPLETED", "ARCHIVED", "TERMINATED"}).
+		Order("c.tenant_id, c.end_date, c.contract_id").
 		Find(&candidates).Error
 	if err != nil {
 		return nil, err

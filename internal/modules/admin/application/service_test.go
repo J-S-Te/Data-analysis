@@ -15,6 +15,11 @@ type repositoryStub struct {
 	jobs          []domain.SyncJob
 	rules         []domain.AlertRule
 	defaultTenant string
+	previewDays   int
+	previewScope  domain.AlertRuleScope
+	previewAt     time.Time
+	previewLimit  int
+	previewResult domain.AlertPreviewResult
 }
 
 func (stub *repositoryStub) ListSources(context.Context, string) ([]domain.SyncSource, error) {
@@ -42,6 +47,13 @@ func (stub *repositoryStub) ReplaceAlertRules(_ context.Context, _ string, rules
 	return nil
 }
 func (stub *repositoryStub) DeleteAlertRule(context.Context, string, string) error { return nil }
+func (stub *repositoryStub) PreviewContractExpiry(_ context.Context, _ string, days int, scope domain.AlertRuleScope, at time.Time, limit int) (domain.AlertPreviewResult, error) {
+	stub.previewDays = days
+	stub.previewScope = scope
+	stub.previewAt = at
+	stub.previewLimit = limit
+	return stub.previewResult, nil
+}
 
 func TestTriggerSourceQueuesEnabledSource(t *testing.T) {
 	stub := &repositoryStub{source: domain.SyncSource{ID: "source-1", SubsystemCode: "contract_management", Enabled: true}, found: true, createJob: true}
@@ -132,5 +144,27 @@ func TestRuleWritesRejectForgedCreationIdentity(t *testing.T) {
 		if _, err := NewService(&repositoryStub{}).ReplaceAlertRules(context.Background(), "tenant", "actor", []domain.AlertRule{input}); err != ErrRulePayloadInvalid {
 			t.Fatalf("forged identity accepted: %+v %v", ids, err)
 		}
+	}
+}
+
+func stringPtr(value string) *string { return &value }
+
+func TestPreviewAlertRuleNormalizesScopeAndDoesNotWrite(t *testing.T) {
+	stub := &repositoryStub{previewResult: domain.AlertPreviewResult{MatchedCount: 3, Limited: true}}
+	now := time.Date(2026, 8, 17, 0, 0, 0, 0, time.UTC)
+	service := &Service{repository: stub, now: func() time.Time { return now }, newID: func() string { return "id" }}
+	scope := "{\"owner_org_ids\":[\" org-a \",\"org-a\"],\"customer_types\":[\"企业\"],\"amount_min_minor\":10000}"
+	result, err := service.PreviewAlertRule(context.Background(), "tenant-1", 30, &scope)
+	if err != nil || result.MatchedCount != 3 || !result.Limited {
+		t.Fatalf("preview = %+v, error = %v", result, err)
+	}
+	if stub.previewDays != 30 || stub.previewLimit != 20 || !stub.previewAt.Equal(now) {
+		t.Fatalf("preview args = days %d limit %d at %v", stub.previewDays, stub.previewLimit, stub.previewAt)
+	}
+	if len(stub.previewScope.OwnerOrgIDs) != 1 || stub.previewScope.OwnerOrgIDs[0] != "org-a" || len(stub.previewScope.CustomerTypes) != 1 {
+		t.Fatalf("normalized scope = %+v", stub.previewScope)
+	}
+	if _, err := service.PreviewAlertRule(context.Background(), "tenant-1", 30, stringPtr("{\"amount_min_minor\":-1}")); err != ErrRulePayloadInvalid {
+		t.Fatalf("negative amount preview error = %v, want invalid", err)
 	}
 }

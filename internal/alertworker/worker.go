@@ -26,15 +26,28 @@ type Rule struct {
 	Code          string
 	Severity      string
 	ThresholdJSON []byte
+	ScopeJSON     []byte
+	EffectiveFrom *string
+	EffectiveTo   *string
+}
+
+// RuleScope 是合同到期规则的可选范围；空集合表示不限制。
+type RuleScope struct {
+	OwnerOrgIDs    []string `json:"owner_org_ids"`
+	CustomerTypes  []string `json:"customer_types"`
+	AmountMinMinor *int64   `json:"amount_min_minor"`
+	AmountMaxMinor *int64   `json:"amount_max_minor"`
 }
 
 // ContractExpiryCandidate 是从 dim_contract 筛出的合同到期候选项。
 type ContractExpiryCandidate struct {
-	TenantID   string
-	OwnerOrgID string
-	TargetRef  string
-	Title      string
-	DueDate    time.Time
+	TenantID     string
+	OwnerOrgID   string
+	TargetRef    string
+	Title        string
+	CustomerType string
+	AmountMinor  int64
+	DueDate      time.Time
 	// InWindow 表示到期日位于 [基准日, 基准日+提醒窗口天数] 内。
 	// 条件集合包含刚过期但未续签的合同（InWindow=false），它们仍算"条件成立"，
 	// 因此保持 OPEN，不会因为滑出窗口被关闭。
@@ -106,6 +119,73 @@ type LifecycleOptions struct {
 type ReconcileOptions struct {
 	ConfirmRounds int
 	ReopenPolicy  ReopenPolicy
+}
+
+// ruleEffectiveOn 判断规则在业务评估日是否处于生效区间；空边界表示不限。
+// 参数：rule 为启用规则；evaluatedAt 为业务时区评估时刻。
+// 返回值：生效开始日 <= 当前日 <= 生效截止日时为 true。
+func ruleEffectiveOn(rule Rule, evaluatedAt time.Time) bool {
+	day := evaluatedAt.Format("2006-01-02")
+	if rule.EffectiveFrom != nil && strings.TrimSpace(*rule.EffectiveFrom) > day {
+		return false
+	}
+	if rule.EffectiveTo != nil && strings.TrimSpace(*rule.EffectiveTo) < day {
+		return false
+	}
+	return true
+}
+
+// parseRuleScope 解析规则范围 JSON；空数据表示不限制。
+// 参数：raw 为 scope_json；未知字段或非法金额返回错误。
+// 返回值：范围对象或错误。
+func parseRuleScope(raw []byte) (RuleScope, error) {
+	var scope RuleScope
+	if len(strings.TrimSpace(string(raw))) == 0 || strings.TrimSpace(string(raw)) == "null" {
+		return scope, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&scope); err != nil {
+		return RuleScope{}, err
+	}
+	if scope.AmountMinMinor != nil && *scope.AmountMinMinor < 0 {
+		return RuleScope{}, errors.New("alert rule scope amount_min_minor must be non-negative")
+	}
+	if scope.AmountMaxMinor != nil && *scope.AmountMaxMinor < 0 {
+		return RuleScope{}, errors.New("alert rule scope amount_max_minor must be non-negative")
+	}
+	if scope.AmountMinMinor != nil && scope.AmountMaxMinor != nil && *scope.AmountMinMinor > *scope.AmountMaxMinor {
+		return RuleScope{}, errors.New("alert rule scope amount range is inverted")
+	}
+	return scope, nil
+}
+
+// matchesRuleScope 判断合同候选是否满足规则范围。
+// 参数：scope 为规则范围；candidate 为合同候选。
+// 返回值：组织、客户类型、金额均满足时 true。
+func matchesRuleScope(scope RuleScope, candidate ContractExpiryCandidate) bool {
+	if len(scope.OwnerOrgIDs) > 0 && !containsString(scope.OwnerOrgIDs, candidate.OwnerOrgID) {
+		return false
+	}
+	if len(scope.CustomerTypes) > 0 && !containsString(scope.CustomerTypes, candidate.CustomerType) {
+		return false
+	}
+	if scope.AmountMinMinor != nil && candidate.AmountMinor < *scope.AmountMinMinor {
+		return false
+	}
+	if scope.AmountMaxMinor != nil && candidate.AmountMinor > *scope.AmountMaxMinor {
+		return false
+	}
+	return true
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 // normalized 补齐零值，使 LifecycleOptions{} 与显式默认值行为一致。
@@ -273,6 +353,9 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 	processed := 0
 	var runErrors []error
 	for _, rule := range rules {
+		if !ruleEffectiveOn(rule, evaluatedAt) {
+			continue
+		}
 		if w.LicenseCheck != nil {
 			if err := w.LicenseCheck(ctx); err != nil {
 				return processed, err
@@ -306,8 +389,15 @@ func (w *Worker) evaluateContractExpiry(ctx context.Context, rule Rule, evaluate
 	if err != nil {
 		return 0, fmt.Errorf("find contract expiry candidates: %w", err)
 	}
+	scope, err := parseRuleScope(rule.ScopeJSON)
+	if err != nil {
+		return 0, fmt.Errorf("parse contract expiry scope: %w", err)
+	}
 	alerts := make([]Alert, 0, len(candidates))
 	for _, candidate := range candidates {
+		if !matchesRuleScope(scope, candidate) {
+			continue
+		}
 		alerts = append(alerts, Alert{
 			ID:          stableAlertID(candidate.TenantID, RuleContractExpiry, candidate.TargetRef),
 			TenantID:    candidate.TenantID,

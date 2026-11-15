@@ -48,7 +48,10 @@ func Middleware(check Check) gin.HandlerFunc {
 		// 未知新路由保持受限：仅使用 GET 不能证明是
 		// 历史读取，嵌入授权签发本身也是 GET。
 		operation := MutateBusiness
-		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
+		if c.Request.Method == http.MethodPost && c.FullPath() == "/api/v1/alert-rules/preview" {
+			// 命中预览只读，不写规则；按历史读取许可放行。
+			operation = ReadHistory
+		} else if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
 			for _, suffix := range []string{
 				"/admin/standard-finance/status", "/alerts", "/alerts/summary", "/dictionary",
 				"/dictionary/metrics/:code/versions", "/dashboard/contract", "/dashboard/project",
