@@ -44,6 +44,8 @@ type Repository interface {
 	ReplaceAlertRules(context.Context, string, []domain.AlertRule) error
 	DeleteAlertRule(context.Context, string, string) error
 	PreviewContractExpiry(context.Context, string, int, domain.AlertRuleScope, time.Time, int) (domain.AlertPreviewResult, error)
+	AlertRuleScopeOptions(context.Context, string) (domain.AlertRuleScopeOptions, error)
+	LatestAlertRuleExecutions(context.Context, string) ([]domain.AlertRuleExecution, error)
 }
 
 // TriggerAllSources 为当前租户一次性排入全部启用数据源，并跳过已有活动任务。
@@ -79,6 +81,26 @@ func (service *Service) DeleteAlertRule(ctx context.Context, tenantID, ruleID st
 	return service.repository.DeleteAlertRule(ctx, tenantID, ruleID)
 }
 
+// LatestAlertRuleExecutions 返回每个规则最近一次执行记录。
+// 参数：ctx 为上下文；tenantID 为可信租户。
+// 返回值：按规则 ID 去重后的执行结果；读取失败返回错误。
+func (service *Service) LatestAlertRuleExecutions(ctx context.Context, tenantID string) ([]domain.AlertRuleExecution, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return nil, ErrRulePayloadInvalid
+	}
+	return service.repository.LatestAlertRuleExecutions(ctx, tenantID)
+}
+
+// AlertRuleScopeOptions 读取当前租户可用于规则范围的聚合维度值。
+// 参数：ctx 为上下文；tenantID 为可信租户。
+// 返回值：组织、客户类型、币种去重列表；读取失败返回错误。
+func (service *Service) AlertRuleScopeOptions(ctx context.Context, tenantID string) (domain.AlertRuleScopeOptions, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return domain.AlertRuleScopeOptions{}, ErrRulePayloadInvalid
+	}
+	return service.repository.AlertRuleScopeOptions(ctx, tenantID)
+}
+
 // PreviewAlertRule 计算合同到期规则当前会命中的合同数量和样例，不写入任何状态。
 // 参数：tenantID 为可信租户；days 为到期前后窗口；scopeJSON 为可选范围。
 // 返回值：命中数量、最多 20 条样例和是否被截断；非法参数或读取失败返回错误。
@@ -96,19 +118,33 @@ func (service *Service) PreviewAlertRule(ctx context.Context, tenantID string, d
 			return domain.AlertPreviewResult{}, ErrRulePayloadInvalid
 		}
 	}
-	return service.repository.PreviewContractExpiry(ctx, tenantID, days, scope, service.now(), 20)
+	location := service.location
+	if location == nil {
+		location = time.UTC
+	}
+	return service.repository.PreviewContractExpiry(ctx, tenantID, days, scope, service.now().In(location), 20)
 }
 
 // Service 协调数据源入队和预警规则替换用例。
 type Service struct {
 	repository Repository
+	location   *time.Location
 	now        func() time.Time
 	newID      func() string
 }
 
-// NewService 构造生产环境使用的管理应用服务。
+// NewService 构造生产环境使用的管理应用服务；默认 UTC，由启动方注入业务时区。
 func NewService(repository Repository) *Service {
-	return &Service{repository: repository, now: func() time.Time { return time.Now().UTC() }, newID: generateID}
+	return &Service{repository: repository, location: time.UTC, now: func() time.Time { return time.Now().UTC() }, newID: generateID}
+}
+
+// SetBusinessLocation 注入预警预览和规则执行使用的业务时区。
+// 参数：location 为 IANA 时区；nil 保持 UTC。
+// 返回值：无。
+func (service *Service) SetBusinessLocation(location *time.Location) {
+	if location != nil {
+		service.location = location
+	}
 }
 
 // ListSources 返回当前配置的数据源及其最近同步状态。
@@ -227,6 +263,7 @@ func normalizeAlertRuleScope(rule *domain.AlertRule) error {
 			}
 			scope.OwnerOrgIDs = normalizeStringList(scope.OwnerOrgIDs, 100, 64)
 			scope.CustomerTypes = normalizeStringList(scope.CustomerTypes, 100, 64)
+			scope.Currencies = normalizeCurrencyList(scope.Currencies)
 			if scope.AmountMinMinor != nil && *scope.AmountMinMinor < 0 {
 				return ErrRulePayloadInvalid
 			}
@@ -236,7 +273,7 @@ func normalizeAlertRuleScope(rule *domain.AlertRule) error {
 			if scope.AmountMinMinor != nil && scope.AmountMaxMinor != nil && *scope.AmountMinMinor > *scope.AmountMaxMinor {
 				return ErrRulePayloadInvalid
 			}
-			if len(scope.OwnerOrgIDs) == 0 && len(scope.CustomerTypes) == 0 && scope.AmountMinMinor == nil && scope.AmountMaxMinor == nil {
+			if len(scope.OwnerOrgIDs) == 0 && len(scope.CustomerTypes) == 0 && len(scope.Currencies) == 0 && scope.AmountMinMinor == nil && scope.AmountMaxMinor == nil {
 				rule.ScopeJSON = nil
 			} else {
 				encoded, err := json.Marshal(scope)
@@ -272,6 +309,23 @@ func normalizeAlertRuleScope(rule *domain.AlertRule) error {
 		return ErrRulePayloadInvalid
 	}
 	return nil
+}
+
+func normalizeCurrencyList(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.ToUpper(strings.TrimSpace(raw))
+		if len(value) != 3 {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func normalizeStringList(values []string, maxItems, maxLen int) []string {

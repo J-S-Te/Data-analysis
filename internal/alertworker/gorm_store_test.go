@@ -25,7 +25,7 @@ func ruleTestDB(t *testing.T) *gorm.DB {
 	}
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	if err := db.Exec(`CREATE TABLE alert_rule (tenant_id TEXT, rule_code TEXT, severity TEXT, threshold_json BLOB, scope_json BLOB, effective_from TEXT, effective_to TEXT, enabled BOOLEAN)`).Error; err != nil {
+	if err := db.Exec(`CREATE TABLE alert_rule (id TEXT, tenant_id TEXT, rule_code TEXT, severity TEXT, threshold_json BLOB, scope_json BLOB, effective_from TEXT, effective_to TEXT, enabled BOOLEAN)`).Error; err != nil {
 		t.Fatal(err)
 	}
 	return db
@@ -40,10 +40,10 @@ func TestListEnabledRulesIsReadOnlyAndTenantScoped(t *testing.T) {
 			t.Fatalf("empty rules = %v, error = %v", rules, err)
 		}
 	}
-	if err := db.Exec(`INSERT INTO alert_rule (tenant_id, rule_code, severity, threshold_json, scope_json, effective_from, effective_to, enabled) VALUES
-('tenant-a', 'CONTRACT_EXPIRY', 'HIGH', '{"days":30}', NULL, NULL, NULL, 1),
-('tenant-a', 'DISABLED', 'HIGH', '{"days":30}', NULL, NULL, NULL, 0),
-('tenant-b', 'OTHER', 'HIGH', '{"days":30}', NULL, NULL, NULL, 1)`).Error; err != nil {
+	if err := db.Exec(`INSERT INTO alert_rule (id, tenant_id, rule_code, severity, threshold_json, scope_json, effective_from, effective_to, enabled) VALUES
+('rule-1', 'tenant-a', 'CONTRACT_EXPIRY', 'HIGH', '{"days":30}', NULL, NULL, NULL, 1),
+('rule-2', 'tenant-a', 'DISABLED', 'HIGH', '{"days":30}', NULL, NULL, NULL, 0),
+('rule-3', 'tenant-b', 'OTHER', 'HIGH', '{"days":30}', NULL, NULL, NULL, 1)`).Error; err != nil {
 		t.Fatal(err)
 	}
 	rules, err := store.ListEnabledRules(context.Background())
@@ -279,5 +279,29 @@ func TestUpsertAlertsLocksTenantRuleBeforeWriting(t *testing.T) {
 	}
 	if !locked || !written {
 		t.Fatalf("rule locked = %v, alert written = %v", locked, written)
+	}
+}
+
+func TestRecordRuleExecutionPersistsStatusAndMatchedCount(t *testing.T) {
+	db := ruleTestDB(t)
+	if err := db.Exec(`CREATE TABLE alert_rule_execution (id TEXT PRIMARY KEY, tenant_id TEXT, rule_id TEXT, rule_version INTEGER, status TEXT, matched_count INTEGER, error_message TEXT, started_at DATETIME, finished_at DATETIME)`).Error; err != nil {
+		t.Fatal(err)
+	}
+	store := NewGormStore(db, "tenant-a")
+	started := time.Date(2026, 11, 16, 1, 0, 0, 0, time.UTC)
+	finished := started.Add(2 * time.Second)
+	if err := store.RecordRuleExecution(context.Background(), Rule{ID: "rule-1", Code: RuleContractExpiry}, "SUCCEEDED", 7, started, finished, ""); err != nil {
+		t.Fatal(err)
+	}
+	var row struct {
+		RuleID       string
+		Status       string
+		MatchedCount int64
+	}
+	if err := db.Table("alert_rule_execution").Where("tenant_id = ? AND rule_id = ?", "tenant-a", "rule-1").Select("rule_id, status, matched_count").Scan(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.RuleID != "rule-1" || row.Status != "SUCCEEDED" || row.MatchedCount != 7 {
+		t.Fatalf("execution row = %+v", row)
 	}
 }

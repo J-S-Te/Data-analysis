@@ -50,6 +50,7 @@ type AlertRule struct {
 type AlertRuleScope struct {
 	OwnerOrgIDs    []string `json:"owner_org_ids"`
 	CustomerTypes  []string `json:"customer_types"`
+	Currencies     []string `json:"currencies"`
 	AmountMinMinor *int64   `json:"amount_min_minor"`
 	AmountMaxMinor *int64   `json:"amount_max_minor"`
 }
@@ -60,8 +61,27 @@ type AlertPreviewItem struct {
 	Title        string `json:"title"`
 	OwnerOrgID   string `json:"owner_org_id"`
 	CustomerType string `json:"customer_type"`
+	Currency     string `json:"currency"`
 	AmountMinor  int64  `json:"amount_minor"`
 	DueDate      string `json:"due_date"`
+}
+
+// AlertRuleExecution 是规则最近一次执行结果。
+type AlertRuleExecution struct {
+	RuleID       string     `json:"rule_id"`
+	RuleVersion  int64      `json:"rule_version"`
+	Status       string     `json:"status"`
+	MatchedCount int64      `json:"matched_count"`
+	ErrorMessage string     `json:"error_message"`
+	StartedAt    time.Time  `json:"started_at"`
+	FinishedAt   *time.Time `json:"finished_at"`
+}
+
+// AlertRuleScopeOptions 是规则范围选择器可用的聚合维度值。
+type AlertRuleScopeOptions struct {
+	OwnerOrgIDs   []string `json:"owner_org_ids"`
+	CustomerTypes []string `json:"customer_types"`
+	Currencies    []string `json:"currencies"`
 }
 
 // AlertPreviewResult 是规则命中预览结果。

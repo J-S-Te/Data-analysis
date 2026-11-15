@@ -267,7 +267,9 @@ func New(config Config) (*App, error) {
 	api.DELETE("/dictionary/metrics/:code", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("dictionary.manage"), dictHandler.Delete)
 	api.GET("/dictionary/metrics/:code/versions", middleware.RequirePermission("dictionary.view"), dictHandler.History)
 
-	adminHandler := adminhttp.NewHandler(adminapplication.NewService(admininfrastructure.NewGORMRepository(db)))
+	adminService := adminapplication.NewService(admininfrastructure.NewGORMRepository(db))
+	adminService.SetBusinessLocation(dashboardLocation)
+	adminHandler := adminhttp.NewHandler(adminService)
 	dashboardRepository := dashboardinfrastructure.NewGORMRepositoryWithApprovalSource(
 		db, dashboardLocation, config.DashboardApprovalSource,
 	).WithFinanceSource(config.FinanceSource).WithIntegrationSyncEnabled(config.IntegrationSyncEnabled)
@@ -285,6 +287,8 @@ func New(config Config) (*App, error) {
 	api.POST("/admin/sources/:id/trigger", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("aggregation.manage"), requireIntegrationSync(config.IntegrationSyncEnabled), func(c *gin.Context) { adminHandler.TriggerSource(c, c.Param("id")) })
 	api.POST("/admin/sources/trigger-all", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("aggregation.manage"), requireIntegrationSync(config.IntegrationSyncEnabled), adminHandler.TriggerAllSources)
 	api.GET("/alert-rules", middleware.RequirePermission("alert.manage"), adminHandler.ListAlertRules)
+	api.GET("/alert-rules/scope-options", middleware.RequirePermission("alert.manage"), adminHandler.AlertRuleScopeOptions)
+	api.GET("/alert-rules/executions", middleware.RequirePermission("alert.manage"), adminHandler.LatestAlertRuleExecutions)
 	api.POST("/alert-rules/preview", middleware.RequirePermission("alert.manage"), adminHandler.PreviewAlertRule)
 	api.PUT("/alert-rules", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("alert.manage"), adminHandler.PutAlertRules)
 	api.DELETE("/alert-rules/:id", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("alert.manage"), func(c *gin.Context) { adminHandler.DeleteAlertRule(c, c.Param("id")) })

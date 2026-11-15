@@ -28,6 +28,10 @@ func (s *memoryStore) ListEnabledRules(context.Context) ([]Rule, error) {
 	return s.rules, nil
 }
 
+func (s *memoryStore) RecordRuleExecution(context.Context, Rule, string, int, time.Time, time.Time, string) error {
+	return nil
+}
+
 func (s *memoryStore) FindContractExpiryCandidates(
 	_ context.Context,
 	_ time.Time,

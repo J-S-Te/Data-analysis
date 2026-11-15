@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/alertworker"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"strings"
 	"time"
@@ -240,6 +241,68 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 	})
 }
 
+// LatestAlertRuleExecutions 返回每个规则最近一次执行记录。
+// 参数：ctx 为上下文；tenantID 为可信租户。
+// 返回值：按 started_at 倒序读取后每个 rule_id 取第一条；读取失败返回错误。
+func (repository *GORMRepository) LatestAlertRuleExecutions(ctx context.Context, tenantID string) ([]domain.AlertRuleExecution, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return nil, application.ErrRulePayloadInvalid
+	}
+	var rows []domain.AlertRuleExecution
+	if err := repository.db.WithContext(ctx).Table("alert_rule_execution").
+		Where("tenant_id = ?", tenantID).
+		Order("started_at DESC").Limit(1000).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(rows))
+	latest := make([]domain.AlertRuleExecution, 0, len(rows))
+	for _, row := range rows {
+		if _, exists := seen[row.RuleID]; exists {
+			continue
+		}
+		seen[row.RuleID] = struct{}{}
+		latest = append(latest, row)
+	}
+	return latest, nil
+}
+
+// AlertRuleScopeOptions 读取当前租户合同/客户维度的去重范围选项。
+// 参数：ctx 为上下文；tenantID 为可信租户。
+// 返回值：组织、客户类型、币种列表；读取失败返回错误。
+func (repository *GORMRepository) AlertRuleScopeOptions(ctx context.Context, tenantID string) (domain.AlertRuleScopeOptions, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return domain.AlertRuleScopeOptions{}, application.ErrRulePayloadInvalid
+	}
+	options := domain.AlertRuleScopeOptions{
+		OwnerOrgIDs: make([]string, 0), CustomerTypes: make([]string, 0), Currencies: make([]string, 0),
+	}
+	var orgs []string
+	if err := repository.db.WithContext(ctx).Table("dim_contract").
+		Distinct("owner_org_id").
+		Where("tenant_id = ? AND origin_kind = 'NORMAL' AND owner_org_id <> ''", tenantID).
+		Order("owner_org_id").Pluck("owner_org_id", &orgs).Error; err != nil {
+		return domain.AlertRuleScopeOptions{}, err
+	}
+	var types []string
+	if err := repository.db.WithContext(ctx).Table("dim_customer").
+		Distinct("customer_type").
+		Where("tenant_id = ? AND customer_type <> ''", tenantID).
+		Order("customer_type").Pluck("customer_type", &types).Error; err != nil {
+		return domain.AlertRuleScopeOptions{}, err
+	}
+	var currencies []string
+	if err := repository.db.WithContext(ctx).Table("dim_contract").
+		Distinct("currency").
+		Where("tenant_id = ? AND origin_kind = 'NORMAL' AND currency <> ''", tenantID).
+		Order("currency").Pluck("currency", &currencies).Error; err != nil {
+		return domain.AlertRuleScopeOptions{}, err
+	}
+	options.OwnerOrgIDs = orgs
+	options.CustomerTypes = types
+	options.Currencies = currencies
+	return options, nil
+}
+
 // PreviewContractExpiry 只读计算合同到期规则命中数量与样例，不写预警项。
 // 参数：tenantID 为可信租户；days 为到期前后窗口；scope 为可选范围；
 //
@@ -250,55 +313,19 @@ func (repository *GORMRepository) PreviewContractExpiry(ctx context.Context, ten
 	if strings.TrimSpace(tenantID) == "" || days < 1 || days > 3650 {
 		return domain.AlertPreviewResult{}, application.ErrRulePayloadInvalid
 	}
-	if limit < 1 || limit > 20 {
-		limit = 20
-	}
-	base := func() *gorm.DB {
-		query := repository.db.WithContext(ctx).
-			Table("dim_contract AS c").
-			Joins("LEFT JOIN dim_customer AS dc ON dc.tenant_id = c.tenant_id AND dc.customer_id = c.crm_customer_id").
-			Where("c.tenant_id = ? AND c.origin_kind = 'NORMAL' AND c.end_date IS NOT NULL", tenantID).
-			Where("c.end_date >= DATE_SUB(DATE(?), INTERVAL ? DAY)", evaluatedAt, days).
-			Where("c.end_date <= DATE_ADD(DATE(?), INTERVAL ? DAY)", evaluatedAt, days).
-			Where("c.status NOT IN ?", []string{"COMPLETED", "ARCHIVED", "TERMINATED"})
-		if len(scope.OwnerOrgIDs) > 0 {
-			query = query.Where("c.owner_org_id IN ?", scope.OwnerOrgIDs)
-		}
-		if len(scope.CustomerTypes) > 0 {
-			query = query.Where("dc.customer_type IN ?", scope.CustomerTypes)
-		}
-		if scope.AmountMinMinor != nil {
-			query = query.Where("c.amount_minor >= ?", *scope.AmountMinMinor)
-		}
-		if scope.AmountMaxMinor != nil {
-			query = query.Where("c.amount_minor <= ?", *scope.AmountMaxMinor)
-		}
-		return query
-	}
-	var count int64
-	if err := base().Count(&count).Error; err != nil {
+	count, candidates, err := alertworker.PreviewContractExpiry(ctx, repository.db, tenantID, evaluatedAt, days, alertworker.RuleScope{
+		OwnerOrgIDs: scope.OwnerOrgIDs, CustomerTypes: scope.CustomerTypes, Currencies: scope.Currencies,
+		AmountMinMinor: scope.AmountMinMinor, AmountMaxMinor: scope.AmountMaxMinor,
+	}, limit)
+	if err != nil {
 		return domain.AlertPreviewResult{}, err
 	}
-	var rows []struct {
-		ContractID   string
-		Title        string
-		OwnerOrgID   string
-		CustomerType string
-		AmountMinor  int64
-		DueDate      string
-	}
-	if err := base().
-		Select("c.contract_id, c.title, c.owner_org_id, COALESCE(dc.customer_type, '') AS customer_type, c.amount_minor, CAST(c.end_date AS CHAR) AS due_date").
-		Order("c.end_date, c.contract_id").
-		Limit(limit).
-		Scan(&rows).Error; err != nil {
-		return domain.AlertPreviewResult{}, err
-	}
-	items := make([]domain.AlertPreviewItem, 0, len(rows))
-	for _, row := range rows {
+	items := make([]domain.AlertPreviewItem, 0, len(candidates))
+	for _, candidate := range candidates {
 		items = append(items, domain.AlertPreviewItem{
-			ContractID: row.ContractID, Title: row.Title, OwnerOrgID: row.OwnerOrgID,
-			CustomerType: row.CustomerType, AmountMinor: row.AmountMinor, DueDate: row.DueDate,
+			ContractID: candidate.TargetRef, Title: candidate.Title, OwnerOrgID: candidate.OwnerOrgID,
+			CustomerType: candidate.CustomerType, Currency: candidate.Currency,
+			AmountMinor: candidate.AmountMinor, DueDate: candidate.DueDate.Format("2006-01-02"),
 		})
 	}
 	return domain.AlertPreviewResult{MatchedCount: count, Sample: items, Limited: count > int64(len(items))}, nil
