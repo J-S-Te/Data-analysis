@@ -14,6 +14,7 @@ type SyncSource struct {
 	LastStatus    string     `json:"last_status"`
 	LastRunAt     *time.Time `json:"last_run_at"`
 	LastError     *string    `json:"last_error"`
+	LastErrorCode string     `json:"last_error_code,omitempty"`
 }
 
 // SyncJob 表示已经入队、等待聚合 Worker 执行的一次同步请求。

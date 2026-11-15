@@ -61,6 +61,9 @@ func (stub *advancedSnapshotRepositoryStub) ListTrend(context.Context, string, i
 	return nil, nil
 }
 
+// ContractRegions 返回测试预设的区域分布与仓储错误。
+// 参数：上下文和租户仅用于满足隔离仓储契约。
+// 返回值：预设区域分布及错误，不执行外部读取。
 func (stub *advancedSnapshotRepositoryStub) ContractRegions(context.Context, string) (domain.ContractRegionDistribution, error) {
 	return stub.regions, stub.regionsErr
 }
@@ -95,8 +98,9 @@ func TestTrendReturnsEmptyArrayWhenNoData(t *testing.T) {
 	}
 }
 
-// TestContractRegionsReturnsEmptyItemsArray 固定区域信封契约：不可用或零数据时
-// items 必须是 []，不能序列化成 null；可用性说明必须保留。
+// TestContractRegionsReturnsEmptyItemsArray 验证空区域分布保留可用性说明。
+// 参数：t 为仅使用仓储替身的应用层测试上下文。
+// 返回值：无；列表为空值或可用性说明丢失时失败。
 func TestContractRegionsReturnsEmptyItemsArray(t *testing.T) {
 	service := NewService(&advancedSnapshotRepositoryStub{regions: domain.ContractRegionDistribution{
 		Available: false,

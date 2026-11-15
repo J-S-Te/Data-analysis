@@ -240,17 +240,15 @@ func (repository *GORMRepository) ListContracts(ctx context.Context, tenantID st
 	return rows, total, err
 }
 
-// ContractRegions 返回签约事实按客户区域×币种的聚合（字典指标 1.3 区域分布）。
-// 未授权合同来源或非全租户范围时不产出（不补零），由调用方按「尚未接入」显式声明。
-// 签约事实按客户区域聚合，已丢失合同行级 owner_org_id，因此 ORG/TEAM/SELF 范围
-// 无法安全裁剪；这里失败关闭而不是返回全租户汇总。
-// 参数：ctx 含可信权限与范围，tenantID 为租户。
-// 返回值：带可用性说明的区域聚合及数据库错误。
+// ContractRegions 读取按客户区域与原币种分别归集的签约事实。
+// 参数：ctx 含可信权限与范围，tenantID 为当前租户。
+// 返回值：带可用性说明的区域聚合；数据库读取失败时返回错误。
 func (repository *GORMRepository) ContractRegions(ctx context.Context, tenantID string) (domain.ContractRegionDistribution, error) {
 	distribution := domain.ContractRegionDistribution{
 		Items: []domain.ContractRegionTotal{},
 		Basis: "按客户区域与币种归集已生效合同签约事实；金额不跨币种合计。",
 	}
+	// 区域汇总已丢失合同行级组织归属，窄范围不能借用全租户汇总。
 	if scopeFor(ctx, tenantID).mode != "TENANT" {
 		distribution.Available = false
 		distribution.Basis = "区域分布只支持全租户范围；组织、团队或个人范围不能从区域汇总签约事实安全推导。"

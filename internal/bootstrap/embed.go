@@ -10,12 +10,9 @@ import (
 	"gorm.io/gorm"
 )
 
-// dashboardEmbedReady 判定嵌入能力是否具备全部运行前提。
-// 仅打开开关不足以签发能力：Metabase 地址、嵌入密钥、独立公开来源和五个看板 ID
-// 缺一都会让前端拿到 503。此处在会话能力层直接降级为原生模式，避免可选嵌入选
-// 在每次进入总览/报告/财务时显示错误卡片。
-// 参数：config 为已装载的服务配置。
-// 返回值：开关关闭或任一前提缺失时 false。
+// dashboardEmbedReady 判定是否具备完整嵌入配置，避免会话宣告不可用能力。
+// 参数：config 为已装载的服务配置，含五个看板的嵌入标识。
+// 返回值：开关关闭或任一嵌入前提缺失时返回 false。
 func dashboardEmbedReady(config Config) bool {
 	if !config.DashboardEmbedEnabled {
 		return false

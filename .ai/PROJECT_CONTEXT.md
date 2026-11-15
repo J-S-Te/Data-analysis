@@ -12,6 +12,9 @@
 - 预警规则使用 `alert.manage` 权限；当前可执行类型仅 `CONTRACT_EXPIRY`。API/Worker 在运行时均不自动播种；新建默认停用，显式启用后扫描。保存保留稳定 ID 与不可变版本快照并检查版本；有历史告警只能停用，未关联历史允许删除。
 - 告警候选与写入均限制 Worker 配置租户；写入/停用/删除共用规则行锁，避免失效规则迟到写入。原 Worker 返回数量仍为候选数量，非并发状态变更后的精确持久化数量。
 - 合同与项目原生摘要页展示真实聚合数据；报告/财务也已接入原生 business_dashboard_snapshot，并保留独立 Metabase 嵌入。报告来源 PROJECT_READ_DSN，财务来源 SETTLEMENT_READ_DSN，均只读；缺失指标明确不可用，不填演示零值。
+- 合同区域分布 `GET /dashboard/contract-regions` 按客户区域与原币种分列；仅可信 TENANT 范围且有合同成功同步水位时可用，窄范围和缺少来源权限时明确不可用。
+- 嵌入会话能力同时检查开关、Metabase 地址、密钥、独立公开来源和五个看板 ID；配置不完整时降级为原生模式。
+- 管理与字典拒绝回执保留稳定错误码并提供安全中文字段提示；数据源内部诊断仅输出公开分类，批量同步部分入队与规则已保存后刷新失败分别回执，避免误导重复提交。
 - 指标字典读取使用 dictionary.view，维护使用 dictionary.manage（目录 data-analysis-v2）；编码不可变，新建默认停用，版本冲突拒绝写入，删除保留墓碑和不可变历史。内置与已登记引用保护；历史接口返回最近 200 条。
 - 浏览器会话为“空闲 + 绝对”双期限：OIDC_SESSION_IDLE_TTL（默认 30m）只由 POST /api/v1/auth/activity 续期，普通业务请求只刷新 last_seen_at；OIDC_SESSION_ABSOLUTE_TTL（默认 8h）为登录后绝对到期，Cookie 到期与之一致。000024 迁移为 da_oidc_sessions 增加 last_interactive_at，旧行 NULL 按 created_at 兼容；/api/v1/auth/me 追加 idle_timeout_seconds/idle_remaining_ms。
 - migration 13 增加字典启用/来源/删除状态、历史快照与引用登记表。数据库读取失败显式返回错误，不静默回退。自定义公式仅口径说明，不执行任意计算；2026-11-12目录发布13项受控身份：1.1–1.5、2.1/2.4/2.5、3.2/3.3、4.1/4.6/4.7；只有已确认且与发布定义一致才可启用。2.1保留既有默认，新获得资格默认关闭，租户显式状态保留。3.1提交至签发仍无匹配计算而未绑定。字典启停不改变看板计算、展示或权限，不保证来源当前可用。

@@ -7,6 +7,7 @@ import (
 	"encoding/base32"
 	"encoding/json"
 	"errors"
+	"fmt"
 	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"regexp"
@@ -19,10 +20,23 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-type Error struct{ Code string }
+type FieldIssue struct {
+	Field   string `json:"field"`
+	Rule    string `json:"rule"`
+	Message string `json:"message"`
+}
+
+type Error struct {
+	Code   string
+	Issues []FieldIssue
+}
 
 func (e *Error) Error() string { return e.Code }
-func fail(code string) error   { return &Error{code} }
+
+// fail 用途：构造保留既有分类的指标治理错误。
+// 参数：code 为稳定业务错误码。
+// 返回值：不包含底层异常文本的指标错误。
+func fail(code string) error { return &Error{Code: code} }
 func creationError(e error) error {
 	if e == nil {
 		return nil
@@ -152,16 +166,27 @@ func sameCalculation(a, b domain.Metric) bool {
 
 var codePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 
+// validate 用途：按既有格式和长度条件校验指标，并提供安全字段提示。
+// 参数：m 为当前请求的指标口径。
+// 返回值：字段问题或空；不回显被拒绝的字段值。
 func validate(m domain.Metric) error {
 	if !codePattern.MatchString(m.Code) {
-		return fail("METRIC_VALIDATION_FAILED")
+		return metricFieldFailure("code", "format", "指标编码须以字母或数字开头，仅含字母、数字、下划线、点或横线，最多64字符")
 	}
 	for _, v := range []struct {
-		s string
-		n int
-	}{{m.Name, 128}, {m.Dashboard, 128}, {m.Definition, 512}, {m.Formula, 512}, {m.Source, 255}, {m.Period, 64}, {m.Status, 32}} {
-		if strings.TrimSpace(v.s) == "" || len([]rune(v.s)) > v.n {
-			return fail("METRIC_VALIDATION_FAILED")
+		field, label, value string
+		limit               int
+	}{
+		{"name", "指标名称", m.Name, 128}, {"dashboard", "所属看板", m.Dashboard, 128},
+		{"definition", "业务定义", m.Definition, 512}, {"formula", "公式说明", m.Formula, 512},
+		{"source", "数据源说明", m.Source, 255}, {"period", "统计周期", m.Period, 64},
+		{"status", "口径确认状态", m.Status, 32},
+	} {
+		if strings.TrimSpace(v.value) == "" {
+			return metricFieldFailure(v.field, "required", "请填写"+v.label)
+		}
+		if len([]rune(v.value)) > v.limit {
+			return metricFieldFailure(v.field, "max", fmt.Sprintf("%s最多%d字符，请缩短后保存", v.label, v.limit))
 		}
 	}
 	return nil

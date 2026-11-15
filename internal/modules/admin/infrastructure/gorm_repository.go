@@ -33,9 +33,20 @@ type syncSourceRecord struct {
 
 func (syncSourceRecord) TableName() string { return "sync_source" }
 
+// toDomain 用途：投影数据源状态，内部诊断只转换为安全公开分类。
+// 参数：record 为当前租户的数据源持久化记录。
+// 返回值：公开状态回执；不改变数据库诊断、水位或任务状态。
 func (record syncSourceRecord) toDomain() domain.SyncSource {
-	return domain.SyncSource{TenantID: record.TenantID, ID: record.ID, SubsystemCode: record.SubsystemCode, DBHost: record.DBHost, DBSchema: record.DBSchema,
+	value := domain.SyncSource{TenantID: record.TenantID, ID: record.ID, SubsystemCode: record.SubsystemCode, DBHost: record.DBHost, DBSchema: record.DBSchema,
 		Enabled: record.Enabled, LastStatus: record.LastStatus, LastRunAt: record.LastRunAt, LastError: record.LastError}
+	if record.LastError != nil {
+		code, message := domain.PublicSyncFailure(*record.LastError)
+		value.LastErrorCode = code
+		if code != "" {
+			value.LastError = &message
+		}
+	}
+	return value
 }
 
 type syncJobRecord struct {

@@ -192,7 +192,7 @@ func New(config Config) (*App, error) {
 			auditStatus = "enabled"
 		}
 		// C14：能力维度快照；嵌入开关与财务来源是模式事实，不影响整体就绪。
-		// 开关打开但配置不完整时能力状态为 unconfigured，会话能力同步降级为原生模式。
+		// 配置不完整时会话能力降级为原生模式，避免可选嵌入反复返回错误。
 		embedState := "disabled"
 		if config.DashboardEmbedEnabled {
 			embedState = "unconfigured"

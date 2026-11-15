@@ -35,6 +35,10 @@ func principal(c *gin.Context, manage bool) (auth.Principal, bool) {
 	}
 	return p, true
 }
+
+// respondError 用途：输出指标治理的公开原因和安全字段问题。
+// 参数：c 为HTTP上下文，e 为治理错误或不可公开的底层异常。
+// 返回值：无；仅已知业务原因可进入错误回执。
 func respondError(c *gin.Context, e error) {
 	code := "METRIC_STORAGE_FAILED"
 	status := 500
@@ -62,12 +66,20 @@ func respondError(c *gin.Context, e error) {
 			message = "指标已有引用，不能删除"
 		case "CALCULATION_BINDING_REQUIRED":
 			message = "指标未绑定受控计算执行器，不能启用"
+		case "METRIC_VALIDATION_FAILED":
+			message = "指标内容未通过校验，请核对提示字段、长度和编码格式"
+		case "METRIC_LIMIT_EXCEEDED":
+			message = "当前租户已达到500条指标定义记录上限，本次未创建；已删除记录仍保留，请联系管理员核对指标容量"
 		case "METRIC_STORAGE_FAILED":
 			status = 500
 			message = "指标字典存储失败"
 		}
 	}
-	c.JSON(status, gin.H{"code": code, "message": message})
+	body := gin.H{"code": code, "message": message}
+	if typed != nil && len(typed.Issues) > 0 {
+		body["details"] = gin.H{"issues": typed.Issues}
+	}
+	c.JSON(status, body)
 }
 func invalid(c *gin.Context) {
 	c.JSON(400, gin.H{"code": "METRIC_PAYLOAD_INVALID", "message": "指标定义格式无效"})
