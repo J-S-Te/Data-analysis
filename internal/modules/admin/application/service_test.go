@@ -71,7 +71,7 @@ func TestReplaceAlertRulesRejectsMissingRequiredFields(t *testing.T) {
 	}
 }
 
-func TestReplaceAlertRulesRejectsUnsafeThresholdAndDuplicateCode(t *testing.T) {
+func TestReplaceAlertRulesRejectsUnsafeThresholdAndMultipleEnabledConfigs(t *testing.T) {
 	service := NewService(&repositoryStub{})
 	invalidThreshold := `{"days":0}`
 	validThreshold := `{"days":30}`
@@ -81,8 +81,19 @@ func TestReplaceAlertRulesRejectsUnsafeThresholdAndDuplicateCode(t *testing.T) {
 	if _, err := service.ReplaceAlertRules(context.Background(), "tenant-1", "operator-1", []domain.AlertRule{invalid}); err != ErrRulePayloadInvalid {
 		t.Fatalf("invalid threshold error = %v, want %v", err, ErrRulePayloadInvalid)
 	}
+	second := valid
+	second.Name = "合同到期提醒（60天）"
+	if _, err := service.ReplaceAlertRules(context.Background(), "tenant-1", "operator-1", []domain.AlertRule{valid, second}); err != nil {
+		t.Fatalf("multiple disabled configs should be accepted: %v", err)
+	}
+	enabled := valid
+	enabled.Enabled = true
+	second.Enabled = true
+	if _, err := service.ReplaceAlertRules(context.Background(), "tenant-1", "operator-1", []domain.AlertRule{enabled, second}); err != ErrRulePayloadInvalid {
+		t.Fatalf("multiple enabled configs error = %v, want %v", err, ErrRulePayloadInvalid)
+	}
 	if _, err := service.ReplaceAlertRules(context.Background(), "tenant-1", "operator-1", []domain.AlertRule{valid, valid}); err != ErrRulePayloadInvalid {
-		t.Fatalf("duplicate rule error = %v, want %v", err, ErrRulePayloadInvalid)
+		t.Fatalf("duplicate name error = %v, want %v", err, ErrRulePayloadInvalid)
 	}
 }
 

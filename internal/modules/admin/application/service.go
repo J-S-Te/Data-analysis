@@ -135,7 +135,8 @@ func (service *Service) ReplaceAlertRules(ctx context.Context, tenantID, actorID
 	}
 	now := service.now()
 	rules := make([]domain.AlertRule, 0, len(input))
-	seenCodes := make(map[string]struct{}, len(input))
+	seenNames := make(map[string]struct{}, len(input))
+	enabledCodes := make(map[string]struct{}, len(input))
 	for _, rule := range input {
 		rule.RuleCode = strings.ToUpper(strings.TrimSpace(rule.RuleCode))
 		rule.Name = strings.TrimSpace(rule.Name)
@@ -147,10 +148,17 @@ func (service *Service) ReplaceAlertRules(ctx context.Context, tenantID, actorID
 		if rule.Version < 0 || (rule.ID == "" && rule.Version != 0) || (rule.ID != "" && (len(rule.ID) != 26 || rule.Version < 1)) {
 			return nil, ErrRulePayloadInvalid
 		}
-		if _, duplicated := seenCodes[rule.RuleCode]; duplicated {
+		duplicateKey := rule.RuleCode + "\x00" + rule.Name
+		if _, duplicated := seenNames[duplicateKey]; duplicated {
 			return nil, ErrRulePayloadInvalid
 		}
-		seenCodes[rule.RuleCode] = struct{}{}
+		seenNames[duplicateKey] = struct{}{}
+		if rule.Enabled {
+			if _, alreadyEnabled := enabledCodes[rule.RuleCode]; alreadyEnabled {
+				return nil, ErrRulePayloadInvalid
+			}
+			enabledCodes[rule.RuleCode] = struct{}{}
+		}
 		if rule.ID == "" {
 			rule.ID = service.newID()
 		}
