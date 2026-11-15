@@ -24,7 +24,9 @@ type managementService interface {
 	DeleteAlertRule(context.Context, string, string) error
 }
 
-// TriggerAllSources 将当前租户全部启用数据源一次性入队。
+// TriggerAllSources 用途：将当前租户全部启用数据源一次性入队。
+// 参数：c 为带可信租户与数据范围的HTTP上下文。
+// 返回值：无；后续失败时仍返回已确认入队和跳过的数量。
 func (handler *Handler) TriggerAllSources(c *gin.Context) {
 	principal, ok := auth.FromContext(c.Request.Context())
 	if !ok {
@@ -36,7 +38,16 @@ func (handler *Handler) TriggerAllSources(c *gin.Context) {
 	}
 	queued, skipped, err := handler.service.TriggerAllSources(c.Request.Context(), principal.TenantID)
 	if err != nil {
-		response.Error(c, apperror.Wrap(err, stdhttp.StatusInternalServerError, "SYNC_ALL_FAILED", "批量同步入队失败"))
+		requestID := c.GetHeader("X-Request-ID")
+		if requestID == "" {
+			requestID = c.GetString("request_id")
+		}
+		c.JSON(stdhttp.StatusInternalServerError, gin.H{
+			"code": "SYNC_ALL_FAILED", "message": "批量同步结果尚未全部确认，请先刷新查看任务，勿重复触发",
+			"request_id": requestID, "details": gin.H{
+				"queued": queued, "skipped": skipped, "partial_completion": queued > 0,
+			},
+		})
 		return
 	}
 	response.OK(c, gin.H{"queued": queued, "skipped": skipped, "note": "已将启用的数据源加入同步队列"})
@@ -126,7 +137,9 @@ func (handler *Handler) ListAlertRules(c *gin.Context) {
 	response.OK(c, rules)
 }
 
-// PutAlertRules 原子保存预警规则并检查版本；省略的规则不会被隐式删除。
+// PutAlertRules 用途：原子保存预警规则并检查版本；省略的规则不会被隐式删除。
+// 参数：c 为包含可信身份和规则请求的HTTP上下文。
+// 返回值：无；已保存但读取失败与真正保存失败使用不同回执。
 func (handler *Handler) PutAlertRules(c *gin.Context) {
 	principal, ok := auth.FromContext(c.Request.Context())
 	if !ok {
@@ -149,6 +162,17 @@ func (handler *Handler) PutAlertRules(c *gin.Context) {
 	actorID = principal.UserID
 	rules, err := handler.service.ReplaceAlertRules(c.Request.Context(), tenantID(c), actorID, alertRulesFromRequest(input))
 	if err != nil {
+		if errors.Is(err, application.ErrRuleSavedRefreshFailed) {
+			requestID := c.GetHeader("X-Request-ID")
+			if requestID == "" {
+				requestID = c.GetString("request_id")
+			}
+			c.JSON(stdhttp.StatusInternalServerError, gin.H{
+				"code": "RULE_SAVED_REFRESH_FAILED", "message": "规则已保存，但最新列表读取失败，请先刷新核对，无需再次保存",
+				"request_id": requestID, "details": gin.H{"saved": true, "refresh_failed": true},
+			})
+			return
+		}
 		if errors.Is(err, application.ErrRuleVersionConflict) {
 			response.Error(c, apperror.New(stdhttp.StatusConflict, "RULE_VERSION_CONFLICT", "规则已被修改，请重新加载后再保存"))
 			return
@@ -157,7 +181,7 @@ func (handler *Handler) PutAlertRules(c *gin.Context) {
 			response.Error(c, apperror.New(stdhttp.StatusBadRequest, "RULE_PAYLOAD_INVALID", "rule_code, name and source_fct are required"))
 			return
 		}
-		response.Error(c, apperror.Wrap(err, stdhttp.StatusInternalServerError, "RULE_SAVE_FAILED", "failed to save rules"))
+		response.Error(c, apperror.New(stdhttp.StatusInternalServerError, "RULE_SAVE_FAILED", "规则保存结果暂未确认，请先刷新列表核对，避免重复保存"))
 		return
 	}
 	response.OK(c, rules)

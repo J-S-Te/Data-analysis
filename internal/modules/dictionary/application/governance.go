@@ -1,14 +1,15 @@
 package application
 
 import (
-	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/json"
 	"errors"
+	"fmt"
 	mysqlDriver "github.com/go-sql-driver/mysql"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"regexp"
 	"sort"
 	"strings"
@@ -19,10 +20,23 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-type Error struct{ Code string }
+type FieldIssue struct {
+	Field   string `json:"field"`
+	Rule    string `json:"rule"`
+	Message string `json:"message"`
+}
+
+type Error struct {
+	Code   string
+	Issues []FieldIssue
+}
 
 func (e *Error) Error() string { return e.Code }
-func fail(code string) error   { return &Error{code} }
+
+// fail 用途：构造保留既有分类的指标治理错误。
+// 参数：code 为稳定业务错误码。
+// 返回值：不包含底层异常文本的指标错误。
+func fail(code string) error { return &Error{Code: code} }
 func creationError(e error) error {
 	if e == nil {
 		return nil
@@ -101,16 +115,33 @@ func builtinMetrics() []domain.Metric {
 	}
 	return out
 }
+
+// controlledBindings 声明已接入受控计算执行器的内置指标及其绑定身份。
+// 每项追加前必须同时具备：既有受控管道真实承担该指标计算（聚合/快照/事实表），
+// 且对应看板读取路径已存在。绑定串是治理层的身份声明，不参与运行时路由。
+var controlledBindings = map[string]string{
+	"2.1": "PROJECT_STATUS_COUNTS_V1",
+	"1.1": "CONTRACT_SIGNING_FACTS_V1",
+	"1.2": "CONTRACT_SIGNING_FACTS_V1",
+	"1.3": "CONTRACT_REGION_FACTS_V1",
+	"1.4": "CONTRACT_CONVERSION_FACTS_V1",
+	"3.1": "REPORT_CYCLE_SNAPSHOT_V1",
+	"4.1": "FINANCE_CURRENCY_TOTALS_V1",
+}
+
 func derived(m domain.Metric) domain.Metric {
 	m.CalculationBinding = ""
 	m.CanEnable = false
 	m.EnableBlockReason = ""
-	// 项目状态计数由原生项目快照读取器提供。
-	if m.Origin == "BUILTIN" && m.Code == "2.1" && m.Status == "已确认" {
-		for _, b := range publishedMetrics {
-			if b.Code == m.Code && sameCalculation(m, b) {
-				m.CalculationBinding = "PROJECT_STATUS_COUNTS_V1"
-				m.CanEnable = true
+	// 已接入受控计算执行器的指标：内置来源、口径已确认且与发布版本逐字一致时，
+	// 绑定对应执行器身份；口径漂移即失绑（不得以偏离口径启用）。
+	if m.Origin == "BUILTIN" && m.Status == "已确认" {
+		if binding, ok := controlledBindings[m.Code]; ok {
+			for _, b := range publishedMetrics {
+				if b.Code == m.Code && sameCalculation(m, b) {
+					m.CalculationBinding = binding
+					m.CanEnable = true
+				}
 			}
 		}
 	}
@@ -124,11 +155,13 @@ func derived(m domain.Metric) domain.Metric {
 // enableBlockReason 说明指标为何不能启用：口径未确认、口径偏离发布版本，
 // 或该指标尚未接入受控计算执行器。原因由服务端计算，前端只做展示映射。
 func enableBlockReason(m domain.Metric) string {
-	if m.Origin == "BUILTIN" && m.Code == "2.1" {
-		if m.Status != "已确认" {
-			return "METRIC_STATUS_UNCONFIRMED"
+	if m.Origin == "BUILTIN" {
+		if _, controlled := controlledBindings[m.Code]; controlled {
+			if m.Status != "已确认" {
+				return "METRIC_STATUS_UNCONFIRMED"
+			}
+			return "CALCULATION_DEFINITION_DRIFT"
 		}
-		return "CALCULATION_DEFINITION_DRIFT"
 	}
 	return "CALCULATION_BINDING_MISSING"
 }
@@ -139,16 +172,27 @@ func sameCalculation(a, b domain.Metric) bool {
 
 var codePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 
+// validate 用途：按既有格式和长度条件校验指标，并提供安全字段提示。
+// 参数：m 为当前请求的指标口径。
+// 返回值：字段问题或空；不回显被拒绝的字段值。
 func validate(m domain.Metric) error {
 	if !codePattern.MatchString(m.Code) {
-		return fail("METRIC_VALIDATION_FAILED")
+		return metricFieldFailure("code", "format", "指标编码须以字母或数字开头，仅含字母、数字、下划线、点或横线，最多64字符")
 	}
 	for _, v := range []struct {
-		s string
-		n int
-	}{{m.Name, 128}, {m.Dashboard, 128}, {m.Definition, 512}, {m.Formula, 512}, {m.Source, 255}, {m.Period, 64}, {m.Status, 32}} {
-		if strings.TrimSpace(v.s) == "" || len([]rune(v.s)) > v.n {
-			return fail("METRIC_VALIDATION_FAILED")
+		field, label, value string
+		limit               int
+	}{
+		{"name", "指标名称", m.Name, 128}, {"dashboard", "所属看板", m.Dashboard, 128},
+		{"definition", "业务定义", m.Definition, 512}, {"formula", "公式说明", m.Formula, 512},
+		{"source", "数据源说明", m.Source, 255}, {"period", "统计周期", m.Period, 64},
+		{"status", "口径确认状态", m.Status, 32},
+	} {
+		if strings.TrimSpace(v.value) == "" {
+			return metricFieldFailure(v.field, "required", "请填写"+v.label)
+		}
+		if len([]rune(v.value)) > v.limit {
+			return metricFieldFailure(v.field, "max", fmt.Sprintf("%s最多%d字符，请缩短后保存", v.label, v.limit))
 		}
 	}
 	return nil

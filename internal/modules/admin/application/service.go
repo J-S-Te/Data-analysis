@@ -29,6 +29,8 @@ var (
 	ErrRuleNotFound        = errors.New("alert rule not found")
 	ErrRuleHasHistory      = errors.New("alert rule has alert history")
 	ErrRuleVersionConflict = errors.New("alert rule version conflict")
+	// ErrRuleSavedRefreshFailed 表示提交已经完成，仅后续列表读取失败。
+	ErrRuleSavedRefreshFailed = errors.New("规则已保存，但最新列表读取失败")
 )
 
 const maxRulesPerTenant = 50
@@ -124,7 +126,9 @@ func (service *Service) ListAlertRules(ctx context.Context, tenantID string) ([]
 	return service.repository.ListAlertRules(ctx, tenantID)
 }
 
-// ReplaceAlertRules 在指定租户内原子保存规则，删除使用独立的历史保护接口。
+// ReplaceAlertRules 用途：在指定租户内原子保存规则，删除使用独立的历史保护接口。
+// 参数：ctx 为请求上下文，tenantID 和 actorID 为可信身份，input 为规则内容。
+// 返回值：保存后的规则；提交后读取失败返回明确已保存的错误语义。
 func (service *Service) ReplaceAlertRules(ctx context.Context, tenantID, actorID string, input []domain.AlertRule) ([]domain.AlertRule, error) {
 	if strings.TrimSpace(tenantID) == "" || strings.TrimSpace(actorID) == "" || len(input) == 0 || len(input) > maxRulesPerTenant {
 		return nil, ErrRulePayloadInvalid
@@ -164,7 +168,11 @@ func (service *Service) ReplaceAlertRules(ctx context.Context, tenantID, actorID
 	if err := service.repository.ReplaceAlertRules(ctx, tenantID, rules); err != nil {
 		return nil, err
 	}
-	return service.repository.ListAlertRules(ctx, tenantID)
+	saved, err := service.repository.ListAlertRules(ctx, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrRuleSavedRefreshFailed, err)
+	}
+	return saved, nil
 }
 
 func validAlertRule(rule domain.AlertRule) bool {
