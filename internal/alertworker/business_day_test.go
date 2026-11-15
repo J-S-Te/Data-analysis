@@ -18,6 +18,10 @@ type windowStore struct {
 
 func (s *windowStore) ListEnabledRules(context.Context) ([]Rule, error) { return s.rules, nil }
 
+func (s *windowStore) RecordRuleExecution(context.Context, Rule, string, int, time.Time, time.Time, string) error {
+	return nil
+}
+
 func (s *windowStore) FindContractExpiryCandidates(_ context.Context, evaluatedAt time.Time, _ int) ([]ContractExpiryCandidate, error) {
 	s.window = evaluatedAt
 	return nil, nil

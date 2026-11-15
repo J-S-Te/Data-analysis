@@ -2,6 +2,8 @@ package alertworker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"sort"
 	"strings"
@@ -12,6 +14,7 @@ import (
 )
 
 type gormRule struct {
+	ID            string  `gorm:"column:id"`
 	RuleCode      string  `gorm:"column:rule_code"`
 	Severity      string  `gorm:"column:severity"`
 	ThresholdJSON []byte  `gorm:"column:threshold_json"`
@@ -38,7 +41,7 @@ func (s *GormStore) ListEnabledRules(ctx context.Context) ([]Rule, error) {
 	var rows []gormRule
 	if err := s.db.WithContext(ctx).
 		Table("alert_rule").
-		Select("rule_code, severity, threshold_json, scope_json, effective_from, effective_to").
+		Select("id, rule_code, severity, threshold_json, scope_json, effective_from, effective_to").
 		Where("tenant_id = ? AND enabled = ?", s.tenantID, true).
 		Order("rule_code").
 		Find(&rows).Error; err != nil {
@@ -47,6 +50,7 @@ func (s *GormStore) ListEnabledRules(ctx context.Context) ([]Rule, error) {
 	rules := make([]Rule, 0, len(rows))
 	for _, row := range rows {
 		rules = append(rules, Rule{
+			ID:            row.ID,
 			Code:          row.RuleCode,
 			Severity:      row.Severity,
 			ThresholdJSON: row.ThresholdJSON,
@@ -91,7 +95,7 @@ func (s *GormStore) FindContractExpiryCandidates(
 		Select(`c.tenant_id, c.owner_org_id, c.contract_id AS target_ref,
 CONCAT('合同「', c.title, '」将在 ', DATE_FORMAT(c.end_date, '%Y-%m-%d'), ' 到期') AS title,
 c.end_date AS due_date,
-COALESCE(dc.customer_type, '') AS customer_type, c.amount_minor,
+COALESCE(dc.customer_type, '') AS customer_type, c.currency, c.amount_minor,
 (c.end_date >= DATE(?) AND c.end_date <= DATE_ADD(DATE(?), INTERVAL ? DAY)) AS in_window`,
 			evaluatedAt, evaluatedAt, days).
 		Where("c.end_date IS NOT NULL").
@@ -110,6 +114,32 @@ COALESCE(dc.customer_type, '') AS customer_type, c.amount_minor,
 		}
 	}
 	return candidates, nil
+}
+
+// RecordRuleExecution 写入一次规则执行结果，供规则中心展示最近执行/命中数。
+// 参数：rule 为已评估规则；status 为 SUCCEEDED/FAILED；matched 为命中数。
+// 返回值：写入失败返回错误；不写 alert_item。
+func (s *GormStore) RecordRuleExecution(ctx context.Context, rule Rule, status string, matched int, startedAt, finishedAt time.Time, errorMessage string) error {
+	if err := s.validateTenant(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(rule.ID) == "" {
+		return errors.New("alert rule execution requires rule id")
+	}
+	if status != "SUCCEEDED" && status != "FAILED" {
+		return errors.New("alert rule execution status must be SUCCEEDED or FAILED")
+	}
+	if len(errorMessage) > 1024 {
+		errorMessage = errorMessage[:1024]
+	}
+	sum := sha256.Sum256([]byte(s.tenantID + "\x00" + rule.ID + "\x00" + startedAt.UTC().Format(time.RFC3339Nano)))
+	id := strings.ToUpper(hex.EncodeToString(sum[:]))[:26]
+	err := s.db.WithContext(ctx).Exec(
+		`INSERT INTO alert_rule_execution (id, tenant_id, rule_id, rule_version, status, matched_count, error_message, started_at, finished_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, s.tenantID, rule.ID, 0, status, matched, errorMessage, startedAt.UTC(), finishedAt.UTC(),
+	).Error
+	return err
 }
 
 // CountActiveAlerts 统计同一租户、同一规则下仍未关闭（OPEN/ACK）的告警数。

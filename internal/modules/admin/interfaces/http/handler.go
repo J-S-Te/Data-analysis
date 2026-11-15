@@ -23,6 +23,8 @@ type managementService interface {
 	ReplaceAlertRules(context.Context, string, string, []domain.AlertRule) ([]domain.AlertRule, error)
 	DeleteAlertRule(context.Context, string, string) error
 	PreviewAlertRule(context.Context, string, int, *string) (domain.AlertPreviewResult, error)
+	AlertRuleScopeOptions(context.Context, string) (domain.AlertRuleScopeOptions, error)
+	LatestAlertRuleExecutions(context.Context, string) ([]domain.AlertRuleExecution, error)
 }
 
 // TriggerAllSources 用途：将当前租户全部启用数据源一次性入队。
@@ -136,6 +138,62 @@ func (handler *Handler) ListAlertRules(c *gin.Context) {
 		return
 	}
 	response.OK(c, rules)
+}
+
+// LatestAlertRuleExecutions 返回每条规则最近一次执行状态和命中数。
+// 参数：c 为带租户范围的 HTTP 上下文。
+// 返回值：执行列表；读取失败返回 500。
+func (handler *Handler) LatestAlertRuleExecutions(c *gin.Context) {
+	principal, ok := auth.FromContext(c.Request.Context())
+	if !ok {
+		response.Error(c, apperror.ErrUnauthenticated)
+		return
+	}
+	if !principal.HasPermission("alert.manage") {
+		response.Error(c, apperror.New(stdhttp.StatusForbidden, "FORBIDDEN", "没有预警规则管理权限"))
+		return
+	}
+	if !requireTenantScope(c, principal) {
+		return
+	}
+	result, err := handler.service.LatestAlertRuleExecutions(c.Request.Context(), principal.TenantID)
+	if errors.Is(err, application.ErrRulePayloadInvalid) {
+		response.Error(c, apperror.New(stdhttp.StatusBadRequest, "RULE_EXECUTIONS_INVALID", "租户范围无效"))
+		return
+	}
+	if err != nil {
+		response.Error(c, apperror.Wrap(err, stdhttp.StatusInternalServerError, "RULE_EXECUTIONS_FAILED", "读取规则执行记录失败"))
+		return
+	}
+	response.OK(c, result)
+}
+
+// AlertRuleScopeOptions 返回规则范围可用的组织/客户类型/币种选项。
+// 参数：c 为带租户范围的 HTTP 上下文。
+// 返回值：只读聚合维度；读取失败返回 500。
+func (handler *Handler) AlertRuleScopeOptions(c *gin.Context) {
+	principal, ok := auth.FromContext(c.Request.Context())
+	if !ok {
+		response.Error(c, apperror.ErrUnauthenticated)
+		return
+	}
+	if !principal.HasPermission("alert.manage") {
+		response.Error(c, apperror.New(stdhttp.StatusForbidden, "FORBIDDEN", "没有预警规则管理权限"))
+		return
+	}
+	if !requireTenantScope(c, principal) {
+		return
+	}
+	result, err := handler.service.AlertRuleScopeOptions(c.Request.Context(), principal.TenantID)
+	if errors.Is(err, application.ErrRulePayloadInvalid) {
+		response.Error(c, apperror.New(stdhttp.StatusBadRequest, "RULE_SCOPE_OPTIONS_INVALID", "租户范围无效"))
+		return
+	}
+	if err != nil {
+		response.Error(c, apperror.Wrap(err, stdhttp.StatusInternalServerError, "RULE_SCOPE_OPTIONS_FAILED", "读取规则范围选项失败"))
+		return
+	}
+	response.OK(c, result)
 }
 
 // PreviewAlertRule 返回合同到期规则当前命中数量和样例，不产生预警或审计写入。

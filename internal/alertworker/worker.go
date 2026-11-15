@@ -23,6 +23,7 @@ const (
 
 // Rule 是 alert_rule 中 Worker 执行所需的最小字段集合。
 type Rule struct {
+	ID            string
 	Code          string
 	Severity      string
 	ThresholdJSON []byte
@@ -35,6 +36,7 @@ type Rule struct {
 type RuleScope struct {
 	OwnerOrgIDs    []string `json:"owner_org_ids"`
 	CustomerTypes  []string `json:"customer_types"`
+	Currencies     []string `json:"currencies"`
 	AmountMinMinor *int64   `json:"amount_min_minor"`
 	AmountMaxMinor *int64   `json:"amount_max_minor"`
 }
@@ -46,6 +48,7 @@ type ContractExpiryCandidate struct {
 	TargetRef    string
 	Title        string
 	CustomerType string
+	Currency     string
 	AmountMinor  int64
 	DueDate      time.Time
 	// InWindow 表示到期日位于 [基准日, 基准日+提醒窗口天数] 内。
@@ -76,6 +79,7 @@ type Store interface {
 	// CountActiveAlerts 返回同一规则下仍未关闭（OPEN/ACK）的告警基数，
 	// 供调用方在本轮命中集合异常收缩时触发安全阀。
 	CountActiveAlerts(ctx context.Context, ruleCode string) (int64, error)
+	RecordRuleExecution(ctx context.Context, rule Rule, status string, matched int, startedAt, finishedAt time.Time, errorMessage string) error
 	// ReconcileAlerts 按本轮实际命中的告警集合收敛同一规则的历史告警状态。
 	// 只有启用了 LifecycleOptions.AutoResolve 才会调用；实现必须幂等且租户隔离。
 	ReconcileAlerts(ctx context.Context, ruleCode string, active []Alert, evaluatedAt time.Time, options ReconcileOptions) error
@@ -168,6 +172,9 @@ func matchesRuleScope(scope RuleScope, candidate ContractExpiryCandidate) bool {
 		return false
 	}
 	if len(scope.CustomerTypes) > 0 && !containsString(scope.CustomerTypes, candidate.CustomerType) {
+		return false
+	}
+	if len(scope.Currencies) > 0 && !containsString(scope.Currencies, candidate.Currency) {
 		return false
 	}
 	if scope.AmountMinMinor != nil && candidate.AmountMinor < *scope.AmountMinMinor {
@@ -356,6 +363,7 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 		if !ruleEffectiveOn(rule, evaluatedAt) {
 			continue
 		}
+		startedAt := w.now()
 		if w.LicenseCheck != nil {
 			if err := w.LicenseCheck(ctx); err != nil {
 				return processed, err
@@ -368,8 +376,15 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 			if evaluateErr != nil {
 				runErrors = append(runErrors, fmt.Errorf("evaluate rule %s: %w", rule.Code, evaluateErr))
 			}
+			if recordErr := recordExecution(ctx, w.store, rule, count, startedAt, w.now(), evaluateErr); recordErr != nil {
+				runErrors = append(runErrors, fmt.Errorf("record rule %s execution: %w", rule.Code, recordErr))
+			}
 		default:
-			runErrors = append(runErrors, fmt.Errorf("alert rule %s is not supported", rule.Code))
+			evaluateErr := fmt.Errorf("alert rule %s is not supported", rule.Code)
+			runErrors = append(runErrors, evaluateErr)
+			if recordErr := recordExecution(ctx, w.store, rule, 0, startedAt, w.now(), evaluateErr); recordErr != nil {
+				runErrors = append(runErrors, fmt.Errorf("record rule %s execution: %w", rule.Code, recordErr))
+			}
 		}
 	}
 	return processed, errors.Join(runErrors...)
@@ -492,6 +507,16 @@ func normalizedSeverity(severity string) string {
 	default:
 		return "MEDIUM"
 	}
+}
+
+func recordExecution(ctx context.Context, store Store, rule Rule, matched int, startedAt, finishedAt time.Time, evaluateErr error) error {
+	status := "SUCCEEDED"
+	errorMessage := ""
+	if evaluateErr != nil {
+		status = "FAILED"
+		errorMessage = evaluateErr.Error()
+	}
+	return store.RecordRuleExecution(ctx, rule, status, matched, startedAt, finishedAt, errorMessage)
 }
 
 func stableAlertID(tenantID, alertType, targetRef string) string {

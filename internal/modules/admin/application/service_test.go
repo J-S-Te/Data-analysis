@@ -47,6 +47,12 @@ func (stub *repositoryStub) ReplaceAlertRules(_ context.Context, _ string, rules
 	return nil
 }
 func (stub *repositoryStub) DeleteAlertRule(context.Context, string, string) error { return nil }
+func (stub *repositoryStub) AlertRuleScopeOptions(context.Context, string) (domain.AlertRuleScopeOptions, error) {
+	return domain.AlertRuleScopeOptions{}, nil
+}
+func (stub *repositoryStub) LatestAlertRuleExecutions(context.Context, string) ([]domain.AlertRuleExecution, error) {
+	return nil, nil
+}
 func (stub *repositoryStub) PreviewContractExpiry(_ context.Context, _ string, days int, scope domain.AlertRuleScope, at time.Time, limit int) (domain.AlertPreviewResult, error) {
 	stub.previewDays = days
 	stub.previewScope = scope
