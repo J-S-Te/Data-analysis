@@ -285,6 +285,7 @@ func New(config Config) (*App, error) {
 	api.POST("/admin/sources/:id/trigger", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("aggregation.manage"), requireIntegrationSync(config.IntegrationSyncEnabled), func(c *gin.Context) { adminHandler.TriggerSource(c, c.Param("id")) })
 	api.POST("/admin/sources/trigger-all", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("aggregation.manage"), requireIntegrationSync(config.IntegrationSyncEnabled), adminHandler.TriggerAllSources)
 	api.GET("/alert-rules", middleware.RequirePermission("alert.manage"), adminHandler.ListAlertRules)
+	api.POST("/alert-rules/preview", middleware.RequirePermission("alert.manage"), adminHandler.PreviewAlertRule)
 	api.PUT("/alert-rules", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("alert.manage"), adminHandler.PutAlertRules)
 	api.DELETE("/alert-rules/:id", middleware.RequireSameOriginWrite(config.PublicOrigin), middleware.RequirePermission("alert.manage"), func(c *gin.Context) { adminHandler.DeleteAlertRule(c, c.Param("id")) })
 

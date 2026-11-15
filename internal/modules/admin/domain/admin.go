@@ -37,8 +37,36 @@ type AlertRule struct {
 	Severity      string    `json:"severity"`
 	Enabled       bool      `json:"enabled"`
 	ThresholdJSON *string   `json:"threshold_json"`
+	ScopeJSON     *string   `json:"scope_json"`
+	EffectiveFrom *string   `json:"effective_from"`
+	EffectiveTo   *string   `json:"effective_to"`
 	UpdatedBy     *string   `json:"updated_by"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 	Version       int64     `json:"version"`
+}
+
+// AlertRuleScope 是合同到期规则的可选适用范围；零值表示不限制。
+type AlertRuleScope struct {
+	OwnerOrgIDs    []string `json:"owner_org_ids"`
+	CustomerTypes  []string `json:"customer_types"`
+	AmountMinMinor *int64   `json:"amount_min_minor"`
+	AmountMaxMinor *int64   `json:"amount_max_minor"`
+}
+
+// AlertPreviewItem 是命中预览中的最小合同摘要，不返回客户敏感信息。
+type AlertPreviewItem struct {
+	ContractID   string `json:"contract_id"`
+	Title        string `json:"title"`
+	OwnerOrgID   string `json:"owner_org_id"`
+	CustomerType string `json:"customer_type"`
+	AmountMinor  int64  `json:"amount_minor"`
+	DueDate      string `json:"due_date"`
+}
+
+// AlertPreviewResult 是规则命中预览结果。
+type AlertPreviewResult struct {
+	MatchedCount int64              `json:"matched_count"`
+	Sample       []AlertPreviewItem `json:"sample"`
+	Limited      bool               `json:"limited"`
 }

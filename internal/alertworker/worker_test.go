@@ -314,3 +314,43 @@ func TestLifecycleOptionsFromEnvRejectsInvalid(t *testing.T) {
 		t.Fatal("缺失环境读取函数未被拒绝")
 	}
 }
+
+func TestRunOnceFiltersContractExpiryByScope(t *testing.T) {
+	dueDate := time.Date(2026, time.September, 8, 0, 0, 0, 0, time.UTC)
+	store := &memoryStore{
+		rules: []Rule{{Code: RuleContractExpiry, Severity: "MEDIUM", ThresholdJSON: []byte(`{"days":21}`),
+			ScopeJSON: []byte(`{"owner_org_ids":["org-a"],"customer_types":["企业"],"amount_min_minor":10000,"amount_max_minor":20000}`)}},
+		candidates: []ContractExpiryCandidate{
+			{TenantID: "tenant-1", OwnerOrgID: "org-a", CustomerType: "企业", AmountMinor: 15000, TargetRef: "contract-match", Title: "命中", DueDate: dueDate},
+			{TenantID: "tenant-1", OwnerOrgID: "org-b", CustomerType: "企业", AmountMinor: 15000, TargetRef: "contract-org", Title: "组织不匹配", DueDate: dueDate},
+			{TenantID: "tenant-1", OwnerOrgID: "org-a", CustomerType: "政府", AmountMinor: 15000, TargetRef: "contract-type", Title: "类型不匹配", DueDate: dueDate},
+			{TenantID: "tenant-1", OwnerOrgID: "org-a", CustomerType: "企业", AmountMinor: 9999, TargetRef: "contract-amount", Title: "金额不匹配", DueDate: dueDate},
+		},
+	}
+	worker := New(store)
+	worker.now = func() time.Time { return time.Date(2026, time.August, 17, 8, 0, 0, 0, time.UTC) }
+	count, err := worker.RunOnce(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("RunOnce() count = %d, error = %v; want only scoped candidate", count, err)
+	}
+	if _, ok := store.alerts["tenant-1/CONTRACT_EXPIRY/contract-match"]; !ok {
+		t.Fatalf("scoped candidate missing: %#v", store.alerts)
+	}
+	if len(store.alerts) != 1 {
+		t.Fatalf("alerts = %#v; want exactly one", store.alerts)
+	}
+}
+
+func TestRunOnceSkipsRuleOutsideEffectiveWindow(t *testing.T) {
+	from := "2026-09-01"
+	store := &memoryStore{rules: []Rule{{Code: RuleContractExpiry, Severity: "MEDIUM", ThresholdJSON: []byte(`{"days":21}`), EffectiveFrom: &from}}}
+	worker := New(store)
+	worker.now = func() time.Time { return time.Date(2026, time.August, 17, 8, 0, 0, 0, time.UTC) }
+	count, err := worker.RunOnce(context.Background())
+	if err != nil || count != 0 {
+		t.Fatalf("RunOnce() count = %d, error = %v; want skipped rule", count, err)
+	}
+	if store.findCalls != 0 {
+		t.Fatalf("candidate lookups = %d; want 0 for rule outside effective window", store.findCalls)
+	}
+}

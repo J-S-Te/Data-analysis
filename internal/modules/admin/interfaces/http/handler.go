@@ -22,6 +22,7 @@ type managementService interface {
 	ListAlertRules(context.Context, string) ([]domain.AlertRule, error)
 	ReplaceAlertRules(context.Context, string, string, []domain.AlertRule) ([]domain.AlertRule, error)
 	DeleteAlertRule(context.Context, string, string) error
+	PreviewAlertRule(context.Context, string, int, *string) (domain.AlertPreviewResult, error)
 }
 
 // TriggerAllSources 用途：将当前租户全部启用数据源一次性入队。
@@ -137,6 +138,42 @@ func (handler *Handler) ListAlertRules(c *gin.Context) {
 	response.OK(c, rules)
 }
 
+// PreviewAlertRule 返回合同到期规则当前命中数量和样例，不产生预警或审计写入。
+// 参数：c 为带租户范围的 HTTP 上下文。
+// 返回值：命中结果；非法范围或窗口返回 400，读取失败返回 500。
+func (handler *Handler) PreviewAlertRule(c *gin.Context) {
+	principal, ok := auth.FromContext(c.Request.Context())
+	if !ok {
+		response.Error(c, apperror.ErrUnauthenticated)
+		return
+	}
+	if !principal.HasPermission("alert.manage") {
+		response.Error(c, apperror.New(stdhttp.StatusForbidden, "FORBIDDEN", "没有预警规则管理权限"))
+		return
+	}
+	if !requireTenantScope(c, principal) {
+		return
+	}
+	var input struct {
+		Days      int     `json:"days"`
+		ScopeJSON *string `json:"scope_json"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.Error(c, apperror.New(stdhttp.StatusBadRequest, "RULE_PREVIEW_INVALID", "预览参数无效"))
+		return
+	}
+	result, err := handler.service.PreviewAlertRule(c.Request.Context(), principal.TenantID, input.Days, input.ScopeJSON)
+	if errors.Is(err, application.ErrRulePayloadInvalid) {
+		response.Error(c, apperror.New(stdhttp.StatusBadRequest, "RULE_PREVIEW_INVALID", "到期天数或适用范围无效"))
+		return
+	}
+	if err != nil {
+		response.Error(c, apperror.Wrap(err, stdhttp.StatusInternalServerError, "RULE_PREVIEW_FAILED", "读取命中预览失败"))
+		return
+	}
+	response.OK(c, result)
+}
+
 // PutAlertRules 用途：原子保存预警规则并检查版本；省略的规则不会被隐式删除。
 // 参数：c 为包含可信身份和规则请求的HTTP上下文。
 // 返回值：无；已保存但读取失败与真正保存失败使用不同回执。
@@ -196,12 +233,15 @@ type alertRuleRequest struct {
 	Severity      string  `json:"severity"`
 	Enabled       bool    `json:"enabled"`
 	ThresholdJSON *string `json:"threshold_json"`
+	ScopeJSON     *string `json:"scope_json"`
+	EffectiveFrom *string `json:"effective_from"`
+	EffectiveTo   *string `json:"effective_to"`
 }
 
 func alertRulesFromRequest(input []alertRuleRequest) []domain.AlertRule {
 	rules := make([]domain.AlertRule, 0, len(input))
 	for _, rule := range input {
-		rules = append(rules, domain.AlertRule{ID: rule.ID, Version: rule.Version, RuleCode: rule.RuleCode, Name: rule.Name, SourceFCT: rule.SourceFCT, Severity: rule.Severity, Enabled: rule.Enabled, ThresholdJSON: rule.ThresholdJSON})
+		rules = append(rules, domain.AlertRule{ID: rule.ID, Version: rule.Version, RuleCode: rule.RuleCode, Name: rule.Name, SourceFCT: rule.SourceFCT, Severity: rule.Severity, Enabled: rule.Enabled, ThresholdJSON: rule.ThresholdJSON, ScopeJSON: rule.ScopeJSON, EffectiveFrom: rule.EffectiveFrom, EffectiveTo: rule.EffectiveTo})
 	}
 	return rules
 }
