@@ -230,8 +230,16 @@ func (r *Runner) runScheduledSources(ctx context.Context, locker scheduledSyncLo
 				}
 			}()
 			slog.Info("aggregation sync start", "source", code)
-			r.mark(ctx, code, statusRunning, start, nil)
-			if err := r.runSource(ctx, code, dsn); err != nil {
+			sourceCtx := ctx
+			if isMetricSource(code) {
+				sourceCtx = context.WithValue(ctx, metricRoundStartKey{}, start)
+				if err := r.markMetricRound(sourceCtx, code, statusRunning, start, nil); err != nil {
+					return err
+				}
+			} else {
+				r.mark(ctx, code, statusRunning, start, nil)
+			}
+			if err := r.runSource(sourceCtx, code, dsn); err != nil {
 				// 审批投影失败不影响已成功的合同维表：通道保持 SUCCESS，
 				// 失败已写入 sync_source.contract_approval，错误仍计入当轮。
 				var approvalErr *ContractApprovalError
@@ -242,12 +250,18 @@ func (r *Runner) runScheduledSources(ctx context.Context, locker scheduledSyncLo
 					return err
 				}
 				msg := err.Error()
-				r.mark(ctx, code, statusFailed, start, &msg)
+				if isMetricSource(code) {
+					err = errors.Join(err, r.markMetricRound(ctx, code, statusFailed, start, err))
+				} else {
+					r.mark(ctx, code, statusFailed, start, &msg)
+				}
 				slog.Error("aggregation sync failed", "source", code, "error", err)
 				return fmt.Errorf("sync source %s: %w", code, err)
 			}
 			sourceOK[code] = true
-			r.mark(ctx, code, statusSuccess, start, nil)
+			if !isMetricSource(code) {
+				r.mark(ctx, code, statusSuccess, start, nil)
+			}
 			slog.Info("aggregation sync done", "source", code)
 			return nil
 		}()
@@ -330,6 +344,9 @@ func (r *Runner) RunQueued(ctx context.Context) error {
 func (r *Runner) runSource(ctx context.Context, code, dsn string) error {
 	if err := r.checkLicense(ctx); err != nil {
 		return err
+	}
+	if code == "contract_metrics" || code == "project_metrics" || code == "finance_metrics" {
+		return r.syncMetricFacts(ctx, code)
 	}
 	if code == "project_management" {
 		return r.syncProject(ctx, dsn)
@@ -792,6 +809,9 @@ func (r *Runner) configuredSources() map[string]string {
 		sources["project_management"] = r.sources["project_management"]
 	}
 	if r.ProjectAPI != nil {
+		for code := range r.metricSources() {
+			sources[code] = ""
+		}
 		if r.ProjectAPI.options.ContractInternalURL != "" {
 			sources["contract_dashboard"] = ""
 		}

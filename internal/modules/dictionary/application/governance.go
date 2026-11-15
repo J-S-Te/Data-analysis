@@ -103,6 +103,10 @@ func builtin(code string) (domain.Metric, bool) {
 	}
 	return domain.Metric{}, false
 }
+
+// builtinMetrics 派生内置资格并保留既有项目状态指标的默认启用行为。
+// 参数：无。
+// 返回值：发布目录副本；新增资格默认关闭，租户覆盖另行读取。
 func builtinMetrics() []domain.Metric {
 	out := append([]domain.Metric(nil), publishedMetrics...)
 	for i := range out {
@@ -111,36 +115,25 @@ func builtinMetrics() []domain.Metric {
 		out[i].Version = 1
 		out[i].Origin = "BUILTIN"
 		out[i] = derived(out[i])
-		out[i].Enabled = out[i].CanEnable
+		out[i].Enabled = out[i].CanEnable && out[i].Code == "2.1"
 	}
 	return out
 }
 
-// controlledBindings 声明已接入受控计算执行器的内置指标及其绑定身份。
-// 每项追加前必须同时具备：既有受控管道真实承担该指标计算（聚合/快照/事实表），
-// 且对应看板读取路径已存在。绑定串是治理层的身份声明，不参与运行时路由。
-var controlledBindings = map[string]string{
-	"2.1": "PROJECT_STATUS_COUNTS_V1",
-	"1.1": "CONTRACT_SIGNING_FACTS_V1",
-	"1.2": "CONTRACT_SIGNING_FACTS_V1",
-	"1.3": "CONTRACT_REGION_FACTS_V1",
-	"1.4": "CONTRACT_CONVERSION_FACTS_V1",
-	"3.1": "REPORT_CYCLE_SNAPSHOT_V1",
-	"4.1": "FINANCE_CURRENCY_TOTALS_V1",
-}
-
+// derived 根据受控身份与发布口径计算启用资格，忽略客户端伪造的派生字段。
+// 参数：m为内置或租户覆盖定义，包含其显式启用状态。
+// 返回值：服务端派生定义；未确认或口径漂移时清除身份并禁用。
 func derived(m domain.Metric) domain.Metric {
 	m.CalculationBinding = ""
 	m.CanEnable = false
 	m.EnableBlockReason = ""
-	// 已接入受控计算执行器的指标：内置来源、口径已确认且与发布版本逐字一致时，
-	// 绑定对应执行器身份；口径漂移即失绑（不得以偏离口径启用）。
 	if m.Origin == "BUILTIN" && m.Status == "已确认" {
 		if binding, ok := controlledBindings[m.Code]; ok {
-			for _, b := range publishedMetrics {
-				if b.Code == m.Code && sameCalculation(m, b) {
+			for _, published := range publishedMetrics {
+				if published.Code == m.Code && sameCalculation(m, published) {
 					m.CalculationBinding = binding
 					m.CanEnable = true
+					break
 				}
 			}
 		}
@@ -152,8 +145,9 @@ func derived(m domain.Metric) domain.Metric {
 	return m
 }
 
-// enableBlockReason 说明指标为何不能启用：口径未确认、口径偏离发布版本，
-// 或该指标尚未接入受控计算执行器。原因由服务端计算，前端只做展示映射。
+// enableBlockReason 解释未接入、未确认或口径漂移导致的启用阻断。
+// 参数：m为未获得启用资格的指标定义。
+// 返回值：供既有前端展示的稳定原因码。
 func enableBlockReason(m domain.Metric) string {
 	if m.Origin == "BUILTIN" {
 		if _, controlled := controlledBindings[m.Code]; controlled {

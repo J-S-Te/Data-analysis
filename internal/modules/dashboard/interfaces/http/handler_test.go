@@ -30,18 +30,30 @@ type advancedDashboardServiceStub struct {
 	regions domain.ContractRegionDistribution
 }
 
+// Contracts 返回空合同明细以满足区域测试的服务契约。
+// 参数：请求上下文、租户和分页参数仅用于接口匹配。
+// 返回值：空列表、零条目及空错误。
 func (stub advancedDashboardServiceStub) Contracts(context.Context, string, int, int) ([]domain.ContractDetail, int64, error) {
 	return nil, 0, nil
 }
 
+// Trend 返回空趋势以满足区域测试的服务契约。
+// 参数：请求上下文、租户和窗口月份仅用于接口匹配。
+// 返回值：空趋势及空错误。
 func (stub advancedDashboardServiceStub) Trend(context.Context, string, int) ([]domain.TrendPoint, error) {
 	return nil, nil
 }
 
+// ContractRegions 返回预设的区域分布以隔离 HTTP 适配层。
+// 参数：请求上下文和租户仅用于接口匹配。
+// 返回值：预设区域分布及空错误。
 func (stub advancedDashboardServiceStub) ContractRegions(context.Context, string) (domain.ContractRegionDistribution, error) {
 	return stub.regions, nil
 }
 
+// TestContractRegionsReturnsAvailabilityEnvelope 验证区域分布保留不可用原因。
+// 参数：t 为仅使用内存响应记录器的 HTTP 测试上下文。
+// 返回值：无；响应未保留空列表或可用性信封时失败。
 func TestContractRegionsReturnsAvailabilityEnvelope(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	request := httptest.NewRequest(stdhttp.MethodGet, "/dashboard/contract-regions", nil)

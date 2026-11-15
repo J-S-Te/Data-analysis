@@ -49,7 +49,12 @@ func Middleware(check Check) gin.HandlerFunc {
 		// 历史读取，嵌入授权签发本身也是 GET。
 		operation := MutateBusiness
 		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
-			for _, suffix := range []string{"/admin/standard-finance/status", "/alerts", "/alerts/summary", "/dictionary", "/dictionary/metrics/:code/versions", "/dashboard/contract", "/dashboard/project", "/dashboard/report", "/dashboard/finance", "/dashboard/contracts", "/dashboard/trend", "/admin/sources", "/alert-rules"} {
+			for _, suffix := range []string{
+				"/admin/standard-finance/status", "/alerts", "/alerts/summary", "/dictionary",
+				"/dictionary/metrics/:code/versions", "/dashboard/contract", "/dashboard/project",
+				"/dashboard/report", "/dashboard/finance", "/dashboard/contracts", "/dashboard/projects",
+				"/dashboard/metrics", "/dashboard/trend", "/admin/sources", "/alert-rules",
+			} {
 				if strings.HasSuffix(c.FullPath(), "/api/v1"+suffix) {
 					operation = ReadHistory
 					break

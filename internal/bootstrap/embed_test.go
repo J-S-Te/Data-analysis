@@ -33,8 +33,9 @@ func TestNativeModeSkipsBridgeInitialization(t *testing.T) {
 	}
 }
 
-// TestDashboardEmbedReadyRequiresCompleteConfig 固定能力降级边界：
-// 开关打开但缺少任一嵌入前提时，不得向浏览器宣告可嵌入。
+// TestDashboardEmbedReadyRequiresCompleteConfig 验证不完整配置的嵌入能力降级。
+// 参数：t 为仅使用隔离配置的测试上下文。
+// 返回值：无；缺少任一前提仍宣告嵌入可用时失败。
 func TestDashboardEmbedReadyRequiresCompleteConfig(t *testing.T) {
 	complete := Config{
 		DashboardEmbedEnabled:   true,

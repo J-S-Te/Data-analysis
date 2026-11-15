@@ -111,10 +111,9 @@ func (service *Service) Trend(ctx context.Context, tenantID string, months int) 
 	return points, nil
 }
 
-// ContractRegions 返回签约事实按客户区域×币种的聚合（字典指标 1.3 区域分布）。
-// 金额不跨币种合计：多币种租户按行返回，前端不做跨币种相加。
-// 参数：ctx 为请求上下文，tenantID 为租户。
-// 返回值：带可用性说明的区域聚合；仓储未配置时返回错误。
+// ContractRegions 返回按客户区域与原币种分别统计的签约事实。
+// 参数：ctx 为可信请求上下文，tenantID 为当前租户。
+// 返回值：带可用性说明的区域聚合；仓储未配置或读取失败时返回错误。
 func (service *Service) ContractRegions(ctx context.Context, tenantID string) (domain.ContractRegionDistribution, error) {
 	repository, ok := service.snapshots.(advancedRepository)
 	if !ok {

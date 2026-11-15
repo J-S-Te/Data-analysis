@@ -12,6 +12,7 @@ import (
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/importreport"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/integrationsync"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/metricfacts"
 	dashboardinfrastructure "github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard/infrastructure"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/oidc"
 )
@@ -57,6 +58,7 @@ type Config struct {
 	TrustedProxies []string
 
 	IntegrationSyncEnabled  bool
+	MetricFactsSyncEnabled  bool
 	DashboardEmbedEnabled   bool
 	FinanceSource           string
 	AuthorizationContextURL string
@@ -115,6 +117,10 @@ func LoadConfig() (Config, error) {
 		return Config{}, errors.New("invalid CENTRAL_SESSION_ENABLED")
 	}
 	integrationSyncEnabled, err := integrationsync.EnabledFromEnv(os.Getenv)
+	if err != nil {
+		return Config{}, err
+	}
+	metricFactsEnabled, err := metricfacts.EnabledFromEnv(os.Getenv)
 	if err != nil {
 		return Config{}, err
 	}
@@ -188,6 +194,7 @@ func LoadConfig() (Config, error) {
 		MetricsAccessToken:   strings.TrimSpace(os.Getenv("METRICS_ACCESS_TOKEN")),
 
 		IntegrationSyncEnabled:  integrationSyncEnabled,
+		MetricFactsSyncEnabled:  metricFactsEnabled,
 		DashboardEmbedEnabled:   embedEnabled,
 		FinanceSource:           financeSource,
 		AuthorizationContextURL: envOr("PLATFORM_AUTHORIZATION_CONTEXT_URL", "http://platform-api:8080/oauth2/authorization-context"),

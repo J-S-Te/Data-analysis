@@ -118,10 +118,9 @@ func (handler *Handler) Trend(c *gin.Context) {
 	response.OK(c, points)
 }
 
-// ContractRegions 返回签约事实按客户区域×币种的聚合（字典指标 1.3 区域分布）。
-// 金额不跨币种合计：多币种租户按行返回，前端不做跨币种相加。
-// 参数：c 为当前HTTP上下文。
-// 返回值：无；以可用性信封输出区域聚合，非全租户范围明确不可用。
+// ContractRegions 输出按客户区域与原币种分别统计的签约事实。
+// 参数：c 为包含可信租户身份的 HTTP 上下文。
+// 返回值：无；写入可用性信封，未认证或查询失败时输出明确错误。
 func (handler *Handler) ContractRegions(c *gin.Context) {
 	principal, ok := auth.FromContext(c.Request.Context())
 	if !ok {

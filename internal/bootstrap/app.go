@@ -15,6 +15,7 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/importreport"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/metricfacts"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/metrics"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/middleware"
 	adminapplication "github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin/application"
@@ -191,7 +192,7 @@ func New(config Config) (*App, error) {
 			auditStatus = "enabled"
 		}
 		// C14：能力维度快照；嵌入开关与财务来源是模式事实，不影响整体就绪。
-		// 开关打开但配置不完整时能力状态为 unconfigured，会话能力同步降级为原生模式。
+		// 配置不完整时会话能力降级为原生模式，避免可选嵌入反复返回错误。
 		embedState := "disabled"
 		if config.DashboardEmbedEnabled {
 			embedState = "unconfigured"
@@ -244,6 +245,7 @@ func New(config Config) (*App, error) {
 
 	mountDashboardEmbedRoutes(api, base, bridge, config, licenseCheck)
 	(&standardfacts.Handler{Store: &standardfacts.Store{DB: db, LicenseCheck: licenseCheck}, FinanceSource: config.FinanceSource}).Register(api)
+	(&metricfacts.Handler{Store: &metricfacts.Store{DB: db}, IntegrationEnabled: config.IntegrationSyncEnabled && config.MetricFactsSyncEnabled}).Register(api)
 
 	// 业务桩（聚合库表就绪后生效）
 	alertHandler := alertshttp.NewHandler(alertsapplication.NewService(alertsinfrastructure.NewGORMRepository(db)))
