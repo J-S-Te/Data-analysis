@@ -29,21 +29,22 @@ type SyncJob struct {
 
 // AlertRule 定义一个业务租户自己的预警规则。
 type AlertRule struct {
-	TenantID      string    `json:"-"`
-	ID            string    `json:"id"`
-	RuleCode      string    `json:"rule_code"`
-	Name          string    `json:"name"`
-	SourceFCT     string    `json:"source_fct"`
-	Severity      string    `json:"severity"`
-	Enabled       bool      `json:"enabled"`
-	ThresholdJSON *string   `json:"threshold_json"`
-	ScopeJSON     *string   `json:"scope_json"`
-	EffectiveFrom *string   `json:"effective_from"`
-	EffectiveTo   *string   `json:"effective_to"`
-	UpdatedBy     *string   `json:"updated_by"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
-	Version       int64     `json:"version"`
+	TenantID         string    `json:"-"`
+	ID               string    `json:"id"`
+	RuleCode         string    `json:"rule_code"`
+	Name             string    `json:"name"`
+	SourceFCT        string    `json:"source_fct"`
+	Severity         string    `json:"severity"`
+	Enabled          bool      `json:"enabled"`
+	ThresholdJSON    *string   `json:"threshold_json"`
+	ScopeJSON        *string   `json:"scope_json"`
+	NotificationJSON *string   `json:"notification_json"`
+	EffectiveFrom    *string   `json:"effective_from"`
+	EffectiveTo      *string   `json:"effective_to"`
+	UpdatedBy        *string   `json:"updated_by"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+	Version          int64     `json:"version"`
 }
 
 // AlertRuleScope 是合同到期规则的可选适用范围；零值表示不限制。
@@ -77,11 +78,29 @@ type AlertRuleExecution struct {
 	FinishedAt   *time.Time `json:"finished_at"`
 }
 
+// AlertRuleNotification 是规则的通知对象、静默和到期升级配置。
+type AlertRuleNotification struct {
+	Enabled                bool     `json:"enabled"`
+	Recipients             []string `json:"recipients"`
+	QuietStart             string   `json:"quiet_start"`
+	QuietEnd               string   `json:"quiet_end"`
+	EscalationAfterMinutes int      `json:"escalation_after_minutes"`
+	EscalationRecipients   []string `json:"escalation_recipients"`
+}
+
+// AlertRecipientOption 是通知对象选择器可用的人员。
+type AlertRecipientOption struct {
+	UserID      string `json:"user_id"`
+	DisplayName string `json:"display_name"`
+	OrgUnitName string `json:"org_unit_name"`
+}
+
 // AlertRuleScopeOptions 是规则范围选择器可用的聚合维度值。
 type AlertRuleScopeOptions struct {
-	OwnerOrgIDs   []string `json:"owner_org_ids"`
-	CustomerTypes []string `json:"customer_types"`
-	Currencies    []string `json:"currencies"`
+	OwnerOrgIDs   []string               `json:"owner_org_ids"`
+	CustomerTypes []string               `json:"customer_types"`
+	Currencies    []string               `json:"currencies"`
+	Users         []AlertRecipientOption `json:"users"`
 }
 
 // AlertPreviewResult 是规则命中预览结果。

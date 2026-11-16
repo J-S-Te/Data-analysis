@@ -14,14 +14,15 @@ import (
 )
 
 type gormRule struct {
-	ID            string  `gorm:"column:id"`
-	RuleCode      string  `gorm:"column:rule_code"`
-	Severity      string  `gorm:"column:severity"`
-	ThresholdJSON []byte  `gorm:"column:threshold_json"`
-	ScopeJSON     []byte  `gorm:"column:scope_json"`
-	EffectiveFrom *string `gorm:"column:effective_from"`
-	EffectiveTo   *string `gorm:"column:effective_to"`
-	UpdatedBy     *string `gorm:"column:updated_by"`
+	ID               string  `gorm:"column:id"`
+	RuleCode         string  `gorm:"column:rule_code"`
+	Severity         string  `gorm:"column:severity"`
+	ThresholdJSON    []byte  `gorm:"column:threshold_json"`
+	ScopeJSON        []byte  `gorm:"column:scope_json"`
+	EffectiveFrom    *string `gorm:"column:effective_from"`
+	EffectiveTo      *string `gorm:"column:effective_to"`
+	NotificationJSON []byte  `gorm:"column:notification_json"`
+	UpdatedBy        *string `gorm:"column:updated_by"`
 }
 
 // GormStore 使用版本化迁移创建的 alert_rule、alert_item 和 dim_contract 表。
@@ -42,7 +43,7 @@ func (s *GormStore) ListEnabledRules(ctx context.Context) ([]Rule, error) {
 	var rows []gormRule
 	if err := s.db.WithContext(ctx).
 		Table("alert_rule").
-		Select("id, rule_code, severity, threshold_json, scope_json, effective_from, effective_to, updated_by").
+		Select("id, rule_code, severity, threshold_json, scope_json, notification_json, effective_from, effective_to, updated_by").
 		Where("tenant_id = ? AND enabled = ?", s.tenantID, true).
 		Order("rule_code").
 		Find(&rows).Error; err != nil {
@@ -51,14 +52,15 @@ func (s *GormStore) ListEnabledRules(ctx context.Context) ([]Rule, error) {
 	rules := make([]Rule, 0, len(rows))
 	for _, row := range rows {
 		rules = append(rules, Rule{
-			ID:            row.ID,
-			Code:          row.RuleCode,
-			Severity:      row.Severity,
-			ThresholdJSON: row.ThresholdJSON,
-			ScopeJSON:     row.ScopeJSON,
-			EffectiveFrom: row.EffectiveFrom,
-			EffectiveTo:   row.EffectiveTo,
-			UpdatedBy:     derefString(row.UpdatedBy),
+			ID:               row.ID,
+			Code:             row.RuleCode,
+			Severity:         row.Severity,
+			ThresholdJSON:    row.ThresholdJSON,
+			ScopeJSON:        row.ScopeJSON,
+			EffectiveFrom:    row.EffectiveFrom,
+			EffectiveTo:      row.EffectiveTo,
+			NotificationJSON: row.NotificationJSON,
+			UpdatedBy:        derefString(row.UpdatedBy),
 		})
 	}
 	return rules, nil

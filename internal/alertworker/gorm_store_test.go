@@ -25,7 +25,7 @@ func ruleTestDB(t *testing.T) *gorm.DB {
 	}
 	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	if err := db.Exec(`CREATE TABLE alert_rule (id TEXT, tenant_id TEXT, rule_code TEXT, severity TEXT, threshold_json BLOB, scope_json BLOB, effective_from TEXT, effective_to TEXT, updated_by TEXT, enabled BOOLEAN)`).Error; err != nil {
+	if err := db.Exec(`CREATE TABLE alert_rule (id TEXT, tenant_id TEXT, rule_code TEXT, severity TEXT, threshold_json BLOB, scope_json BLOB, notification_json BLOB, effective_from TEXT, effective_to TEXT, updated_by TEXT, enabled BOOLEAN)`).Error; err != nil {
 		t.Fatal(err)
 	}
 	return db
@@ -40,10 +40,10 @@ func TestListEnabledRulesIsReadOnlyAndTenantScoped(t *testing.T) {
 			t.Fatalf("empty rules = %v, error = %v", rules, err)
 		}
 	}
-	if err := db.Exec(`INSERT INTO alert_rule (id, tenant_id, rule_code, severity, threshold_json, scope_json, effective_from, effective_to, updated_by, enabled) VALUES
-('rule-1', 'tenant-a', 'CONTRACT_EXPIRY', 'HIGH', '{"days":30}', NULL, NULL, NULL, 'user-1', 1),
-('rule-2', 'tenant-a', 'DISABLED', 'HIGH', '{"days":30}', NULL, NULL, NULL, NULL, 0),
-('rule-3', 'tenant-b', 'OTHER', 'HIGH', '{"days":30}', NULL, NULL, NULL, NULL, 1)`).Error; err != nil {
+	if err := db.Exec(`INSERT INTO alert_rule (id, tenant_id, rule_code, severity, threshold_json, scope_json, notification_json, effective_from, effective_to, updated_by, enabled) VALUES
+('rule-1', 'tenant-a', 'CONTRACT_EXPIRY', 'HIGH', '{"days":30}', NULL, NULL, NULL, NULL, 'user-1', 1),
+('rule-2', 'tenant-a', 'DISABLED', 'HIGH', '{"days":30}', NULL, NULL, NULL, NULL, NULL, 0),
+('rule-3', 'tenant-b', 'OTHER', 'HIGH', '{"days":30}', NULL, NULL, NULL, NULL, NULL, 1)`).Error; err != nil {
 		t.Fatal(err)
 	}
 	rules, err := store.ListEnabledRules(context.Background())

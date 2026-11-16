@@ -205,6 +205,9 @@ func (service *Service) ReplaceAlertRules(ctx context.Context, tenantID, actorID
 		if err := normalizeAlertRuleScope(&rule); err != nil {
 			return nil, ErrRulePayloadInvalid
 		}
+		if err := normalizeAlertRuleNotification(&rule); err != nil {
+			return nil, ErrRulePayloadInvalid
+		}
 		if rule.Version < 0 || (rule.ID == "" && rule.Version != 0) || (rule.ID != "" && (len(rule.ID) != 26 || rule.Version < 1)) {
 			return nil, ErrRulePayloadInvalid
 		}
@@ -308,6 +311,62 @@ func normalizeAlertRuleScope(rule *domain.AlertRule) error {
 	if rule.EffectiveFrom != nil && rule.EffectiveTo != nil && *rule.EffectiveFrom > *rule.EffectiveTo {
 		return ErrRulePayloadInvalid
 	}
+	return nil
+}
+
+// normalizeAlertRuleNotification 校验并规范化通知对象、静默时段和到期升级配置。
+func normalizeAlertRuleNotification(rule *domain.AlertRule) error {
+	if rule == nil {
+		return ErrRulePayloadInvalid
+	}
+	if rule.NotificationJSON == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(*rule.NotificationJSON)
+	if raw == "" || raw == "null" {
+		rule.NotificationJSON = nil
+		return nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var notification domain.AlertRuleNotification
+	if err := decoder.Decode(&notification); err != nil {
+		return ErrRulePayloadInvalid
+	}
+	notification.Recipients = normalizeStringList(notification.Recipients, 50, 64)
+	notification.EscalationRecipients = normalizeStringList(notification.EscalationRecipients, 50, 64)
+	notification.QuietStart = strings.TrimSpace(notification.QuietStart)
+	notification.QuietEnd = strings.TrimSpace(notification.QuietEnd)
+	if (notification.QuietStart == "") != (notification.QuietEnd == "") {
+		return ErrRulePayloadInvalid
+	}
+	for _, value := range []string{notification.QuietStart, notification.QuietEnd} {
+		if value == "" {
+			continue
+		}
+		if _, err := time.Parse("15:04", value); err != nil {
+			return ErrRulePayloadInvalid
+		}
+	}
+	if notification.EscalationAfterMinutes < 0 || notification.EscalationAfterMinutes > 10080 {
+		return ErrRulePayloadInvalid
+	}
+	if notification.EscalationAfterMinutes > 0 && len(notification.EscalationRecipients) == 0 {
+		return ErrRulePayloadInvalid
+	}
+	if notification.Enabled && len(notification.Recipients) == 0 {
+		return ErrRulePayloadInvalid
+	}
+	if !notification.Enabled && len(notification.Recipients) == 0 && notification.QuietStart == "" && notification.EscalationAfterMinutes == 0 {
+		rule.NotificationJSON = nil
+		return nil
+	}
+	encoded, err := json.Marshal(notification)
+	if err != nil {
+		return ErrRulePayloadInvalid
+	}
+	normalized := string(encoded)
+	rule.NotificationJSON = &normalized
 	return nil
 }
 
