@@ -3,8 +3,10 @@ package bootstrap
 import (
 	"context"
 	"errors"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/dbpool"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -30,6 +32,7 @@ import (
 	dictionaryapplication "github.com/unified-identity-auth-platform/data-analysis/internal/modules/dictionary/application"
 	dictionaryhttp "github.com/unified-identity-auth-platform/data-analysis/internal/modules/dictionary/interfaces/http"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/oidc"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/ownerdirectory"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/platformaudit"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/platformcatalog"
 	central "github.com/unified-identity-auth-platform/data-analysis/internal/sessiongovernance"
@@ -83,6 +86,9 @@ func New(config Config) (*App, error) {
 	}
 	db, err := gorm.Open(mysql.Open(config.MySQLDSN), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
+		return nil, err
+	}
+	if err := dbpool.Configure(db, "DA_API"); err != nil {
 		return nil, err
 	}
 	// 表结构由版本化 SQL 迁移创建（migrations/，compose 初始化时执行）；不使用运行时 AutoMigrate。
@@ -269,6 +275,7 @@ func New(config Config) (*App, error) {
 
 	adminService := adminapplication.NewService(admininfrastructure.NewGORMRepository(db))
 	adminService.SetBusinessLocation(dashboardLocation)
+	adminService.SetOwnerDirectory(ownerdirectory.New(os.Getenv))
 	adminHandler := adminhttp.NewHandler(adminService)
 	dashboardRepository := dashboardinfrastructure.NewGORMRepositoryWithApprovalSource(
 		db, dashboardLocation, config.DashboardApprovalSource,

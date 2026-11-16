@@ -123,6 +123,10 @@ func validateRow(row Row, source string) error {
 			return ErrInvalid
 		}
 	}
+	if (row.AutoConfirmedMinutes != 0 || row.AutoConfirmedCount != 0) &&
+		(row.Kind != "person_utilization" && row.Kind != "equipment_utilization") {
+		return ErrInvalid
+	}
 	if row.Period != "" && !ValidPeriod(row.Period) {
 		return ErrInvalid
 	}
@@ -225,7 +229,9 @@ func validateUtilization(row Row) error {
 	if row.Status != "CONFIRMED" || !ValidPeriod(row.Period) ||
 		!validInteger(row.ActualMinutes, false) || !validInteger(row.CapacityMinutes, false) ||
 		*row.ActualMinutes > *row.CapacityMinutes || !validInteger(row.PendingCount, false) ||
-		!validInteger(row.UnknownCount, false) {
+		!validInteger(row.UnknownCount, false) ||
+		row.AutoConfirmedMinutes < 0 || row.AutoConfirmedMinutes > *row.ActualMinutes ||
+		row.AutoConfirmedCount < 0 || row.AutoConfirmedCount > row.AutoConfirmedMinutes {
 		return ErrInvalid
 	}
 	return nil

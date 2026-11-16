@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/dbpool"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -69,8 +70,8 @@ func (r *Runner) checkLicense(ctx context.Context) error {
 }
 
 // NewRunner 使用聚合库 DSN、租户和源系统配置初始化 Runner。
-// aggDSN 为聚合数据库连接串；tenantID 是数据源配置的隔离边界；sources 映射 subsystem_code 到只读源 DSN；
-// 成功时返回可复用的 *Runner，建立连接失败时返回错误并终止后续同步。
+// 参数：aggDSN 为聚合库连接；tenantID 为隔离边界；sources 映射来源到只读连接。
+// 返回值：可复用的Runner；连接或独立连接池预算无效时返回错误。
 func NewRunner(aggDSN, tenantID string, sources map[string]string) (*Runner, error) {
 	if tenantID == "" {
 		return nil, errors.New("OIDC_TENANT_ID is required for aggregation source isolation")
@@ -85,6 +86,9 @@ func NewRunner(aggDSN, tenantID string, sources map[string]string) (*Runner, err
 	dsnConfig.Loc = time.UTC
 	db, err := gorm.Open(mysql.Open(dsnConfig.FormatDSN()), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
+		return nil, err
+	}
+	if err := dbpool.Configure(db, "DA_AGGREGATION_RUNNER"); err != nil {
 		return nil, err
 	}
 	return &Runner{aggDB: db, tenantID: tenantID, sources: sources}, nil
@@ -576,7 +580,7 @@ func (r *Runner) syncContractSnapshot(ctx context.Context, src *gorm.DB, run str
 					if err := r.checkLicense(ctx); err != nil {
 						return err
 					}
-					if err := r.execAggregation(ctx, dimContractUpsert,
+					if err := r.stageDimensionWrite(ctx, run, "dim_contract", dimContractUpsert,
 						row.OriginKind, tenant, row.ID, row.ContractNumber, row.Title, row.ContractType, row.ServiceType, row.Status,
 						row.StartDate, row.EndDate, crmID, row.OpportunityID, row.AmountMinor, row.Currency,
 						row.OwnerUserID, org, identity, project, row.UpdatedAt); err != nil {
@@ -650,7 +654,7 @@ func (r *Runner) syncCRMSnapshot(ctx context.Context, src *gorm.DB, run string) 
 					if err := r.checkLicense(ctx); err != nil {
 						return err
 					}
-					if err := r.execAggregation(ctx, dimCustomerUpsert,
+					if err := r.stageDimensionWrite(ctx, run, "dim_customer", dimCustomerUpsert,
 						row.TenantID, row.ID, row.CustomerNo, row.Name, row.CustomerType, row.Industry, row.Region,
 						row.Status, row.OwnerUserID, row.OwnerOrgID, row.DeletedAt, row.UpdatedAt); err != nil {
 						return err
@@ -703,7 +707,7 @@ func (r *Runner) syncCRMSnapshot(ctx context.Context, src *gorm.DB, run string) 
 					if err := r.checkLicense(ctx); err != nil {
 						return err
 					}
-					if err := r.execAggregation(ctx, dimOpportunityUpsert,
+					if err := r.stageDimensionWrite(ctx, run, "dim_opportunity", dimOpportunityUpsert,
 						row.TenantID, row.ID, row.OpportunityNo, row.Name, row.CustomerID, row.Type, row.Source,
 						row.ExpectedAmount, row.ExpectedSignDate, row.OwnerUserID, row.OwnerOrgID, row.CurrentStage,
 						row.OppStatus, row.ContractRef, row.ContractID, row.CreatedAt, row.LostReason, row.StageChangedAt, row.DeletedAt, row.UpdatedAt); err != nil {

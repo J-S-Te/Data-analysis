@@ -27,10 +27,16 @@
 - `internal/aggregation/`：四类只读源/两类机器 API、有效状态签约事实、独立商机转化事实及带租约队列。
 - `docs/sync-job-lease-recovery.md`：旧无租约同步任务的受控恢复，禁止运行时猜测过期或直接改库重置。
 - `internal/embedbridge/`：Metabase 嵌入 token 与代理。
-- `migrations/`：版本化聚合库 Schema，当前至 000020（预警归属范围）；运行时禁止 AutoMigrate。
+- `migrations/`：版本化聚合库 Schema，本地源码当前至 000042（指标分块完整代次；部署状态另查发布记录）；运行时禁止 AutoMigrate。
 
 合同/项目 freshness 分列源更新、成功同步与查询计算时间；失败/停用/未知/运行中/待首次或超过48小时标陈旧。全租户持久快照保留 snapshot_at 与 SNAPSHOT 语义，按写入时间超过48小时标陈旧；缺失、非法或未来写入时间也标陈旧，无快照行仍不可用；dim_project 无写入方，组织/团队项目摘要不能借报告水位当最新。合同签约事实默认 active/in_progress/pending_pay/completed，按 start_date 月和币种归集；转化要求有效商机已签约且有关联有效合同，组织/团队漏斗未开放。经营事实新增链路已实现折扣、完整首轮终决通过率、退回决定原因、资源实际/容量及净确认收入/成本；读取入口为internal/metricfacts与GET /dashboard/metrics。字典3.2按首轮终决、3.3按决定次数、4.1按当前累计、4.6/4.7按不含税净成本，与旧模板差异见指标字典2026-11-12说明；投诉暂缓。交付/项目周期、返工率、完整账龄、开票未回款TOP10及部门/个人产值仍缺完整字典计算出口。
 
 ## 验证方式
 
 后端在本目录执行 `GOCACHE=/tmp/data-analysis-deep-go-cache go test ./...`、`go vet ./...`；统一前端在 `frontend` 执行 `npm test` 和 `npm run build`。
+
+## 2026-11-12 本地平台评审修复（未提交/部署）
+
+合同/CRM维表内容先写dimension_sync_key.payload，完整扫描成功后与删除对账在同事务发布（000041）；失败保留当前完整维表。经营事实优先使用同源/stream分块协议（000042），只有404/405回退旧JSON。逐块许可/租约保护，完整计数/SHA256/EOF后才原子切换代次与SUCCESS；按可信组织/人员和月份执行SQL汇总，旧JSON在释放读事务后计算。连接池按API、聚合API、聚合Runner、告警四角色设置有限默认并支持配置，原部署拓扑未改。详见docs/metric-facts.md和本轮主工程任务记录。
+
+流式指标旧载荷以rows:null对旧v1失败关闭，当前读者仅从已发布generation元数据/事实汇总。镜像epoch1配套平台换代排空和跨代回滚保护；目录短时不可用保留原人员ID，查询补名总预算3秒。发布状态另查主工程任务记录。

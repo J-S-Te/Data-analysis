@@ -6,6 +6,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/dbpool"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -62,6 +63,10 @@ func main() {
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
 		logger.Error("open dashboard database failed", "error", err)
+		os.Exit(1)
+	}
+	if err := dbpool.Configure(db, "DA_ALERT"); err != nil {
+		logger.Error("database connection budget invalid", "error", err)
 		os.Exit(1)
 	}
 	tenantID := os.Getenv("OIDC_TENANT_ID")

@@ -24,6 +24,10 @@ func TestMetricFactsMySQLSourceFailurePreservesPublication(t *testing.T) {
 	}
 	metricStatus := http.StatusOK
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/internal/v1/dashboard/metrics/stream" {
+			http.NotFound(w, req)
+			return
+		}
 		if req.Header.Get("Authorization") != "Bearer synthetic-metrics-token" || req.Header.Get("X-DA-Tenant-ID") != tenant {
 			t.Error("missing fixture machine identity")
 		}

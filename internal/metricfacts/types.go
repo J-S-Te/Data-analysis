@@ -16,31 +16,33 @@ type Bundle struct {
 
 // Row 保留统计必须的最小维度，不含原始凭证、银行账号或联系方式。
 type Row struct {
-	Kind             string `json:"kind"`
-	RecordID         string `json:"record_id"`
-	SubjectID        string `json:"subject_id,omitempty"`
-	OrganizationID   string `json:"organization_id"`
-	IdentityID       string `json:"identity_id"`
-	ProjectID        string `json:"project_id"`
-	OrganizationName string `json:"organization_name,omitempty"`
-	IdentityName     string `json:"identity_name,omitempty"`
-	ProjectName      string `json:"project_name,omitempty"`
-	ResourceID       string `json:"resource_id,omitempty"`
-	Period           string `json:"period"`
-	Status           string `json:"status"`
-	Currency         string `json:"currency,omitempty"`
-	AmountMinor      *int64 `json:"amount_minor,omitempty"`
-	StandardMinor    *int64 `json:"standard_minor,omitempty"`
-	TaxMinor         *int64 `json:"tax_minor,omitempty"`
-	Bucket           string `json:"bucket,omitempty"`
-	UnknownReason    string `json:"unknown_reason,omitempty"`
-	FirstDecidedAt   string `json:"first_decided_at,omitempty"`
-	ReasonCode       string `json:"reason_code,omitempty"`
-	ActualMinutes    *int64 `json:"actual_minutes,omitempty"`
-	CapacityMinutes  *int64 `json:"capacity_minutes,omitempty"`
-	PendingCount     *int64 `json:"pending_count,omitempty"`
-	UnknownCount     *int64 `json:"unknown_count,omitempty"`
-	CostCategory     string `json:"cost_category,omitempty"`
+	AutoConfirmedMinutes int64  `json:"auto_confirmed_minutes,omitempty"`
+	AutoConfirmedCount   int64  `json:"auto_confirmed_count,omitempty"`
+	Kind                 string `json:"kind"`
+	RecordID             string `json:"record_id"`
+	SubjectID            string `json:"subject_id,omitempty"`
+	OrganizationID       string `json:"organization_id"`
+	IdentityID           string `json:"identity_id"`
+	ProjectID            string `json:"project_id"`
+	OrganizationName     string `json:"organization_name,omitempty"`
+	IdentityName         string `json:"identity_name,omitempty"`
+	ProjectName          string `json:"project_name,omitempty"`
+	ResourceID           string `json:"resource_id,omitempty"`
+	Period               string `json:"period"`
+	Status               string `json:"status"`
+	Currency             string `json:"currency,omitempty"`
+	AmountMinor          *int64 `json:"amount_minor,omitempty"`
+	StandardMinor        *int64 `json:"standard_minor,omitempty"`
+	TaxMinor             *int64 `json:"tax_minor,omitempty"`
+	Bucket               string `json:"bucket,omitempty"`
+	UnknownReason        string `json:"unknown_reason,omitempty"`
+	FirstDecidedAt       string `json:"first_decided_at,omitempty"`
+	ReasonCode           string `json:"reason_code,omitempty"`
+	ActualMinutes        *int64 `json:"actual_minutes,omitempty"`
+	CapacityMinutes      *int64 `json:"capacity_minutes,omitempty"`
+	PendingCount         *int64 `json:"pending_count,omitempty"`
+	UnknownCount         *int64 `json:"unknown_count,omitempty"`
+	CostCategory         string `json:"cost_category,omitempty"`
 }
 
 // Scope 只能由已验签且已在线复核的主体构造，不接收浏览器声明。
@@ -53,11 +55,13 @@ type Scope struct {
 
 // Utilization 表示已确认项目实施分钟与显式容量，零分母为null。
 type Utilization struct {
-	ActualMinutes   int64    `json:"actual_minutes"`
-	CapacityMinutes int64    `json:"capacity_minutes"`
-	Rate            *float64 `json:"rate"`
-	Pending         int64    `json:"pending"`
-	Unknown         int64    `json:"unknown"`
+	AutoConfirmedMinutes int64    `json:"auto_confirmed_minutes"`
+	AutoConfirmedCount   int64    `json:"auto_confirmed_count"`
+	ActualMinutes        int64    `json:"actual_minutes"`
+	CapacityMinutes      int64    `json:"capacity_minutes"`
+	Rate                 *float64 `json:"rate"`
+	Pending              int64    `json:"pending"`
+	Unknown              int64    `json:"unknown"`
 }
 
 // CurrencyTotal 按币种区分确认、税额与现金流，允许当期冲回净额为负。
