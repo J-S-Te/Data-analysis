@@ -33,7 +33,7 @@ RUN set -eu; \
 
 FROM alpine:3.21@sha256:bbfcd601d7cd20d35bb0b8b866ad1a8a0d107ca3e1c20870c75c5ce2c1186d30 AS runtime-base
 ARG APP_VERSION
-LABEL org.opencontainers.image.version=${APP_VERSION} com.basic-platform.license.protocol="1"
+LABEL org.opencontainers.image.version=${APP_VERSION} com.basic-platform.license.protocol="1" com.basic-platform.runtime.epoch="1"
 
 RUN apk add --no-cache ca-certificates tzdata wget && mkdir -p /var/lib/commercial-license
 

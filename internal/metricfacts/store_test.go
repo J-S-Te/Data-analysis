@@ -25,7 +25,7 @@ func metricStoreFixture(t *testing.T) *gorm.DB {
 		t.Fatal(err)
 	}
 	for _, sql := range []string{
-		`CREATE TABLE dashboard_metric_snapshot(tenant_id TEXT,source_code TEXT,source_snapshot_at DATETIME,collected_at DATETIME,payload_json TEXT,PRIMARY KEY(tenant_id,source_code))`,
+		`CREATE TABLE dashboard_metric_snapshot(tenant_id TEXT,source_code TEXT,source_snapshot_at DATETIME,collected_at DATETIME,payload_json TEXT,generation_id TEXT NOT NULL DEFAULT '',PRIMARY KEY(tenant_id,source_code))`,
 		`CREATE TABLE sync_source(tenant_id TEXT,subsystem_code TEXT,enabled BOOLEAN,last_status TEXT,last_success_at DATETIME)`,
 	} {
 		if err := db.Exec(sql).Error; err != nil {

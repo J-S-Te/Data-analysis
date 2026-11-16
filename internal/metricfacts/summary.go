@@ -128,11 +128,7 @@ func Summarize(bundle Bundle, section, period string, scope Scope) (Summary, err
 		period != "" && !ValidPeriod(period) {
 		return Summary{}, ErrInvalid
 	}
-	out := Summary{Available: true, Section: section, Period: period,
-		Basis: bundle.Basis, SourceCode: bundle.SourceCode, SnapshotAt: bundle.SnapshotAt,
-		SourceUpdatedAt: bundle.SourceUpdatedAt, CollectionStart: bundle.CollectionStartedAt,
-		DiscountBuckets: map[string]int64{}, ReturnReasons: map[string]int64{},
-		Currencies: []CurrencyTotal{}, Costs: []CostDimension{}}
+	out := emptySummary(bundle, section, period)
 	currencies := map[string]*CurrencyTotal{}
 	dimensions := map[string]*CostDimension{}
 	returned := map[string]bool{}
@@ -237,6 +233,8 @@ func appendUtilization(out *Utilization, row Row) error {
 	}{
 		{&out.ActualMinutes, row.ActualMinutes}, {&out.CapacityMinutes, row.CapacityMinutes},
 		{&out.Pending, row.PendingCount}, {&out.Unknown, row.UnknownCount},
+		{&out.AutoConfirmedMinutes, &row.AutoConfirmedMinutes},
+		{&out.AutoConfirmedCount, &row.AutoConfirmedCount},
 	} {
 		if item.value == nil {
 			return ErrInvalid

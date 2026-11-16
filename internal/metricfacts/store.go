@@ -18,6 +18,7 @@ type SnapshotRow struct {
 	SourceSnapshotAt time.Time `gorm:"precision:3"`
 	CollectedAt      time.Time `gorm:"precision:3"`
 	PayloadJSON      string    `gorm:"type:json"`
+	GenerationID     string    `gorm:"size:32;not null;default:''"`
 }
 
 // TableName 指向版本化迁移建立的独立指标快照表。
@@ -71,7 +72,7 @@ func Save(tx *gorm.DB, bundle Bundle, now time.Time) error {
 	}
 	return tx.Model(&SnapshotRow{}).Where("tenant_id=? AND source_code=?", row.TenantID, row.SourceCode).
 		Updates(map[string]any{"source_snapshot_at": row.SourceSnapshotAt,
-			"collected_at": row.CollectedAt, "payload_json": row.PayloadJSON}).Error
+			"collected_at": row.CollectedAt, "payload_json": row.PayloadJSON, "generation_id": ""}).Error
 }
 
 // Store 只读取数析自有指标表，不跨系统查询业务数据库。
@@ -101,30 +102,52 @@ func (s *Store) Read(ctx context.Context, tenant, section, period string, scope 
 		return Summary{}, err
 	}
 	var result Summary
+	var row SnapshotRow
+	var legacy bool
+	now := s.now()
 	err := s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var row SnapshotRow
 		err := tx.Where("tenant_id=? AND source_code=?", tenant, SourceFor(section)).Take(&row).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			result = Summary{Available: false, Section: section, Period: period,
-				SourceCode: SourceFor(section), Stale: true, StaleReason: "指标来源尚未完整发布"}
+			result = Summary{Available: false, Section: section, Period: period, SourceCode: SourceFor(section), Stale: true, StaleReason: "指标来源尚未完整发布"}
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		var bundle Bundle
-		if len(row.PayloadJSON) > MaxBytes || json.Unmarshal([]byte(row.PayloadJSON), &bundle) != nil {
-			return ErrInvalid
+		if row.GenerationID == "" {
+			legacy = true
+			return attachFreshness(tx, tenant, row, &result, now)
 		}
-		if err := Validate(bundle, tenant, row.SourceCode, s.now()); err != nil {
+		var generation GenerationRow
+		if err := tx.Select("id,state,row_count,metadata_json").Where("id=? AND tenant_id=? AND source_code=?", row.GenerationID, tenant, row.SourceCode).
+			Take(&generation).Error; err != nil {
 			return err
 		}
-		result, err = Summarize(bundle, section, period, scope)
+		if generation.State != "PUBLISHED" || generation.RowCount < 0 || generation.RowCount > MaxInteger {
+			return ErrInvalid
+		}
+		var metadata Bundle
+		if len(generation.MetadataJSON) > MaxBytes || strictJSON([]byte(generation.MetadataJSON), &metadata) != nil || len(metadata.Rows) != 0 ||
+			Validate(metadata, tenant, row.SourceCode, now) != nil {
+			return ErrInvalid
+		}
+		result, err = generationSummary(tx, row, metadata, section, period, scope)
 		if err != nil {
 			return err
 		}
-		return attachFreshness(tx, tenant, row, &result, s.now())
+		return attachFreshness(tx, tenant, row, &result, now)
 	}, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
+	if err != nil || !legacy {
+		return result, err
+	}
+	// 旧协议兼容路径在释放数据库事务后解析；不持有连接做整包校验和 CPU 汇总。
+	var bundle Bundle
+	if len(row.PayloadJSON) > MaxBytes || strictJSON([]byte(row.PayloadJSON), &bundle) != nil || Validate(bundle, tenant, row.SourceCode, now) != nil {
+		return Summary{}, ErrInvalid
+	}
+	stale, reason := result.Stale, result.StaleReason
+	result, err = Summarize(bundle, section, period, scope)
+	result.Stale, result.StaleReason = stale, reason
 	return result, err
 }
 

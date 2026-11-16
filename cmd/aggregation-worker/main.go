@@ -6,6 +6,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/dbpool"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -124,6 +125,10 @@ func main() {
 	aggDB, err := gorm.Open(mysql.Open(aggDSN), &gorm.Config{DisableAutomaticPing: true})
 	if err != nil {
 		logger.Error("aggregation db failed", "error", err)
+		os.Exit(1)
+	}
+	if err := dbpool.Configure(aggDB, "DA_AGGREGATION"); err != nil {
+		logger.Error("database connection budget invalid", "error", err)
 		os.Exit(1)
 	}
 	var apiSync *aggregation.APISyncRunner

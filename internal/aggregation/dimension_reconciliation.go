@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -22,6 +24,7 @@ type dimensionSyncKey struct {
 	SourceKey string `gorm:"uniqueIndex:uk_dimension_sync_key,priority:4"`
 	ParentKey string `gorm:"uniqueIndex:uk_dimension_sync_key,priority:5"`
 	CreatedAt time.Time
+	Payload   []byte `gorm:"type:json"`
 }
 
 // TableName 返回完整快照主键暂存表名。
@@ -156,10 +159,13 @@ func (r *Runner) runDimensionSnapshot(
 		}
 		return r.checkLicense(ctx)
 	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
-	if err != nil {
-		return err
+	if err == nil {
+		err = r.reconcileDimensions(ctx, source, run)
 	}
-	return r.reconcileDimensions(ctx, source, run)
+	if err != nil {
+		return errors.Join(err, r.cleanupDimensionRun(ctx, run))
+	}
+	return nil
 }
 
 // reconcileDimensions 原子删除完整成功快照中已不存在的本租户维表行。
@@ -175,6 +181,9 @@ func (r *Runner) reconcileDimensions(ctx context.Context, source, run string) er
 	}
 	return r.aggregationWrite(ctx, func(tx *gorm.DB) error {
 		for _, table := range tables {
+			if err := publishDimensionStage(tx, r.tenantID, run, table); err != nil {
+				return err
+			}
 			predicate, err := dimensionKeyPredicate(table)
 			if err != nil {
 				return err
@@ -189,4 +198,174 @@ func (r *Runner) reconcileDimensions(ctx context.Context, source, run string) er
 		return tx.Where("tenant_id = ? AND run_id = ? AND dimension IN ?", r.tenantID, run, tables).
 			Delete(&dimensionSyncKey{}).Error
 	})
+}
+
+// dimensionArgument 保留暂存参数的时间和整数类型，避免JSON浮点精度损失。
+type dimensionArgument struct {
+	Type  string
+	Value json.RawMessage
+}
+
+// stageDimensionWrite 将完整行暂存到独立轮次，不修改当前维表。
+// 参数：ctx/run 为许可上下文及轮次，table/query 为固定维表与SQL，args 为本行值。
+// 返回值：非法SQL、参数或暂存失败返回错误，当前代次始终不变。
+func (r *Runner) stageDimensionWrite(ctx context.Context, run, table, query string, args ...any) error {
+	if dimensionUpsert(table) != query || query == "" || run == "" {
+		return errors.New("invalid dimension stage")
+	}
+	if err := validateDimensionArguments(r.tenantID, table, args); err != nil {
+		return err
+	}
+	values := make([]dimensionArgument, len(args))
+	for i, value := range args {
+		if value != nil {
+			v := reflect.ValueOf(value)
+			if v.Kind() == reflect.Ptr {
+				if v.IsNil() {
+					value = nil
+				} else {
+					value = v.Elem().Interface()
+				}
+			}
+		}
+		kind := "value"
+		if _, ok := value.(time.Time); ok {
+			kind = "time"
+		}
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		values[i] = dimensionArgument{kind, raw}
+	}
+	payload, err := json.Marshal(values)
+	if err != nil {
+		return err
+	}
+	if len(payload) > 1<<20 {
+		return errors.New("dimension row exceeds staging bound")
+	}
+	token := make([]byte, 16)
+	if _, err := rand.Read(token); err != nil {
+		return err
+	}
+	row := dimensionSyncKey{TenantID: r.tenantID, RunID: run, Dimension: table,
+		SourceKey: "stage:" + hex.EncodeToString(token), ParentKey: "stage", CreatedAt: time.Now().UTC(), Payload: payload}
+	return r.aggregationWrite(ctx, func(tx *gorm.DB) error { return tx.Create(&row).Error })
+}
+
+// dimensionUpsert 仅允许当前维表对应的固定写入SQL。
+// 参数：table 为受控维表名。
+// 返回值：固定SQL；非暂存来源返回空串。
+func dimensionUpsert(table string) string {
+	switch table {
+	case "dim_contract":
+		return dimContractUpsert
+	case "dim_customer":
+		return dimCustomerUpsert
+	case "dim_opportunity":
+		return dimOpportunityUpsert
+	}
+	return ""
+}
+
+// publishDimensionStage 在发布事务内逐批回放完整快照的暂存行。
+// 参数：tx 为受许可/租约围栏保护的事务，tenant/run/table 为可信轮次边界。
+// 返回值：任何行读取、解码或合并失败均回滚整次发布。
+func publishDimensionStage(tx *gorm.DB, tenant, run, table string) error {
+	if dimensionUpsert(table) == "" {
+		return nil
+	}
+	var cursor uint64
+	for {
+		var rows []dimensionSyncKey
+		err := tx.Where("tenant_id=? AND run_id=? AND dimension=? AND parent_key='stage' AND id>?", tenant, run, table, cursor).Order("id").Limit(sourceReadBatchSize).Find(&rows).Error
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		for _, row := range rows {
+			var values []dimensionArgument
+			if json.Unmarshal(row.Payload, &values) != nil {
+				return errors.New("invalid staged dimension row")
+			}
+			args := make([]any, len(values))
+			for i, value := range values {
+				if value.Type == "time" {
+					var at time.Time
+					if err := json.Unmarshal(value.Value, &at); err != nil {
+						return err
+					}
+					args[i] = at
+				} else {
+					var v any
+					decoder := json.NewDecoder(strings.NewReader(string(value.Value)))
+					decoder.UseNumber()
+					if err := decoder.Decode(&v); err != nil {
+						return err
+					}
+					if n, ok := v.(json.Number); ok {
+						v = n.String()
+					}
+					args[i] = v
+				}
+			}
+			if err := validateDimensionArguments(tenant, table, args); err != nil {
+				return err
+			}
+			if err := tx.Exec(dimensionUpsert(table), args...).Error; err != nil {
+				return err
+			}
+			cursor = row.ID
+		}
+	}
+}
+
+// validateDimensionArguments 校验暂存及发布参数形状与可信租户，拒绝跨租户回放。
+// 参数：tenant/table 为本轮可信目标，args 为完整维表参数。
+// 返回值：参数数目或租户不符时错误。
+func validateDimensionArguments(tenant, table string, args []any) error {
+	count, index := 0, 0
+	switch table {
+	case "dim_contract":
+		count, index = 19, 1
+	case "dim_customer":
+		count = 12
+	case "dim_opportunity":
+		count = 20
+	default:
+		return errors.New("invalid dimension table")
+	}
+	if tenant == "" || len(args) != count || args[index] != tenant {
+		return errors.New("invalid dimension arguments or tenant")
+	}
+	return nil
+}
+
+// cleanupDimensionRun 在仍持有许可和租约时分批清理本轮失败暂存。
+// 参数：ctx 为原轮次上下文，run 为已生成的唯一令牌。
+// 返回值：清理或围栏失败返回错误；失去权限的残留由后续有界过期回收处理。
+func (r *Runner) cleanupDimensionRun(ctx context.Context, run string) error {
+	for {
+		removed := 0
+		err := r.aggregationWrite(ctx, func(tx *gorm.DB) error {
+			var ids []uint64
+			if err := tx.Model(&dimensionSyncKey{}).Where("tenant_id=? AND run_id=?", r.tenantID, run).Order("id").Limit(sourceReadBatchSize).Pluck("id", &ids).Error; err != nil {
+				return err
+			}
+			removed = len(ids)
+			if removed == 0 {
+				return nil
+			}
+			return tx.Where("tenant_id=? AND run_id=? AND id IN ?", r.tenantID, run, ids).Delete(&dimensionSyncKey{}).Error
+		})
+		if err != nil {
+			return err
+		}
+		if removed < sourceReadBatchSize {
+			return nil
+		}
+	}
 }

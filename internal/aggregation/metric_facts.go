@@ -103,11 +103,12 @@ func (r *Runner) syncMetricFacts(ctx context.Context, code string) error {
 	if !ok {
 		return errors.New("metric facts source is disabled or unconfigured")
 	}
-	bundle, err := r.ProjectAPI.readMetricSnapshot(ctx, source.base, source.credential, source.source)
+	staged, legacy, err := r.ProjectAPI.stageMetricSnapshot(ctx, source.base, source.credential, source.source,
+		func(action func(*gorm.DB) error) error { return r.aggregationWrite(ctx, action) })
 	if err != nil {
 		return err
 	}
-	return r.aggregationWrite(ctx, func(tx *gorm.DB) error {
+	publishErr := r.aggregationWrite(ctx, func(tx *gorm.DB) error {
 		now := time.Now().UTC()
 		roundStart := started
 		if value, ok := ctx.Value(metricRoundStartKey{}).(time.Time); ok {
@@ -120,11 +121,20 @@ func (r *Runner) syncMetricFacts(ctx context.Context, code string) error {
 		if job.StartedAt != nil {
 			roundStart = *job.StartedAt
 		}
-		if err := metricfacts.Save(tx, bundle, now); err != nil {
+		if legacy != nil {
+			if err := metricfacts.Save(tx, *legacy, now); err != nil {
+				return err
+			}
+		} else if err := metricfacts.Publish(tx, staged, now); err != nil {
 			return err
 		}
 		return r.markMetricSource(tx, code, statusSuccess, roundStart, now, nil)
 	})
+	if publishErr != nil && staged != nil {
+		discardErr := r.aggregationWrite(ctx, func(tx *gorm.DB) error { return metricfacts.Discard(tx, staged) })
+		return errors.Join(publishErr, discardErr)
+	}
+	return publishErr
 }
 
 // isMetricSource 限定需要原子发布水位的三个新增来源。

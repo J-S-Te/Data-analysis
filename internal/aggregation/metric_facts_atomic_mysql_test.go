@@ -33,6 +33,10 @@ func metricAtomicFixture(t *testing.T, suffix string) (*Runner, func()) {
 	})
 	bundle := metricfacts.Bundle{SchemaVersion: 1, TenantID: tenant, SourceCode: "contract_management", SnapshotAt: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano), Complete: true, Basis: "atomic A", Rows: []metricfacts.Row{}}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/internal/v1/dashboard/metrics/stream" {
+			http.NotFound(w, req)
+			return
+		}
 		if req.URL.Path == "/internal/v1/dashboard/metrics" {
 			_ = json.NewEncoder(w).Encode(map[string]any{"code": "OK", "data": bundle})
 			return
