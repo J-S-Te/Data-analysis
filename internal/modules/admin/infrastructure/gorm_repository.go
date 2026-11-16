@@ -63,35 +63,36 @@ type syncJobRecord struct {
 func (syncJobRecord) TableName() string { return "sync_job" }
 
 type alertRuleRecord struct {
-	Version       int64     `gorm:"column:version;->"`
-	TenantID      string    `gorm:"column:tenant_id"`
-	ID            string    `gorm:"column:id;primaryKey"`
-	RuleCode      string    `gorm:"column:rule_code"`
-	Name          string    `gorm:"column:name"`
-	SourceFCT     string    `gorm:"column:source_fct"`
-	Severity      string    `gorm:"column:severity"`
-	Enabled       bool      `gorm:"column:enabled"`
-	ThresholdJSON *string   `gorm:"column:threshold_json"`
-	ScopeJSON     *string   `gorm:"column:scope_json"`
-	EffectiveFrom *string   `gorm:"column:effective_from"`
-	EffectiveTo   *string   `gorm:"column:effective_to"`
-	UpdatedBy     *string   `gorm:"column:updated_by"`
-	CreatedAt     time.Time `gorm:"column:created_at"`
-	UpdatedAt     time.Time `gorm:"column:updated_at"`
+	Version          int64     `gorm:"column:version;->"`
+	TenantID         string    `gorm:"column:tenant_id"`
+	ID               string    `gorm:"column:id;primaryKey"`
+	RuleCode         string    `gorm:"column:rule_code"`
+	Name             string    `gorm:"column:name"`
+	SourceFCT        string    `gorm:"column:source_fct"`
+	Severity         string    `gorm:"column:severity"`
+	Enabled          bool      `gorm:"column:enabled"`
+	ThresholdJSON    *string   `gorm:"column:threshold_json"`
+	ScopeJSON        *string   `gorm:"column:scope_json"`
+	NotificationJSON *string   `gorm:"column:notification_json"`
+	EffectiveFrom    *string   `gorm:"column:effective_from"`
+	EffectiveTo      *string   `gorm:"column:effective_to"`
+	UpdatedBy        *string   `gorm:"column:updated_by"`
+	CreatedAt        time.Time `gorm:"column:created_at"`
+	UpdatedAt        time.Time `gorm:"column:updated_at"`
 }
 
 func (alertRuleRecord) TableName() string { return "alert_rule" }
 
 func (record alertRuleRecord) toDomain() domain.AlertRule {
 	return domain.AlertRule{TenantID: record.TenantID, ID: record.ID, RuleCode: record.RuleCode, Name: record.Name, SourceFCT: record.SourceFCT,
-		Severity: record.Severity, Enabled: record.Enabled, ThresholdJSON: record.ThresholdJSON, ScopeJSON: record.ScopeJSON,
+		Severity: record.Severity, Enabled: record.Enabled, ThresholdJSON: record.ThresholdJSON, ScopeJSON: record.ScopeJSON, NotificationJSON: record.NotificationJSON,
 		EffectiveFrom: record.EffectiveFrom, EffectiveTo: record.EffectiveTo, UpdatedBy: record.UpdatedBy,
 		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, Version: record.Version}
 }
 
 func alertRuleRecordFromDomain(rule domain.AlertRule) alertRuleRecord {
 	return alertRuleRecord{TenantID: rule.TenantID, ID: rule.ID, RuleCode: rule.RuleCode, Name: rule.Name, SourceFCT: rule.SourceFCT,
-		Severity: rule.Severity, Enabled: rule.Enabled, ThresholdJSON: rule.ThresholdJSON, ScopeJSON: rule.ScopeJSON,
+		Severity: rule.Severity, Enabled: rule.Enabled, ThresholdJSON: rule.ThresholdJSON, ScopeJSON: rule.ScopeJSON, NotificationJSON: rule.NotificationJSON,
 		EffectiveFrom: rule.EffectiveFrom, EffectiveTo: rule.EffectiveTo, UpdatedBy: rule.UpdatedBy,
 		CreatedAt: rule.CreatedAt, UpdatedAt: rule.UpdatedAt}
 }
@@ -209,7 +210,7 @@ func (repository *GORMRepository) ReplaceAlertRules(ctx context.Context, tenantI
 			record := alertRuleRecordFromDomain(rule)
 			if found {
 				if err := tx.Model(&alertRuleRecord{}).Where("tenant_id = ? AND id = ?", tenantID, rule.ID).
-					Updates(map[string]any{"name": record.Name, "source_fct": record.SourceFCT, "severity": record.Severity, "enabled": record.Enabled, "threshold_json": record.ThresholdJSON, "scope_json": record.ScopeJSON, "effective_from": record.EffectiveFrom, "effective_to": record.EffectiveTo, "updated_by": record.UpdatedBy, "updated_at": record.UpdatedAt}).Error; err != nil {
+					Updates(map[string]any{"name": record.Name, "source_fct": record.SourceFCT, "severity": record.Severity, "enabled": record.Enabled, "threshold_json": record.ThresholdJSON, "scope_json": record.ScopeJSON, "notification_json": record.NotificationJSON, "effective_from": record.EffectiveFrom, "effective_to": record.EffectiveTo, "updated_by": record.UpdatedBy, "updated_at": record.UpdatedAt}).Error; err != nil {
 					return err
 				}
 			} else if err := tx.Create(&record).Error; err != nil {
@@ -274,7 +275,7 @@ func (repository *GORMRepository) AlertRuleScopeOptions(ctx context.Context, ten
 		return domain.AlertRuleScopeOptions{}, application.ErrRulePayloadInvalid
 	}
 	options := domain.AlertRuleScopeOptions{
-		OwnerOrgIDs: make([]string, 0), CustomerTypes: make([]string, 0), Currencies: make([]string, 0),
+		OwnerOrgIDs: make([]string, 0), CustomerTypes: make([]string, 0), Currencies: make([]string, 0), Users: make([]domain.AlertRecipientOption, 0),
 	}
 	var orgs []string
 	if err := repository.db.WithContext(ctx).Table("dim_contract").
@@ -295,6 +296,12 @@ func (repository *GORMRepository) AlertRuleScopeOptions(ctx context.Context, ten
 		Distinct("currency").
 		Where("tenant_id = ? AND origin_kind = 'NORMAL' AND currency <> ''", tenantID).
 		Order("currency").Pluck("currency", &currencies).Error; err != nil {
+		return domain.AlertRuleScopeOptions{}, err
+	}
+	if err := repository.db.WithContext(ctx).Table("dim_org_user_snapshot").
+		Select("user_id, MAX(display_name) AS display_name, MAX(org_unit_name) AS org_unit_name").
+		Where("tenant_id = ?", tenantID).
+		Group("user_id").Order("user_id").Limit(500).Scan(&options.Users).Error; err != nil {
 		return domain.AlertRuleScopeOptions{}, err
 	}
 	options.OwnerOrgIDs = orgs

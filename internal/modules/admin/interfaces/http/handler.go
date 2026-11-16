@@ -283,23 +283,24 @@ func (handler *Handler) PutAlertRules(c *gin.Context) {
 }
 
 type alertRuleRequest struct {
-	ID            string  `json:"id"`
-	Version       int64   `json:"version"`
-	RuleCode      string  `json:"rule_code"`
-	Name          string  `json:"name"`
-	SourceFCT     string  `json:"source_fct"`
-	Severity      string  `json:"severity"`
-	Enabled       bool    `json:"enabled"`
-	ThresholdJSON *string `json:"threshold_json"`
-	ScopeJSON     *string `json:"scope_json"`
-	EffectiveFrom *string `json:"effective_from"`
-	EffectiveTo   *string `json:"effective_to"`
+	ID               string  `json:"id"`
+	Version          int64   `json:"version"`
+	RuleCode         string  `json:"rule_code"`
+	Name             string  `json:"name"`
+	SourceFCT        string  `json:"source_fct"`
+	Severity         string  `json:"severity"`
+	Enabled          bool    `json:"enabled"`
+	ThresholdJSON    *string `json:"threshold_json"`
+	ScopeJSON        *string `json:"scope_json"`
+	NotificationJSON *string `json:"notification_json"`
+	EffectiveFrom    *string `json:"effective_from"`
+	EffectiveTo      *string `json:"effective_to"`
 }
 
 func alertRulesFromRequest(input []alertRuleRequest) []domain.AlertRule {
 	rules := make([]domain.AlertRule, 0, len(input))
 	for _, rule := range input {
-		rules = append(rules, domain.AlertRule{ID: rule.ID, Version: rule.Version, RuleCode: rule.RuleCode, Name: rule.Name, SourceFCT: rule.SourceFCT, Severity: rule.Severity, Enabled: rule.Enabled, ThresholdJSON: rule.ThresholdJSON, ScopeJSON: rule.ScopeJSON, EffectiveFrom: rule.EffectiveFrom, EffectiveTo: rule.EffectiveTo})
+		rules = append(rules, domain.AlertRule{ID: rule.ID, Version: rule.Version, RuleCode: rule.RuleCode, Name: rule.Name, SourceFCT: rule.SourceFCT, Severity: rule.Severity, Enabled: rule.Enabled, ThresholdJSON: rule.ThresholdJSON, ScopeJSON: rule.ScopeJSON, NotificationJSON: rule.NotificationJSON, EffectiveFrom: rule.EffectiveFrom, EffectiveTo: rule.EffectiveTo})
 	}
 	return rules
 }

@@ -25,14 +25,61 @@ const (
 
 // Rule 是 alert_rule 中 Worker 执行所需的最小字段集合。
 type Rule struct {
-	ID            string
-	Code          string
-	Severity      string
-	ThresholdJSON []byte
-	ScopeJSON     []byte
-	EffectiveFrom *string
-	EffectiveTo   *string
-	UpdatedBy     string
+	ID               string
+	Code             string
+	Severity         string
+	ThresholdJSON    []byte
+	ScopeJSON        []byte
+	EffectiveFrom    *string
+	EffectiveTo      *string
+	NotificationJSON []byte
+	UpdatedBy        string
+}
+
+// notificationConfig 是规则通知配置的 Worker 视图。
+type notificationConfig struct {
+	Enabled                bool     `json:"enabled"`
+	Recipients             []string `json:"recipients"`
+	QuietStart             string   `json:"quiet_start"`
+	QuietEnd               string   `json:"quiet_end"`
+	EscalationAfterMinutes int      `json:"escalation_after_minutes"`
+	EscalationRecipients   []string `json:"escalation_recipients"`
+}
+
+func parseNotificationConfig(raw []byte) (notificationConfig, error) {
+	var config notificationConfig
+	if len(strings.TrimSpace(string(raw))) == 0 || strings.TrimSpace(string(raw)) == "null" {
+		return config, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&config); err != nil {
+		return notificationConfig{}, err
+	}
+	return config, nil
+}
+
+func inQuietHours(now time.Time, start, end string) bool {
+	if start == "" || end == "" {
+		return false
+	}
+	parse := func(value string) (int, bool) {
+		parsed, err := time.Parse("15:04", value)
+		if err != nil {
+			return 0, false
+		}
+		return parsed.Hour()*60 + parsed.Minute(), true
+	}
+	startMinutes, okStart := parse(start)
+	endMinutes, okEnd := parse(end)
+	if !okStart || !okEnd || startMinutes == endMinutes {
+		return false
+	}
+	current := now.Hour()*60 + now.Minute()
+	if startMinutes < endMinutes {
+		return current >= startMinutes && current < endMinutes
+	}
+	return current >= startMinutes || current < endMinutes
 }
 
 // RuleScope 是合同到期规则的可选范围；空集合表示不限制。
@@ -532,15 +579,42 @@ func recordExecution(ctx context.Context, store Store, rule Rule, matched int, s
 // notifyAlerts 把本轮预警投递到平台站内信；未配置通知凭据时直接跳过。
 // 收件人暂为规则维护者；通知对象/静默/升级将在后续配置中覆盖。
 func (w *Worker) notifyAlerts(ctx context.Context, rule Rule, alerts []Alert, evaluatedAt time.Time) error {
-	if w.notifier == nil || strings.TrimSpace(rule.UpdatedBy) == "" || len(alerts) == 0 {
+	if w.notifier == nil || len(alerts) == 0 {
+		return nil
+	}
+	config, err := parseNotificationConfig(rule.NotificationJSON)
+	if err != nil {
+		return fmt.Errorf("parse notification config: %w", err)
+	}
+	if !config.Enabled {
+		return nil
+	}
+	recipients := config.Recipients
+	if len(recipients) == 0 && strings.TrimSpace(rule.UpdatedBy) != "" {
+		recipients = []string{rule.UpdatedBy}
+	}
+	if len(recipients) == 0 {
 		return nil
 	}
 	var errs []error
 	for _, alert := range alerts {
+		targetRecipients := recipients
+		priority := alert.Severity
+		escalated := false
+		if config.EscalationAfterMinutes > 0 && len(config.EscalationRecipients) > 0 && !alert.DueDate.IsZero() {
+			if evaluatedAt.Sub(alert.DueDate) >= time.Duration(config.EscalationAfterMinutes)*time.Minute {
+				targetRecipients = config.EscalationRecipients
+				priority = "HIGH"
+				escalated = true
+			}
+		}
+		if !escalated && inQuietHours(evaluatedAt, config.QuietStart, config.QuietEnd) {
+			continue
+		}
 		if err := w.notifier.Publish(ctx, platformnotify.Event{
 			EventID: alert.ID, EventType: "DATA_ANALYSIS_ALERT", Scope: "CROSS_SYSTEM",
-			Priority: alert.Severity, Title: alert.Title, Content: alert.Title,
-			ReferenceType: "ALERT", ReferenceID: alert.ID, Recipients: []string{rule.UpdatedBy},
+			Priority: priority, Title: alert.Title, Content: alert.Title,
+			ReferenceType: "ALERT", ReferenceID: alert.ID, Recipients: targetRecipients,
 			OccurredAt: evaluatedAt, IdempotencyKey: alert.ID,
 		}); err != nil {
 			errs = append(errs, fmt.Errorf("publish alert %s notification: %w", alert.ID, err))

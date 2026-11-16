@@ -372,7 +372,7 @@ func TestRunOnceSkipsRuleOutsideEffectiveWindow(t *testing.T) {
 
 func TestRunOncePublishesAlertToRuleUpdater(t *testing.T) {
 	store := &memoryStore{
-		rules:      []Rule{{ID: "rule-1", UpdatedBy: "user-1", Code: RuleContractExpiry, Severity: "HIGH", ThresholdJSON: []byte(`{"days":21}`)}},
+		rules:      []Rule{{ID: "rule-1", UpdatedBy: "user-1", NotificationJSON: []byte(`{"enabled":true,"recipients":["user-1"]}`), Code: RuleContractExpiry, Severity: "HIGH", ThresholdJSON: []byte(`{"days":21}`)}},
 		candidates: []ContractExpiryCandidate{{TenantID: "tenant-1", TargetRef: "contract-1", Title: "合同即将到期", DueDate: time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)}},
 	}
 	notifier := &fakeNotifier{}
