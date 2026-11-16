@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/unified-identity-auth-platform/data-analysis/internal/modules/admin/domain"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/ownerdirectory"
 )
 
 var (
@@ -98,7 +99,22 @@ func (service *Service) AlertRuleScopeOptions(ctx context.Context, tenantID stri
 	if strings.TrimSpace(tenantID) == "" {
 		return domain.AlertRuleScopeOptions{}, ErrRulePayloadInvalid
 	}
-	return service.repository.AlertRuleScopeOptions(ctx, tenantID)
+	options, err := service.repository.AlertRuleScopeOptions(ctx, tenantID)
+	if err != nil {
+		return domain.AlertRuleScopeOptions{}, err
+	}
+	if service.directory != nil {
+		for index := range options.Users {
+			if strings.TrimSpace(options.Users[index].DisplayName) != "" {
+				continue
+			}
+			name, lookupErr := service.directory.Lookup(ctx, options.Users[index].UserID)
+			if lookupErr == nil && strings.TrimSpace(name) != "" {
+				options.Users[index].DisplayName = strings.TrimSpace(name)
+			}
+		}
+	}
+	return options, nil
 }
 
 // PreviewAlertRule 计算合同到期规则当前会命中的合同数量和样例，不写入任何状态。
@@ -131,6 +147,7 @@ type Service struct {
 	location   *time.Location
 	now        func() time.Time
 	newID      func() string
+	directory  *ownerdirectory.Client
 }
 
 // NewService 构造生产环境使用的管理应用服务；默认 UTC，由启动方注入业务时区。
@@ -141,6 +158,11 @@ func NewService(repository Repository) *Service {
 // SetBusinessLocation 注入预警预览和规则执行使用的业务时区。
 // 参数：location 为 IANA 时区；nil 保持 UTC。
 // 返回值：无。
+// SetOwnerDirectory 注入平台负责人目录，用于把用户 ID 解析成姓名。
+func (service *Service) SetOwnerDirectory(directory *ownerdirectory.Client) {
+	service.directory = directory
+}
+
 func (service *Service) SetBusinessLocation(location *time.Location) {
 	if location != nil {
 		service.location = location
