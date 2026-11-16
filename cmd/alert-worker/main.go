@@ -20,6 +20,7 @@ import (
 	"github.com/unified-identity-auth-platform/data-analysis/internal/alertworker"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/commercial"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/integrationsync"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/platformnotify"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shutdown"
 )
 
@@ -77,6 +78,15 @@ func main() {
 	}
 	worker := alertworker.New(alertworker.NewGormStore(db, tenantID))
 	worker.Logger = logger
+	notificationConfig, notificationErr := platformnotify.ConfigFromEnv(os.Getenv)
+	if notificationErr != nil {
+		logger.Error("platform notification configuration invalid", "error", notificationErr)
+		os.Exit(1)
+	}
+	worker.SetNotifier(platformnotify.New(notificationConfig))
+	if notificationConfig.Enabled() {
+		logger.Info("platform notification publisher enabled")
+	}
 	worker.SetBusinessLocation(businessLocation)
 	logger.Info("alert business day timezone", "timezone", businessLocation.String())
 	worker.LicenseCheck = func(ctx context.Context) error { return licenseCheck.Allow(ctx, commercial.MutateBusiness) }

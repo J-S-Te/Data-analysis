@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/unified-identity-auth-platform/data-analysis/internal/platformnotify"
 )
 
 type memoryStore struct {
@@ -70,6 +72,15 @@ func (s *memoryStore) ReconcileAlerts(_ context.Context, ruleCode string, active
 	s.reconcileAt = evaluatedAt
 	s.reconcileOpts = options
 	s.order = append(s.order, "reconcile")
+	return nil
+}
+
+type fakeNotifier struct {
+	events []platformnotify.Event
+}
+
+func (f *fakeNotifier) Publish(_ context.Context, event platformnotify.Event) error {
+	f.events = append(f.events, event)
 	return nil
 }
 
@@ -356,5 +367,26 @@ func TestRunOnceSkipsRuleOutsideEffectiveWindow(t *testing.T) {
 	}
 	if store.findCalls != 0 {
 		t.Fatalf("candidate lookups = %d; want 0 for rule outside effective window", store.findCalls)
+	}
+}
+
+func TestRunOncePublishesAlertToRuleUpdater(t *testing.T) {
+	store := &memoryStore{
+		rules:      []Rule{{ID: "rule-1", UpdatedBy: "user-1", Code: RuleContractExpiry, Severity: "HIGH", ThresholdJSON: []byte(`{"days":21}`)}},
+		candidates: []ContractExpiryCandidate{{TenantID: "tenant-1", TargetRef: "contract-1", Title: "合同即将到期", DueDate: time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)}},
+	}
+	notifier := &fakeNotifier{}
+	worker := New(store)
+	worker.SetNotifier(notifier)
+	worker.now = func() time.Time { return time.Date(2026, 8, 17, 8, 0, 0, 0, time.UTC) }
+	if _, err := worker.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(notifier.events) != 1 {
+		t.Fatalf("notifications = %d, want 1", len(notifier.events))
+	}
+	event := notifier.events[0]
+	if len(event.Recipients) != 1 || event.Recipients[0] != "user-1" || event.Title == "" || event.IdempotencyKey == "" {
+		t.Fatalf("notification event = %+v", event)
 	}
 }

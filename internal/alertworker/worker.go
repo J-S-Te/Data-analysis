@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/unified-identity-auth-platform/data-analysis/internal/platformnotify"
 )
 
 const (
@@ -30,6 +32,7 @@ type Rule struct {
 	ScopeJSON     []byte
 	EffectiveFrom *string
 	EffectiveTo   *string
+	UpdatedBy     string
 }
 
 // RuleScope 是合同到期规则的可选范围；空集合表示不限制。
@@ -278,6 +281,7 @@ type Worker struct {
 	location *time.Location
 	// lifecycle 是告警生命周期收敛策略；零值等于现网"只增不关"行为。
 	lifecycle LifecycleOptions
+	notifier  platformnotify.Publisher
 }
 
 func New(store Store) *Worker {
@@ -294,6 +298,11 @@ func New(store Store) *Worker {
 // 返回值：无。
 // 到期窗口的"今天"按该时区换算：否则北京时间 00:00-08:00 期间窗口下界仍停在
 // UTC 的昨天，合同会早一天进入/晚一天退出提醒窗口。
+// SetNotifier 注入平台站内信发布器；nil 表示通知通道未开通。
+func (w *Worker) SetNotifier(notifier platformnotify.Publisher) {
+	w.notifier = notifier
+}
+
 func (w *Worker) SetBusinessLocation(location *time.Location) {
 	if location == nil {
 		location = time.UTC
@@ -434,9 +443,10 @@ func (w *Worker) evaluateContractExpiry(ctx context.Context, rule Rule, evaluate
 	if err := w.store.UpsertAlerts(ctx, alerts); err != nil {
 		return 0, fmt.Errorf("upsert contract expiry alerts: %w", err)
 	}
+	notifyErr := w.notifyAlerts(ctx, rule, alerts, evaluatedAt)
 	lifecycle := w.lifecycle.normalized()
 	if !lifecycle.AutoResolve {
-		return len(alerts), nil
+		return len(alerts), notifyErr
 	}
 	// 收敛必须在幂等写入之后执行，否则本轮命中的告警可能被误判为未命中。
 	// 安全阀以"写入后仍未关闭的告警基数"为分母：本轮算出的命中集合为 0，或明显
@@ -444,7 +454,7 @@ func (w *Worker) evaluateContractExpiry(ctx context.Context, rule Rule, evaluate
 	// 表现为命中集合骤降，此时批量 CLOSED 会掩盖真实数据问题。
 	activeCount, err := w.store.CountActiveAlerts(ctx, rule.Code)
 	if err != nil {
-		return 0, fmt.Errorf("count active contract expiry alerts: %w", err)
+		return 0, errors.Join(notifyErr, fmt.Errorf("count active contract expiry alerts: %w", err))
 	}
 	if guarded, reason := closeGuarded(len(alerts), activeCount, lifecycle.CloseGuardRatio); guarded {
 		if activeCount > 0 {
@@ -517,6 +527,26 @@ func recordExecution(ctx context.Context, store Store, rule Rule, matched int, s
 		errorMessage = evaluateErr.Error()
 	}
 	return store.RecordRuleExecution(ctx, rule, status, matched, startedAt, finishedAt, errorMessage)
+}
+
+// notifyAlerts 把本轮预警投递到平台站内信；未配置通知凭据时直接跳过。
+// 收件人暂为规则维护者；通知对象/静默/升级将在后续配置中覆盖。
+func (w *Worker) notifyAlerts(ctx context.Context, rule Rule, alerts []Alert, evaluatedAt time.Time) error {
+	if w.notifier == nil || strings.TrimSpace(rule.UpdatedBy) == "" || len(alerts) == 0 {
+		return nil
+	}
+	var errs []error
+	for _, alert := range alerts {
+		if err := w.notifier.Publish(ctx, platformnotify.Event{
+			EventID: alert.ID, EventType: "DATA_ANALYSIS_ALERT", Scope: "CROSS_SYSTEM",
+			Priority: alert.Severity, Title: alert.Title, Content: alert.Title,
+			ReferenceType: "ALERT", ReferenceID: alert.ID, Recipients: []string{rule.UpdatedBy},
+			OccurredAt: evaluatedAt, IdempotencyKey: alert.ID,
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("publish alert %s notification: %w", alert.ID, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func stableAlertID(tenantID, alertType, targetRef string) string {
