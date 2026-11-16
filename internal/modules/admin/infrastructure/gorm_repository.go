@@ -165,16 +165,23 @@ func (repository *GORMRepository) ReplaceAlertRules(ctx context.Context, tenantI
 	return repository.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, rule := range rules {
 			var existing alertRuleRecord
-			err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND rule_code = ?", tenantID, rule.RuleCode).First(&existing).Error
-			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-				return err
-			}
-			found := err == nil
-			if found && existing.ID != rule.ID {
-				return application.ErrRuleVersionConflict
-			}
-			if !found && rule.Version != 0 {
-				return application.ErrRuleVersionConflict
+			found := false
+			if rule.ID != "" {
+				err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+					Where("tenant_id = ? AND id = ?", tenantID, rule.ID).First(&existing).Error
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					if rule.Version != 0 {
+						return application.ErrRuleVersionConflict
+					}
+					found = false
+				} else if err != nil {
+					return err
+				} else {
+					if existing.RuleCode != rule.RuleCode {
+						return application.ErrRuleVersionConflict
+					}
+					found = true
+				}
 			}
 			var latest int64
 			if err := tx.Table("alert_rule_version").Where("tenant_id = ? AND rule_id = ?", tenantID, rule.ID).
@@ -189,6 +196,8 @@ func (repository *GORMRepository) ReplaceAlertRules(ctx context.Context, tenantI
 					return application.ErrRuleVersionConflict
 				}
 				rule.CreatedAt = existing.CreatedAt
+			} else if rule.Version != 0 {
+				return application.ErrRuleVersionConflict
 			}
 			rule.Version = latest + 1
 			record := alertRuleRecordFromDomain(rule)
@@ -214,10 +223,10 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 				id, tenantID, rule.ID, rule.Version, string(snapshot), rule.UpdatedBy, rule.UpdatedAt).Error; err != nil {
 				return err
 			}
-			// AUD-IP-2026 / 批次 2：规则变更与审计事件同事务，平台不可用时由投递器重试。
+			// 规则变更与审计事件同事务，平台不可用时由投递器重试。
 			if err := auditoutbox.Append(tx, auditoutbox.Entry{
 				TenantID: tenantID, ActorID: derefActor(rule.UpdatedBy), Action: "DATA_ANALYSIS:ALERT_RULE_SAVE",
-				ResourceType: "alert_rule", ResourceID: rule.RuleCode, Result: "SUCCESS",
+				ResourceType: "alert_rule", ResourceID: rule.ID, Result: "SUCCESS",
 			}); err != nil {
 				return err
 			}

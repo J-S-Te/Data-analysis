@@ -113,6 +113,10 @@ func New(config Config) (*App, error) {
 			auditDispatcher.Run(backgroundContext)
 			return nil
 		})
+		background.Run("audit-outbox-health", func() error {
+			reportAuditOutboxHealth(backgroundContext, auditStore, auditReporter, slog.Default())
+			return nil
+		})
 	} else {
 		// 审计发布器配置不完整时不会启动投递循环：事务内审计仍写入
 		// bi_audit_outbox，但没有任何循环把它送到平台，表会只增不减、
@@ -231,7 +235,7 @@ func New(config Config) (*App, error) {
 	base.GET("/auth/logout", authHandler.Logout)
 	base.POST("/auth/backchannel-logout", authService.BackchannelLogout)
 
-	api := base.Group("/api/v1", middleware.SessionAuth(authService, "data_analysis_session"))
+	api := base.Group("/api/v1", middleware.SecurityFailures(auditReporter, config.TrustedProxies), middleware.SessionAuth(authService, "data_analysis_session"))
 	api.Use(middleware.AuditWrites(auditReporter, slog.Default(), config.TrustedProxies))
 	// 组级同源兜底（SEC-D11）：cookie 会话下的所有不安全方法先过 Origin/CSRF 校验，
 	// 即使个别路由忘记单独挂载 RequireSameOriginWrite 也默认受保护；
