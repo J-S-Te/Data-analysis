@@ -19,6 +19,7 @@ import (
 
 const (
 	RuleContractExpiry = "CONTRACT_EXPIRY"
+	RulePaymentOverdue = "PAYMENT_OVERDUE"
 	defaultExpiryDays  = 30
 	maxExpiryDays      = 3650
 )
@@ -91,6 +92,16 @@ type RuleScope struct {
 	AmountMaxMinor *int64   `json:"amount_max_minor"`
 }
 
+// PaymentOverdueCandidate 是标准财务事实中的未清应收。
+type PaymentOverdueCandidate struct {
+	TenantID   string
+	TargetRef  string
+	ExternalID string
+	Currency   string
+	OpenMinor  int64
+	DueDate    time.Time
+}
+
 // ContractExpiryCandidate 是从 dim_contract 筛出的合同到期候选项。
 type ContractExpiryCandidate struct {
 	TenantID     string
@@ -125,6 +136,7 @@ type Alert struct {
 type Store interface {
 	ListEnabledRules(ctx context.Context) ([]Rule, error)
 	FindContractExpiryCandidates(ctx context.Context, evaluatedAt time.Time, days int) ([]ContractExpiryCandidate, error)
+	FindPaymentOverdueCandidates(ctx context.Context) ([]PaymentOverdueCandidate, error)
 	UpsertAlerts(ctx context.Context, alerts []Alert) error
 	// CountActiveAlerts 返回同一规则下仍未关闭（OPEN/ACK）的告警基数，
 	// 供调用方在本轮命中集合异常收缩时触发安全阀。
@@ -435,6 +447,15 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 			if recordErr := recordExecution(ctx, w.store, rule, count, startedAt, w.now(), evaluateErr); recordErr != nil {
 				runErrors = append(runErrors, fmt.Errorf("record rule %s execution: %w", rule.Code, recordErr))
 			}
+		case RulePaymentOverdue:
+			count, evaluateErr := w.evaluatePaymentOverdue(ctx, rule, evaluatedAt)
+			processed += count
+			if evaluateErr != nil {
+				runErrors = append(runErrors, fmt.Errorf("evaluate rule %s: %w", rule.Code, evaluateErr))
+			}
+			if recordErr := recordExecution(ctx, w.store, rule, count, startedAt, w.now(), evaluateErr); recordErr != nil {
+				runErrors = append(runErrors, fmt.Errorf("record rule %s execution: %w", rule.Code, recordErr))
+			}
 		default:
 			evaluateErr := fmt.Errorf("alert rule %s is not supported", rule.Code)
 			runErrors = append(runErrors, evaluateErr)
@@ -444,6 +465,66 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 		}
 	}
 	return processed, errors.Join(runErrors...)
+}
+
+// evaluatePaymentOverdue 评估标准财务应收逾期并幂等写入预警。
+// 口径：open_minor = original_minor - allocated_minor > 0，且到期日 <= 业务今天 - 宽限天数。
+func (w *Worker) evaluatePaymentOverdue(ctx context.Context, rule Rule, evaluatedAt time.Time) (int, error) {
+	days, err := paymentOverdueDays(rule.ThresholdJSON)
+	if err != nil {
+		return 0, err
+	}
+	candidates, err := w.store.FindPaymentOverdueCandidates(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("find payment overdue candidates: %w", err)
+	}
+	scope, err := parseRuleScope(rule.ScopeJSON)
+	if err != nil {
+		return 0, fmt.Errorf("parse payment overdue scope: %w", err)
+	}
+	cutoff := businessDayStart(evaluatedAt).AddDate(0, 0, -days)
+	alerts := make([]Alert, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.OpenMinor <= 0 || candidate.DueDate.IsZero() || candidate.DueDate.After(cutoff) {
+			continue
+		}
+		if !matchesRuleScope(scope, ContractExpiryCandidate{Currency: candidate.Currency, AmountMinor: candidate.OpenMinor}) {
+			continue
+		}
+		title := fmt.Sprintf("应收「%s」已逾期，未清金额 %s %.2f", candidate.ExternalID, candidate.Currency, float64(candidate.OpenMinor)/100)
+		alerts = append(alerts, Alert{
+			ID: stableAlertID(candidate.TenantID, RulePaymentOverdue, candidate.TargetRef), TenantID: candidate.TenantID,
+			AlertType: RulePaymentOverdue, RuleCode: rule.Code, Severity: normalizedSeverity(rule.Severity),
+			TargetRef: candidate.TargetRef, Title: title, DueDate: candidate.DueDate, EvaluatedAt: evaluatedAt,
+		})
+	}
+	if w.LicenseCheck != nil {
+		if err := w.LicenseCheck(ctx); err != nil {
+			return 0, err
+		}
+	}
+	if err := w.store.UpsertAlerts(ctx, alerts); err != nil {
+		return 0, fmt.Errorf("upsert payment overdue alerts: %w", err)
+	}
+	return len(alerts), w.notifyAlerts(ctx, rule, alerts, evaluatedAt)
+}
+
+func paymentOverdueDays(raw []byte) (int, error) {
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return 0, errors.New("PAYMENT_OVERDUE threshold_json is required")
+	}
+	var threshold struct {
+		Days int `json:"days"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&threshold); err != nil {
+		return 0, fmt.Errorf("decode PAYMENT_OVERDUE threshold_json: %w", err)
+	}
+	if threshold.Days < 0 || threshold.Days > maxExpiryDays {
+		return 0, fmt.Errorf("PAYMENT_OVERDUE days must be between 0 and %d", maxExpiryDays)
+	}
+	return threshold.Days, nil
 }
 
 // evaluateContractExpiry 评估合同到期告警并在每个业务写入边界复核许可。

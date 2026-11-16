@@ -13,17 +13,18 @@ import (
 )
 
 type memoryStore struct {
-	rules         []Rule
-	candidates    []ContractExpiryCandidate
-	alerts        map[string]Alert
-	requestedDays int
-	findCalls     int
-	reconcile     []string
-	reconcileAt   time.Time
-	reconcileOpts ReconcileOptions
-	activeCount   int64
-	countCalls    int
-	order         []string
+	rules             []Rule
+	candidates        []ContractExpiryCandidate
+	paymentCandidates []PaymentOverdueCandidate
+	alerts            map[string]Alert
+	requestedDays     int
+	findCalls         int
+	reconcile         []string
+	reconcileAt       time.Time
+	reconcileOpts     ReconcileOptions
+	activeCount       int64
+	countCalls        int
+	order             []string
 }
 
 func (s *memoryStore) ListEnabledRules(context.Context) ([]Rule, error) {
@@ -42,6 +43,10 @@ func (s *memoryStore) FindContractExpiryCandidates(
 	s.findCalls++
 	s.requestedDays = days
 	return s.candidates, nil
+}
+
+func (s *memoryStore) FindPaymentOverdueCandidates(context.Context) ([]PaymentOverdueCandidate, error) {
+	return s.paymentCandidates, nil
 }
 
 func (s *memoryStore) UpsertAlerts(_ context.Context, alerts []Alert) error {
@@ -388,5 +393,24 @@ func TestRunOncePublishesAlertToRuleUpdater(t *testing.T) {
 	event := notifier.events[0]
 	if len(event.Recipients) != 1 || event.Recipients[0] != "user-1" || event.Title == "" || event.IdempotencyKey == "" {
 		t.Fatalf("notification event = %+v", event)
+	}
+}
+
+func TestRunOnceCreatesPaymentOverdueAlert(t *testing.T) {
+	store := &memoryStore{
+		rules: []Rule{{ID: "rule-pay", Code: RulePaymentOverdue, Severity: "HIGH", ThresholdJSON: []byte(`{"days":7}`)}},
+		paymentCandidates: []PaymentOverdueCandidate{
+			{TenantID: "tenant-1", TargetRef: "receivable:R-1", ExternalID: "R-1", Currency: "CNY", OpenMinor: 100000, DueDate: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)},
+			{TenantID: "tenant-1", TargetRef: "receivable:R-2", ExternalID: "R-2", Currency: "CNY", OpenMinor: 0, DueDate: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)},
+		},
+	}
+	worker := New(store)
+	worker.now = func() time.Time { return time.Date(2026, 8, 17, 8, 0, 0, 0, time.UTC) }
+	count, err := worker.RunOnce(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("RunOnce() count = %d, error = %v", count, err)
+	}
+	if _, ok := store.alerts["tenant-1/PAYMENT_OVERDUE/receivable:R-1"]; !ok {
+		t.Fatalf("payment alert missing: %#v", store.alerts)
 	}
 }

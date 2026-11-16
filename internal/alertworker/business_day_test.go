@@ -22,6 +22,10 @@ func (s *windowStore) RecordRuleExecution(context.Context, Rule, string, int, ti
 	return nil
 }
 
+func (s *windowStore) FindPaymentOverdueCandidates(context.Context) ([]PaymentOverdueCandidate, error) {
+	return nil, nil
+}
+
 func (s *windowStore) FindContractExpiryCandidates(_ context.Context, evaluatedAt time.Time, _ int) ([]ContractExpiryCandidate, error) {
 	s.window = evaluatedAt
 	return nil, nil

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -151,6 +153,53 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, s.tenantID, rule.ID, 0, status, matched, errorMessage, startedAt.UTC(), finishedAt.UTC(),
 	).Error
 	return err
+}
+
+// FindPaymentOverdueCandidates 读取标准财务当前发布批次中的应收事实。
+// 参数：ctx 为上下文；返回值：未清金额、到期日和币种；JSON 损坏时返回错误。
+func (s *GormStore) FindPaymentOverdueCandidates(ctx context.Context) ([]PaymentOverdueCandidate, error) {
+	if err := s.validateTenant(); err != nil {
+		return nil, err
+	}
+	var rows []struct {
+		ExternalID  string
+		PayloadJSON []byte
+	}
+	err := s.db.WithContext(ctx).
+		Table("standard_finance_fact AS f").
+		Joins("JOIN standard_finance_source AS s ON s.tenant_id = f.tenant_id AND s.source_code = f.source_code AND s.batch_id = f.batch_id").
+		Select("f.external_id, f.payload_json").
+		Where("f.tenant_id = ? AND f.source_code = 'standard-finance' AND f.fact_type = 'receivable'", s.tenantID).
+		Order("f.external_id").Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	candidates := make([]PaymentOverdueCandidate, 0, len(rows))
+	for _, row := range rows {
+		var payload struct {
+			ExternalID     string `json:"external_id"`
+			Currency       string `json:"currency"`
+			OriginalMinor  int64  `json:"original_minor"`
+			AllocatedMinor int64  `json:"allocated_minor"`
+			DueDate        string `json:"due_date"`
+		}
+		if err := json.Unmarshal(row.PayloadJSON, &payload); err != nil {
+			return nil, fmt.Errorf("decode receivable %s: %w", row.ExternalID, err)
+		}
+		dueDate, err := time.Parse("2006-01-02", payload.DueDate)
+		if err != nil {
+			return nil, fmt.Errorf("decode receivable %s due date: %w", row.ExternalID, err)
+		}
+		target := strings.TrimSpace(payload.ExternalID)
+		if target == "" {
+			target = row.ExternalID
+		}
+		candidates = append(candidates, PaymentOverdueCandidate{
+			TenantID: s.tenantID, TargetRef: "receivable:" + target, ExternalID: target,
+			Currency: payload.Currency, OpenMinor: payload.OriginalMinor - payload.AllocatedMinor, DueDate: dueDate,
+		})
+	}
+	return candidates, nil
 }
 
 // CountActiveAlerts 统计同一租户、同一规则下仍未关闭（OPEN/ACK）的告警数。
