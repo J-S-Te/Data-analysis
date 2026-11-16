@@ -411,7 +411,21 @@ func normalizeStringList(values []string, maxItems, maxLen int) []string {
 }
 
 func validAlertRule(rule domain.AlertRule) bool {
-	if rule.RuleCode != "CONTRACT_EXPIRY" || rule.SourceFCT != "dim_contract" || rule.Name == "" || len([]rune(rule.Name)) > 128 {
+	if rule.Name == "" || len([]rune(rule.Name)) > 128 {
+		return false
+	}
+	minDays := 1
+	switch rule.RuleCode {
+	case "CONTRACT_EXPIRY":
+		if rule.SourceFCT != "dim_contract" {
+			return false
+		}
+	case "PAYMENT_OVERDUE":
+		if rule.SourceFCT != "standard_finance_fact" {
+			return false
+		}
+		minDays = 0
+	default:
 		return false
 	}
 	if rule.Severity != "LOW" && rule.Severity != "MEDIUM" && rule.Severity != "HIGH" {
@@ -425,7 +439,7 @@ func validAlertRule(rule domain.AlertRule) bool {
 	var threshold struct {
 		Days int `json:"days"`
 	}
-	if err := decoder.Decode(&threshold); err != nil || threshold.Days < 1 || threshold.Days > 3650 {
+	if err := decoder.Decode(&threshold); err != nil || threshold.Days < minDays || threshold.Days > 3650 {
 		return false
 	}
 	return decoder.Decode(&struct{}{}) == io.EOF

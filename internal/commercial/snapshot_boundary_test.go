@@ -225,6 +225,10 @@ func (s *biAlertStore) FindContractExpiryCandidates(context.Context, time.Time, 
 	}
 	return []alertworker.ContractExpiryCandidate{{TenantID: "tenant-1", TargetRef: "contract-1", DueDate: s.expiry}}, nil
 }
+func (s *biAlertStore) FindPaymentOverdueCandidates(context.Context) ([]alertworker.PaymentOverdueCandidate, error) {
+	return nil, nil
+}
+
 func (s *biAlertStore) UpsertAlerts(context.Context, []alertworker.Alert) error {
 	s.writes++
 	return nil
