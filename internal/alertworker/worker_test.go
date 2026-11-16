@@ -8,24 +8,31 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/unified-identity-auth-platform/data-analysis/internal/platformnotify"
 )
 
 type memoryStore struct {
-	rules         []Rule
-	candidates    []ContractExpiryCandidate
-	alerts        map[string]Alert
-	requestedDays int
-	findCalls     int
-	reconcile     []string
-	reconcileAt   time.Time
-	reconcileOpts ReconcileOptions
-	activeCount   int64
-	countCalls    int
-	order         []string
+	rules             []Rule
+	candidates        []ContractExpiryCandidate
+	paymentCandidates []PaymentOverdueCandidate
+	alerts            map[string]Alert
+	requestedDays     int
+	findCalls         int
+	reconcile         []string
+	reconcileAt       time.Time
+	reconcileOpts     ReconcileOptions
+	activeCount       int64
+	countCalls        int
+	order             []string
 }
 
 func (s *memoryStore) ListEnabledRules(context.Context) ([]Rule, error) {
 	return s.rules, nil
+}
+
+func (s *memoryStore) RecordRuleExecution(context.Context, Rule, string, int, time.Time, time.Time, string) error {
+	return nil
 }
 
 func (s *memoryStore) FindContractExpiryCandidates(
@@ -36,6 +43,10 @@ func (s *memoryStore) FindContractExpiryCandidates(
 	s.findCalls++
 	s.requestedDays = days
 	return s.candidates, nil
+}
+
+func (s *memoryStore) FindPaymentOverdueCandidates(context.Context) ([]PaymentOverdueCandidate, error) {
+	return s.paymentCandidates, nil
 }
 
 func (s *memoryStore) UpsertAlerts(_ context.Context, alerts []Alert) error {
@@ -66,6 +77,15 @@ func (s *memoryStore) ReconcileAlerts(_ context.Context, ruleCode string, active
 	s.reconcileAt = evaluatedAt
 	s.reconcileOpts = options
 	s.order = append(s.order, "reconcile")
+	return nil
+}
+
+type fakeNotifier struct {
+	events []platformnotify.Event
+}
+
+func (f *fakeNotifier) Publish(_ context.Context, event platformnotify.Event) error {
+	f.events = append(f.events, event)
 	return nil
 }
 
@@ -312,5 +332,85 @@ func TestLifecycleOptionsFromEnvRejectsInvalid(t *testing.T) {
 	}
 	if _, err := LifecycleOptionsFromEnv(nil); err == nil {
 		t.Fatal("缺失环境读取函数未被拒绝")
+	}
+}
+
+func TestRunOnceFiltersContractExpiryByScope(t *testing.T) {
+	dueDate := time.Date(2026, time.September, 8, 0, 0, 0, 0, time.UTC)
+	store := &memoryStore{
+		rules: []Rule{{Code: RuleContractExpiry, Severity: "MEDIUM", ThresholdJSON: []byte(`{"days":21}`),
+			ScopeJSON: []byte(`{"owner_org_ids":["org-a"],"customer_types":["企业"],"amount_min_minor":10000,"amount_max_minor":20000}`)}},
+		candidates: []ContractExpiryCandidate{
+			{TenantID: "tenant-1", OwnerOrgID: "org-a", CustomerType: "企业", AmountMinor: 15000, TargetRef: "contract-match", Title: "命中", DueDate: dueDate},
+			{TenantID: "tenant-1", OwnerOrgID: "org-b", CustomerType: "企业", AmountMinor: 15000, TargetRef: "contract-org", Title: "组织不匹配", DueDate: dueDate},
+			{TenantID: "tenant-1", OwnerOrgID: "org-a", CustomerType: "政府", AmountMinor: 15000, TargetRef: "contract-type", Title: "类型不匹配", DueDate: dueDate},
+			{TenantID: "tenant-1", OwnerOrgID: "org-a", CustomerType: "企业", AmountMinor: 9999, TargetRef: "contract-amount", Title: "金额不匹配", DueDate: dueDate},
+		},
+	}
+	worker := New(store)
+	worker.now = func() time.Time { return time.Date(2026, time.August, 17, 8, 0, 0, 0, time.UTC) }
+	count, err := worker.RunOnce(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("RunOnce() count = %d, error = %v; want only scoped candidate", count, err)
+	}
+	if _, ok := store.alerts["tenant-1/CONTRACT_EXPIRY/contract-match"]; !ok {
+		t.Fatalf("scoped candidate missing: %#v", store.alerts)
+	}
+	if len(store.alerts) != 1 {
+		t.Fatalf("alerts = %#v; want exactly one", store.alerts)
+	}
+}
+
+func TestRunOnceSkipsRuleOutsideEffectiveWindow(t *testing.T) {
+	from := "2026-09-01"
+	store := &memoryStore{rules: []Rule{{Code: RuleContractExpiry, Severity: "MEDIUM", ThresholdJSON: []byte(`{"days":21}`), EffectiveFrom: &from}}}
+	worker := New(store)
+	worker.now = func() time.Time { return time.Date(2026, time.August, 17, 8, 0, 0, 0, time.UTC) }
+	count, err := worker.RunOnce(context.Background())
+	if err != nil || count != 0 {
+		t.Fatalf("RunOnce() count = %d, error = %v; want skipped rule", count, err)
+	}
+	if store.findCalls != 0 {
+		t.Fatalf("candidate lookups = %d; want 0 for rule outside effective window", store.findCalls)
+	}
+}
+
+func TestRunOncePublishesAlertToRuleUpdater(t *testing.T) {
+	store := &memoryStore{
+		rules:      []Rule{{ID: "rule-1", UpdatedBy: "user-1", NotificationJSON: []byte(`{"enabled":true,"recipients":["user-1"]}`), Code: RuleContractExpiry, Severity: "HIGH", ThresholdJSON: []byte(`{"days":21}`)}},
+		candidates: []ContractExpiryCandidate{{TenantID: "tenant-1", TargetRef: "contract-1", Title: "合同即将到期", DueDate: time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)}},
+	}
+	notifier := &fakeNotifier{}
+	worker := New(store)
+	worker.SetNotifier(notifier)
+	worker.now = func() time.Time { return time.Date(2026, 8, 17, 8, 0, 0, 0, time.UTC) }
+	if _, err := worker.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(notifier.events) != 1 {
+		t.Fatalf("notifications = %d, want 1", len(notifier.events))
+	}
+	event := notifier.events[0]
+	if len(event.Recipients) != 1 || event.Recipients[0] != "user-1" || event.Title == "" || event.IdempotencyKey == "" {
+		t.Fatalf("notification event = %+v", event)
+	}
+}
+
+func TestRunOnceCreatesPaymentOverdueAlert(t *testing.T) {
+	store := &memoryStore{
+		rules: []Rule{{ID: "rule-pay", Code: RulePaymentOverdue, Severity: "HIGH", ThresholdJSON: []byte(`{"days":7}`)}},
+		paymentCandidates: []PaymentOverdueCandidate{
+			{TenantID: "tenant-1", TargetRef: "receivable:R-1", ExternalID: "R-1", Currency: "CNY", OpenMinor: 100000, DueDate: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)},
+			{TenantID: "tenant-1", TargetRef: "receivable:R-2", ExternalID: "R-2", Currency: "CNY", OpenMinor: 0, DueDate: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)},
+		},
+	}
+	worker := New(store)
+	worker.now = func() time.Time { return time.Date(2026, 8, 17, 8, 0, 0, 0, time.UTC) }
+	count, err := worker.RunOnce(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("RunOnce() count = %d, error = %v", count, err)
+	}
+	if _, ok := store.alerts["tenant-1/PAYMENT_OVERDUE/receivable:R-1"]; !ok {
+		t.Fatalf("payment alert missing: %#v", store.alerts)
 	}
 }

@@ -13,28 +13,105 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/unified-identity-auth-platform/data-analysis/internal/platformnotify"
 )
 
 const (
 	RuleContractExpiry = "CONTRACT_EXPIRY"
+	RulePaymentOverdue = "PAYMENT_OVERDUE"
 	defaultExpiryDays  = 30
 	maxExpiryDays      = 3650
 )
 
 // Rule 是 alert_rule 中 Worker 执行所需的最小字段集合。
 type Rule struct {
-	Code          string
-	Severity      string
-	ThresholdJSON []byte
+	ID               string
+	Code             string
+	Severity         string
+	ThresholdJSON    []byte
+	ScopeJSON        []byte
+	EffectiveFrom    *string
+	EffectiveTo      *string
+	NotificationJSON []byte
+	UpdatedBy        string
+}
+
+// notificationConfig 是规则通知配置的 Worker 视图。
+type notificationConfig struct {
+	Enabled                bool     `json:"enabled"`
+	Recipients             []string `json:"recipients"`
+	QuietStart             string   `json:"quiet_start"`
+	QuietEnd               string   `json:"quiet_end"`
+	EscalationAfterMinutes int      `json:"escalation_after_minutes"`
+	EscalationRecipients   []string `json:"escalation_recipients"`
+}
+
+func parseNotificationConfig(raw []byte) (notificationConfig, error) {
+	var config notificationConfig
+	if len(strings.TrimSpace(string(raw))) == 0 || strings.TrimSpace(string(raw)) == "null" {
+		return config, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&config); err != nil {
+		return notificationConfig{}, err
+	}
+	return config, nil
+}
+
+func inQuietHours(now time.Time, start, end string) bool {
+	if start == "" || end == "" {
+		return false
+	}
+	parse := func(value string) (int, bool) {
+		parsed, err := time.Parse("15:04", value)
+		if err != nil {
+			return 0, false
+		}
+		return parsed.Hour()*60 + parsed.Minute(), true
+	}
+	startMinutes, okStart := parse(start)
+	endMinutes, okEnd := parse(end)
+	if !okStart || !okEnd || startMinutes == endMinutes {
+		return false
+	}
+	current := now.Hour()*60 + now.Minute()
+	if startMinutes < endMinutes {
+		return current >= startMinutes && current < endMinutes
+	}
+	return current >= startMinutes || current < endMinutes
+}
+
+// RuleScope 是合同到期规则的可选范围；空集合表示不限制。
+type RuleScope struct {
+	OwnerOrgIDs    []string `json:"owner_org_ids"`
+	CustomerTypes  []string `json:"customer_types"`
+	Currencies     []string `json:"currencies"`
+	AmountMinMinor *int64   `json:"amount_min_minor"`
+	AmountMaxMinor *int64   `json:"amount_max_minor"`
+}
+
+// PaymentOverdueCandidate 是标准财务事实中的未清应收。
+type PaymentOverdueCandidate struct {
+	TenantID   string
+	TargetRef  string
+	ExternalID string
+	Currency   string
+	OpenMinor  int64
+	DueDate    time.Time
 }
 
 // ContractExpiryCandidate 是从 dim_contract 筛出的合同到期候选项。
 type ContractExpiryCandidate struct {
-	TenantID   string
-	OwnerOrgID string
-	TargetRef  string
-	Title      string
-	DueDate    time.Time
+	TenantID     string
+	OwnerOrgID   string
+	TargetRef    string
+	Title        string
+	CustomerType string
+	Currency     string
+	AmountMinor  int64
+	DueDate      time.Time
 	// InWindow 表示到期日位于 [基准日, 基准日+提醒窗口天数] 内。
 	// 条件集合包含刚过期但未续签的合同（InWindow=false），它们仍算"条件成立"，
 	// 因此保持 OPEN，不会因为滑出窗口被关闭。
@@ -59,10 +136,12 @@ type Alert struct {
 type Store interface {
 	ListEnabledRules(ctx context.Context) ([]Rule, error)
 	FindContractExpiryCandidates(ctx context.Context, evaluatedAt time.Time, days int) ([]ContractExpiryCandidate, error)
+	FindPaymentOverdueCandidates(ctx context.Context) ([]PaymentOverdueCandidate, error)
 	UpsertAlerts(ctx context.Context, alerts []Alert) error
 	// CountActiveAlerts 返回同一规则下仍未关闭（OPEN/ACK）的告警基数，
 	// 供调用方在本轮命中集合异常收缩时触发安全阀。
 	CountActiveAlerts(ctx context.Context, ruleCode string) (int64, error)
+	RecordRuleExecution(ctx context.Context, rule Rule, status string, matched int, startedAt, finishedAt time.Time, errorMessage string) error
 	// ReconcileAlerts 按本轮实际命中的告警集合收敛同一规则的历史告警状态。
 	// 只有启用了 LifecycleOptions.AutoResolve 才会调用；实现必须幂等且租户隔离。
 	ReconcileAlerts(ctx context.Context, ruleCode string, active []Alert, evaluatedAt time.Time, options ReconcileOptions) error
@@ -106,6 +185,76 @@ type LifecycleOptions struct {
 type ReconcileOptions struct {
 	ConfirmRounds int
 	ReopenPolicy  ReopenPolicy
+}
+
+// ruleEffectiveOn 判断规则在业务评估日是否处于生效区间；空边界表示不限。
+// 参数：rule 为启用规则；evaluatedAt 为业务时区评估时刻。
+// 返回值：生效开始日 <= 当前日 <= 生效截止日时为 true。
+func ruleEffectiveOn(rule Rule, evaluatedAt time.Time) bool {
+	day := evaluatedAt.Format("2006-01-02")
+	if rule.EffectiveFrom != nil && strings.TrimSpace(*rule.EffectiveFrom) > day {
+		return false
+	}
+	if rule.EffectiveTo != nil && strings.TrimSpace(*rule.EffectiveTo) < day {
+		return false
+	}
+	return true
+}
+
+// parseRuleScope 解析规则范围 JSON；空数据表示不限制。
+// 参数：raw 为 scope_json；未知字段或非法金额返回错误。
+// 返回值：范围对象或错误。
+func parseRuleScope(raw []byte) (RuleScope, error) {
+	var scope RuleScope
+	if len(strings.TrimSpace(string(raw))) == 0 || strings.TrimSpace(string(raw)) == "null" {
+		return scope, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&scope); err != nil {
+		return RuleScope{}, err
+	}
+	if scope.AmountMinMinor != nil && *scope.AmountMinMinor < 0 {
+		return RuleScope{}, errors.New("alert rule scope amount_min_minor must be non-negative")
+	}
+	if scope.AmountMaxMinor != nil && *scope.AmountMaxMinor < 0 {
+		return RuleScope{}, errors.New("alert rule scope amount_max_minor must be non-negative")
+	}
+	if scope.AmountMinMinor != nil && scope.AmountMaxMinor != nil && *scope.AmountMinMinor > *scope.AmountMaxMinor {
+		return RuleScope{}, errors.New("alert rule scope amount range is inverted")
+	}
+	return scope, nil
+}
+
+// matchesRuleScope 判断合同候选是否满足规则范围。
+// 参数：scope 为规则范围；candidate 为合同候选。
+// 返回值：组织、客户类型、金额均满足时 true。
+func matchesRuleScope(scope RuleScope, candidate ContractExpiryCandidate) bool {
+	if len(scope.OwnerOrgIDs) > 0 && !containsString(scope.OwnerOrgIDs, candidate.OwnerOrgID) {
+		return false
+	}
+	if len(scope.CustomerTypes) > 0 && !containsString(scope.CustomerTypes, candidate.CustomerType) {
+		return false
+	}
+	if len(scope.Currencies) > 0 && !containsString(scope.Currencies, candidate.Currency) {
+		return false
+	}
+	if scope.AmountMinMinor != nil && candidate.AmountMinor < *scope.AmountMinMinor {
+		return false
+	}
+	if scope.AmountMaxMinor != nil && candidate.AmountMinor > *scope.AmountMaxMinor {
+		return false
+	}
+	return true
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 // normalized 补齐零值，使 LifecycleOptions{} 与显式默认值行为一致。
@@ -191,6 +340,7 @@ type Worker struct {
 	location *time.Location
 	// lifecycle 是告警生命周期收敛策略；零值等于现网"只增不关"行为。
 	lifecycle LifecycleOptions
+	notifier  platformnotify.Publisher
 }
 
 func New(store Store) *Worker {
@@ -207,6 +357,11 @@ func New(store Store) *Worker {
 // 返回值：无。
 // 到期窗口的"今天"按该时区换算：否则北京时间 00:00-08:00 期间窗口下界仍停在
 // UTC 的昨天，合同会早一天进入/晚一天退出提醒窗口。
+// SetNotifier 注入平台站内信发布器；nil 表示通知通道未开通。
+func (w *Worker) SetNotifier(notifier platformnotify.Publisher) {
+	w.notifier = notifier
+}
+
 func (w *Worker) SetBusinessLocation(location *time.Location) {
 	if location == nil {
 		location = time.UTC
@@ -273,6 +428,10 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 	processed := 0
 	var runErrors []error
 	for _, rule := range rules {
+		if !ruleEffectiveOn(rule, evaluatedAt) {
+			continue
+		}
+		startedAt := w.now()
 		if w.LicenseCheck != nil {
 			if err := w.LicenseCheck(ctx); err != nil {
 				return processed, err
@@ -285,11 +444,87 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 			if evaluateErr != nil {
 				runErrors = append(runErrors, fmt.Errorf("evaluate rule %s: %w", rule.Code, evaluateErr))
 			}
+			if recordErr := recordExecution(ctx, w.store, rule, count, startedAt, w.now(), evaluateErr); recordErr != nil {
+				runErrors = append(runErrors, fmt.Errorf("record rule %s execution: %w", rule.Code, recordErr))
+			}
+		case RulePaymentOverdue:
+			count, evaluateErr := w.evaluatePaymentOverdue(ctx, rule, evaluatedAt)
+			processed += count
+			if evaluateErr != nil {
+				runErrors = append(runErrors, fmt.Errorf("evaluate rule %s: %w", rule.Code, evaluateErr))
+			}
+			if recordErr := recordExecution(ctx, w.store, rule, count, startedAt, w.now(), evaluateErr); recordErr != nil {
+				runErrors = append(runErrors, fmt.Errorf("record rule %s execution: %w", rule.Code, recordErr))
+			}
 		default:
-			runErrors = append(runErrors, fmt.Errorf("alert rule %s is not supported", rule.Code))
+			evaluateErr := fmt.Errorf("alert rule %s is not supported", rule.Code)
+			runErrors = append(runErrors, evaluateErr)
+			if recordErr := recordExecution(ctx, w.store, rule, 0, startedAt, w.now(), evaluateErr); recordErr != nil {
+				runErrors = append(runErrors, fmt.Errorf("record rule %s execution: %w", rule.Code, recordErr))
+			}
 		}
 	}
 	return processed, errors.Join(runErrors...)
+}
+
+// evaluatePaymentOverdue 评估标准财务应收逾期并幂等写入预警。
+// 口径：open_minor = original_minor - allocated_minor > 0，且到期日 <= 业务今天 - 宽限天数。
+func (w *Worker) evaluatePaymentOverdue(ctx context.Context, rule Rule, evaluatedAt time.Time) (int, error) {
+	days, err := paymentOverdueDays(rule.ThresholdJSON)
+	if err != nil {
+		return 0, err
+	}
+	candidates, err := w.store.FindPaymentOverdueCandidates(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("find payment overdue candidates: %w", err)
+	}
+	scope, err := parseRuleScope(rule.ScopeJSON)
+	if err != nil {
+		return 0, fmt.Errorf("parse payment overdue scope: %w", err)
+	}
+	cutoff := businessDayStart(evaluatedAt).AddDate(0, 0, -days)
+	alerts := make([]Alert, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.OpenMinor <= 0 || candidate.DueDate.IsZero() || candidate.DueDate.After(cutoff) {
+			continue
+		}
+		if !matchesRuleScope(scope, ContractExpiryCandidate{Currency: candidate.Currency, AmountMinor: candidate.OpenMinor}) {
+			continue
+		}
+		title := fmt.Sprintf("应收「%s」已逾期，未清金额 %s %.2f", candidate.ExternalID, candidate.Currency, float64(candidate.OpenMinor)/100)
+		alerts = append(alerts, Alert{
+			ID: stableAlertID(candidate.TenantID, RulePaymentOverdue, candidate.TargetRef), TenantID: candidate.TenantID,
+			AlertType: RulePaymentOverdue, RuleCode: rule.Code, Severity: normalizedSeverity(rule.Severity),
+			TargetRef: candidate.TargetRef, Title: title, DueDate: candidate.DueDate, EvaluatedAt: evaluatedAt,
+		})
+	}
+	if w.LicenseCheck != nil {
+		if err := w.LicenseCheck(ctx); err != nil {
+			return 0, err
+		}
+	}
+	if err := w.store.UpsertAlerts(ctx, alerts); err != nil {
+		return 0, fmt.Errorf("upsert payment overdue alerts: %w", err)
+	}
+	return len(alerts), w.notifyAlerts(ctx, rule, alerts, evaluatedAt)
+}
+
+func paymentOverdueDays(raw []byte) (int, error) {
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return 0, errors.New("PAYMENT_OVERDUE threshold_json is required")
+	}
+	var threshold struct {
+		Days int `json:"days"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&threshold); err != nil {
+		return 0, fmt.Errorf("decode PAYMENT_OVERDUE threshold_json: %w", err)
+	}
+	if threshold.Days < 0 || threshold.Days > maxExpiryDays {
+		return 0, fmt.Errorf("PAYMENT_OVERDUE days must be between 0 and %d", maxExpiryDays)
+	}
+	return threshold.Days, nil
 }
 
 // evaluateContractExpiry 评估合同到期告警并在每个业务写入边界复核许可。
@@ -306,8 +541,15 @@ func (w *Worker) evaluateContractExpiry(ctx context.Context, rule Rule, evaluate
 	if err != nil {
 		return 0, fmt.Errorf("find contract expiry candidates: %w", err)
 	}
+	scope, err := parseRuleScope(rule.ScopeJSON)
+	if err != nil {
+		return 0, fmt.Errorf("parse contract expiry scope: %w", err)
+	}
 	alerts := make([]Alert, 0, len(candidates))
 	for _, candidate := range candidates {
+		if !matchesRuleScope(scope, candidate) {
+			continue
+		}
 		alerts = append(alerts, Alert{
 			ID:          stableAlertID(candidate.TenantID, RuleContractExpiry, candidate.TargetRef),
 			TenantID:    candidate.TenantID,
@@ -329,9 +571,10 @@ func (w *Worker) evaluateContractExpiry(ctx context.Context, rule Rule, evaluate
 	if err := w.store.UpsertAlerts(ctx, alerts); err != nil {
 		return 0, fmt.Errorf("upsert contract expiry alerts: %w", err)
 	}
+	notifyErr := w.notifyAlerts(ctx, rule, alerts, evaluatedAt)
 	lifecycle := w.lifecycle.normalized()
 	if !lifecycle.AutoResolve {
-		return len(alerts), nil
+		return len(alerts), notifyErr
 	}
 	// 收敛必须在幂等写入之后执行，否则本轮命中的告警可能被误判为未命中。
 	// 安全阀以"写入后仍未关闭的告警基数"为分母：本轮算出的命中集合为 0，或明显
@@ -339,7 +582,7 @@ func (w *Worker) evaluateContractExpiry(ctx context.Context, rule Rule, evaluate
 	// 表现为命中集合骤降，此时批量 CLOSED 会掩盖真实数据问题。
 	activeCount, err := w.store.CountActiveAlerts(ctx, rule.Code)
 	if err != nil {
-		return 0, fmt.Errorf("count active contract expiry alerts: %w", err)
+		return 0, errors.Join(notifyErr, fmt.Errorf("count active contract expiry alerts: %w", err))
 	}
 	if guarded, reason := closeGuarded(len(alerts), activeCount, lifecycle.CloseGuardRatio); guarded {
 		if activeCount > 0 {
@@ -402,6 +645,63 @@ func normalizedSeverity(severity string) string {
 	default:
 		return "MEDIUM"
 	}
+}
+
+func recordExecution(ctx context.Context, store Store, rule Rule, matched int, startedAt, finishedAt time.Time, evaluateErr error) error {
+	status := "SUCCEEDED"
+	errorMessage := ""
+	if evaluateErr != nil {
+		status = "FAILED"
+		errorMessage = evaluateErr.Error()
+	}
+	return store.RecordRuleExecution(ctx, rule, status, matched, startedAt, finishedAt, errorMessage)
+}
+
+// notifyAlerts 把本轮预警投递到平台站内信；未配置通知凭据时直接跳过。
+// 收件人暂为规则维护者；通知对象/静默/升级将在后续配置中覆盖。
+func (w *Worker) notifyAlerts(ctx context.Context, rule Rule, alerts []Alert, evaluatedAt time.Time) error {
+	if w.notifier == nil || len(alerts) == 0 {
+		return nil
+	}
+	config, err := parseNotificationConfig(rule.NotificationJSON)
+	if err != nil {
+		return fmt.Errorf("parse notification config: %w", err)
+	}
+	if !config.Enabled {
+		return nil
+	}
+	recipients := config.Recipients
+	if len(recipients) == 0 && strings.TrimSpace(rule.UpdatedBy) != "" {
+		recipients = []string{rule.UpdatedBy}
+	}
+	if len(recipients) == 0 {
+		return nil
+	}
+	var errs []error
+	for _, alert := range alerts {
+		targetRecipients := recipients
+		priority := alert.Severity
+		escalated := false
+		if config.EscalationAfterMinutes > 0 && len(config.EscalationRecipients) > 0 && !alert.DueDate.IsZero() {
+			if evaluatedAt.Sub(alert.DueDate) >= time.Duration(config.EscalationAfterMinutes)*time.Minute {
+				targetRecipients = config.EscalationRecipients
+				priority = "HIGH"
+				escalated = true
+			}
+		}
+		if !escalated && inQuietHours(evaluatedAt, config.QuietStart, config.QuietEnd) {
+			continue
+		}
+		if err := w.notifier.Publish(ctx, platformnotify.Event{
+			EventID: alert.ID, EventType: "DATA_ANALYSIS_ALERT", Scope: "CROSS_SYSTEM",
+			Priority: priority, Title: alert.Title, Content: alert.Title,
+			ReferenceType: "ALERT", ReferenceID: alert.ID, Recipients: targetRecipients,
+			OccurredAt: evaluatedAt, IdempotencyKey: alert.ID,
+		}); err != nil {
+			errs = append(errs, fmt.Errorf("publish alert %s notification: %w", alert.ID, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func stableAlertID(tenantID, alertType, targetRef string) string {

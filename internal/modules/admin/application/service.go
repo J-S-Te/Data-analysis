@@ -43,6 +43,9 @@ type Repository interface {
 	ListAlertRules(context.Context, string) ([]domain.AlertRule, error)
 	ReplaceAlertRules(context.Context, string, []domain.AlertRule) error
 	DeleteAlertRule(context.Context, string, string) error
+	PreviewContractExpiry(context.Context, string, int, domain.AlertRuleScope, time.Time, int) (domain.AlertPreviewResult, error)
+	AlertRuleScopeOptions(context.Context, string) (domain.AlertRuleScopeOptions, error)
+	LatestAlertRuleExecutions(context.Context, string) ([]domain.AlertRuleExecution, error)
 }
 
 // TriggerAllSources 为当前租户一次性排入全部启用数据源，并跳过已有活动任务。
@@ -78,16 +81,70 @@ func (service *Service) DeleteAlertRule(ctx context.Context, tenantID, ruleID st
 	return service.repository.DeleteAlertRule(ctx, tenantID, ruleID)
 }
 
+// LatestAlertRuleExecutions 返回每个规则最近一次执行记录。
+// 参数：ctx 为上下文；tenantID 为可信租户。
+// 返回值：按规则 ID 去重后的执行结果；读取失败返回错误。
+func (service *Service) LatestAlertRuleExecutions(ctx context.Context, tenantID string) ([]domain.AlertRuleExecution, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return nil, ErrRulePayloadInvalid
+	}
+	return service.repository.LatestAlertRuleExecutions(ctx, tenantID)
+}
+
+// AlertRuleScopeOptions 读取当前租户可用于规则范围的聚合维度值。
+// 参数：ctx 为上下文；tenantID 为可信租户。
+// 返回值：组织、客户类型、币种去重列表；读取失败返回错误。
+func (service *Service) AlertRuleScopeOptions(ctx context.Context, tenantID string) (domain.AlertRuleScopeOptions, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return domain.AlertRuleScopeOptions{}, ErrRulePayloadInvalid
+	}
+	return service.repository.AlertRuleScopeOptions(ctx, tenantID)
+}
+
+// PreviewAlertRule 计算合同到期规则当前会命中的合同数量和样例，不写入任何状态。
+// 参数：tenantID 为可信租户；days 为到期前后窗口；scopeJSON 为可选范围。
+// 返回值：命中数量、最多 20 条样例和是否被截断；非法参数或读取失败返回错误。
+func (service *Service) PreviewAlertRule(ctx context.Context, tenantID string, days int, scopeJSON *string) (domain.AlertPreviewResult, error) {
+	if strings.TrimSpace(tenantID) == "" || days < 1 || days > 3650 {
+		return domain.AlertPreviewResult{}, ErrRulePayloadInvalid
+	}
+	rule := domain.AlertRule{ScopeJSON: scopeJSON}
+	if err := normalizeAlertRuleScope(&rule); err != nil {
+		return domain.AlertPreviewResult{}, ErrRulePayloadInvalid
+	}
+	var scope domain.AlertRuleScope
+	if rule.ScopeJSON != nil {
+		if err := json.Unmarshal([]byte(*rule.ScopeJSON), &scope); err != nil {
+			return domain.AlertPreviewResult{}, ErrRulePayloadInvalid
+		}
+	}
+	location := service.location
+	if location == nil {
+		location = time.UTC
+	}
+	return service.repository.PreviewContractExpiry(ctx, tenantID, days, scope, service.now().In(location), 20)
+}
+
 // Service 协调数据源入队和预警规则替换用例。
 type Service struct {
 	repository Repository
+	location   *time.Location
 	now        func() time.Time
 	newID      func() string
 }
 
-// NewService 构造生产环境使用的管理应用服务。
+// NewService 构造生产环境使用的管理应用服务；默认 UTC，由启动方注入业务时区。
 func NewService(repository Repository) *Service {
-	return &Service{repository: repository, now: func() time.Time { return time.Now().UTC() }, newID: generateID}
+	return &Service{repository: repository, location: time.UTC, now: func() time.Time { return time.Now().UTC() }, newID: generateID}
+}
+
+// SetBusinessLocation 注入预警预览和规则执行使用的业务时区。
+// 参数：location 为 IANA 时区；nil 保持 UTC。
+// 返回值：无。
+func (service *Service) SetBusinessLocation(location *time.Location) {
+	if location != nil {
+		service.location = location
+	}
 }
 
 // ListSources 返回当前配置的数据源及其最近同步状态。
@@ -145,6 +202,12 @@ func (service *Service) ReplaceAlertRules(ctx context.Context, tenantID, actorID
 		if !validAlertRule(rule) {
 			return nil, ErrRulePayloadInvalid
 		}
+		if err := normalizeAlertRuleScope(&rule); err != nil {
+			return nil, ErrRulePayloadInvalid
+		}
+		if err := normalizeAlertRuleNotification(&rule); err != nil {
+			return nil, ErrRulePayloadInvalid
+		}
 		if rule.Version < 0 || (rule.ID == "" && rule.Version != 0) || (rule.ID != "" && (len(rule.ID) != 26 || rule.Version < 1)) {
 			return nil, ErrRulePayloadInvalid
 		}
@@ -183,8 +246,186 @@ func (service *Service) ReplaceAlertRules(ctx context.Context, tenantID, actorID
 	return saved, nil
 }
 
+// normalizeAlertRuleScope 校验并规范化规则范围 JSON 与生效日期。
+// 参数：rule 为待保存规则；空 scope/日期表示不限制。
+// 返回值：非法 JSON、负数金额、范围倒置或非法日期返回错误。
+func normalizeAlertRuleScope(rule *domain.AlertRule) error {
+	if rule == nil {
+		return ErrRulePayloadInvalid
+	}
+	if rule.ScopeJSON != nil {
+		raw := strings.TrimSpace(*rule.ScopeJSON)
+		if raw == "" || raw == "null" {
+			rule.ScopeJSON = nil
+		} else {
+			decoder := json.NewDecoder(strings.NewReader(raw))
+			decoder.DisallowUnknownFields()
+			var scope domain.AlertRuleScope
+			if err := decoder.Decode(&scope); err != nil {
+				return ErrRulePayloadInvalid
+			}
+			scope.OwnerOrgIDs = normalizeStringList(scope.OwnerOrgIDs, 100, 64)
+			scope.CustomerTypes = normalizeStringList(scope.CustomerTypes, 100, 64)
+			scope.Currencies = normalizeCurrencyList(scope.Currencies)
+			if scope.AmountMinMinor != nil && *scope.AmountMinMinor < 0 {
+				return ErrRulePayloadInvalid
+			}
+			if scope.AmountMaxMinor != nil && *scope.AmountMaxMinor < 0 {
+				return ErrRulePayloadInvalid
+			}
+			if scope.AmountMinMinor != nil && scope.AmountMaxMinor != nil && *scope.AmountMinMinor > *scope.AmountMaxMinor {
+				return ErrRulePayloadInvalid
+			}
+			if len(scope.OwnerOrgIDs) == 0 && len(scope.CustomerTypes) == 0 && len(scope.Currencies) == 0 && scope.AmountMinMinor == nil && scope.AmountMaxMinor == nil {
+				rule.ScopeJSON = nil
+			} else {
+				encoded, err := json.Marshal(scope)
+				if err != nil {
+					return ErrRulePayloadInvalid
+				}
+				normalized := string(encoded)
+				rule.ScopeJSON = &normalized
+			}
+		}
+	}
+	if rule.EffectiveFrom != nil {
+		value := strings.TrimSpace(*rule.EffectiveFrom)
+		if value == "" {
+			rule.EffectiveFrom = nil
+		} else if _, err := time.Parse("2006-01-02", value); err != nil {
+			return ErrRulePayloadInvalid
+		} else {
+			rule.EffectiveFrom = &value
+		}
+	}
+	if rule.EffectiveTo != nil {
+		value := strings.TrimSpace(*rule.EffectiveTo)
+		if value == "" {
+			rule.EffectiveTo = nil
+		} else if _, err := time.Parse("2006-01-02", value); err != nil {
+			return ErrRulePayloadInvalid
+		} else {
+			rule.EffectiveTo = &value
+		}
+	}
+	if rule.EffectiveFrom != nil && rule.EffectiveTo != nil && *rule.EffectiveFrom > *rule.EffectiveTo {
+		return ErrRulePayloadInvalid
+	}
+	return nil
+}
+
+// normalizeAlertRuleNotification 校验并规范化通知对象、静默时段和到期升级配置。
+func normalizeAlertRuleNotification(rule *domain.AlertRule) error {
+	if rule == nil {
+		return ErrRulePayloadInvalid
+	}
+	if rule.NotificationJSON == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(*rule.NotificationJSON)
+	if raw == "" || raw == "null" {
+		rule.NotificationJSON = nil
+		return nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var notification domain.AlertRuleNotification
+	if err := decoder.Decode(&notification); err != nil {
+		return ErrRulePayloadInvalid
+	}
+	notification.Recipients = normalizeStringList(notification.Recipients, 50, 64)
+	notification.EscalationRecipients = normalizeStringList(notification.EscalationRecipients, 50, 64)
+	notification.QuietStart = strings.TrimSpace(notification.QuietStart)
+	notification.QuietEnd = strings.TrimSpace(notification.QuietEnd)
+	if (notification.QuietStart == "") != (notification.QuietEnd == "") {
+		return ErrRulePayloadInvalid
+	}
+	for _, value := range []string{notification.QuietStart, notification.QuietEnd} {
+		if value == "" {
+			continue
+		}
+		if _, err := time.Parse("15:04", value); err != nil {
+			return ErrRulePayloadInvalid
+		}
+	}
+	if notification.EscalationAfterMinutes < 0 || notification.EscalationAfterMinutes > 10080 {
+		return ErrRulePayloadInvalid
+	}
+	if notification.EscalationAfterMinutes > 0 && len(notification.EscalationRecipients) == 0 {
+		return ErrRulePayloadInvalid
+	}
+	if notification.Enabled && len(notification.Recipients) == 0 {
+		return ErrRulePayloadInvalid
+	}
+	if !notification.Enabled && len(notification.Recipients) == 0 && notification.QuietStart == "" && notification.EscalationAfterMinutes == 0 {
+		rule.NotificationJSON = nil
+		return nil
+	}
+	encoded, err := json.Marshal(notification)
+	if err != nil {
+		return ErrRulePayloadInvalid
+	}
+	normalized := string(encoded)
+	rule.NotificationJSON = &normalized
+	return nil
+}
+
+func normalizeCurrencyList(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.ToUpper(strings.TrimSpace(raw))
+		if len(value) != 3 {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func normalizeStringList(values []string, maxItems, maxLen int) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" || len([]rune(value)) > maxLen {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+		if len(result) >= maxItems {
+			break
+		}
+	}
+	return result
+}
+
 func validAlertRule(rule domain.AlertRule) bool {
-	if rule.RuleCode != "CONTRACT_EXPIRY" || rule.SourceFCT != "dim_contract" || rule.Name == "" || len([]rune(rule.Name)) > 128 {
+	if rule.Name == "" || len([]rune(rule.Name)) > 128 {
+		return false
+	}
+	minDays := 1
+	switch rule.RuleCode {
+	case "CONTRACT_EXPIRY":
+		if rule.SourceFCT != "dim_contract" {
+			return false
+		}
+	case "PAYMENT_OVERDUE":
+		if rule.SourceFCT != "standard_finance_fact" {
+			return false
+		}
+		minDays = 0
+	default:
 		return false
 	}
 	if rule.Severity != "LOW" && rule.Severity != "MEDIUM" && rule.Severity != "HIGH" {
@@ -198,7 +439,7 @@ func validAlertRule(rule domain.AlertRule) bool {
 	var threshold struct {
 		Days int `json:"days"`
 	}
-	if err := decoder.Decode(&threshold); err != nil || threshold.Days < 1 || threshold.Days > 3650 {
+	if err := decoder.Decode(&threshold); err != nil || threshold.Days < minDays || threshold.Days > 3650 {
 		return false
 	}
 	return decoder.Decode(&struct{}{}) == io.EOF

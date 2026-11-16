@@ -2,7 +2,11 @@ package alertworker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -12,9 +16,15 @@ import (
 )
 
 type gormRule struct {
-	RuleCode      string `gorm:"column:rule_code"`
-	Severity      string `gorm:"column:severity"`
-	ThresholdJSON []byte `gorm:"column:threshold_json"`
+	ID               string  `gorm:"column:id"`
+	RuleCode         string  `gorm:"column:rule_code"`
+	Severity         string  `gorm:"column:severity"`
+	ThresholdJSON    []byte  `gorm:"column:threshold_json"`
+	ScopeJSON        []byte  `gorm:"column:scope_json"`
+	EffectiveFrom    *string `gorm:"column:effective_from"`
+	EffectiveTo      *string `gorm:"column:effective_to"`
+	NotificationJSON []byte  `gorm:"column:notification_json"`
+	UpdatedBy        *string `gorm:"column:updated_by"`
 }
 
 // GormStore 使用版本化迁移创建的 alert_rule、alert_item 和 dim_contract 表。
@@ -35,7 +45,7 @@ func (s *GormStore) ListEnabledRules(ctx context.Context) ([]Rule, error) {
 	var rows []gormRule
 	if err := s.db.WithContext(ctx).
 		Table("alert_rule").
-		Select("rule_code, severity, threshold_json").
+		Select("id, rule_code, severity, threshold_json, scope_json, notification_json, effective_from, effective_to, updated_by").
 		Where("tenant_id = ? AND enabled = ?", s.tenantID, true).
 		Order("rule_code").
 		Find(&rows).Error; err != nil {
@@ -44,12 +54,25 @@ func (s *GormStore) ListEnabledRules(ctx context.Context) ([]Rule, error) {
 	rules := make([]Rule, 0, len(rows))
 	for _, row := range rows {
 		rules = append(rules, Rule{
-			Code:          row.RuleCode,
-			Severity:      row.Severity,
-			ThresholdJSON: row.ThresholdJSON,
+			ID:               row.ID,
+			Code:             row.RuleCode,
+			Severity:         row.Severity,
+			ThresholdJSON:    row.ThresholdJSON,
+			ScopeJSON:        row.ScopeJSON,
+			EffectiveFrom:    row.EffectiveFrom,
+			EffectiveTo:      row.EffectiveTo,
+			NotificationJSON: row.NotificationJSON,
+			UpdatedBy:        derefString(row.UpdatedBy),
 		})
 	}
 	return rules, nil
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
 }
 
 func (s *GormStore) validateTenant() error {
@@ -79,18 +102,21 @@ func (s *GormStore) FindContractExpiryCandidates(
 	}
 	var candidates []ContractExpiryCandidate
 	err := s.db.WithContext(ctx).
-		Table("dim_contract").Where("origin_kind = 'NORMAL'").
-		Select(`tenant_id, owner_org_id, contract_id AS target_ref,
-CONCAT('合同「', title, '」将在 ', DATE_FORMAT(end_date, '%Y-%m-%d'), ' 到期') AS title,
-end_date AS due_date,
-(end_date >= DATE(?) AND end_date <= DATE_ADD(DATE(?), INTERVAL ? DAY)) AS in_window`,
+		Table("dim_contract AS c").
+		Joins("LEFT JOIN dim_customer AS dc ON dc.tenant_id = c.tenant_id AND dc.customer_id = c.crm_customer_id").
+		Where("c.origin_kind = 'NORMAL'").
+		Select(`c.tenant_id, c.owner_org_id, c.contract_id AS target_ref,
+CONCAT('合同「', c.title, '」将在 ', DATE_FORMAT(c.end_date, '%Y-%m-%d'), ' 到期') AS title,
+c.end_date AS due_date,
+COALESCE(dc.customer_type, '') AS customer_type, c.currency, c.amount_minor,
+(c.end_date >= DATE(?) AND c.end_date <= DATE_ADD(DATE(?), INTERVAL ? DAY)) AS in_window`,
 			evaluatedAt, evaluatedAt, days).
-		Where("end_date IS NOT NULL").
-		Where("tenant_id = ?", s.tenantID).
-		Where("end_date >= DATE_SUB(DATE(?), INTERVAL ? DAY)", evaluatedAt, days).
-		Where("end_date <= DATE_ADD(DATE(?), INTERVAL ? DAY)", evaluatedAt, days).
-		Where("status NOT IN ?", []string{"COMPLETED", "ARCHIVED", "TERMINATED"}).
-		Order("tenant_id, end_date, contract_id").
+		Where("c.end_date IS NOT NULL").
+		Where("c.tenant_id = ?", s.tenantID).
+		Where("c.end_date >= DATE_SUB(DATE(?), INTERVAL ? DAY)", evaluatedAt, days).
+		Where("c.end_date <= DATE_ADD(DATE(?), INTERVAL ? DAY)", evaluatedAt, days).
+		Where("c.status NOT IN ?", []string{"COMPLETED", "ARCHIVED", "TERMINATED"}).
+		Order("c.tenant_id, c.end_date, c.contract_id").
 		Find(&candidates).Error
 	if err != nil {
 		return nil, err
@@ -99,6 +125,79 @@ end_date AS due_date,
 		if candidate.TenantID != s.tenantID {
 			return nil, errors.New("contract expiry candidate tenant does not match worker tenant")
 		}
+	}
+	return candidates, nil
+}
+
+// RecordRuleExecution 写入一次规则执行结果，供规则中心展示最近执行/命中数。
+// 参数：rule 为已评估规则；status 为 SUCCEEDED/FAILED；matched 为命中数。
+// 返回值：写入失败返回错误；不写 alert_item。
+func (s *GormStore) RecordRuleExecution(ctx context.Context, rule Rule, status string, matched int, startedAt, finishedAt time.Time, errorMessage string) error {
+	if err := s.validateTenant(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(rule.ID) == "" {
+		return errors.New("alert rule execution requires rule id")
+	}
+	if status != "SUCCEEDED" && status != "FAILED" {
+		return errors.New("alert rule execution status must be SUCCEEDED or FAILED")
+	}
+	if len(errorMessage) > 1024 {
+		errorMessage = errorMessage[:1024]
+	}
+	sum := sha256.Sum256([]byte(s.tenantID + "\x00" + rule.ID + "\x00" + startedAt.UTC().Format(time.RFC3339Nano)))
+	id := strings.ToUpper(hex.EncodeToString(sum[:]))[:26]
+	err := s.db.WithContext(ctx).Exec(
+		`INSERT INTO alert_rule_execution (id, tenant_id, rule_id, rule_version, status, matched_count, error_message, started_at, finished_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, s.tenantID, rule.ID, 0, status, matched, errorMessage, startedAt.UTC(), finishedAt.UTC(),
+	).Error
+	return err
+}
+
+// FindPaymentOverdueCandidates 读取标准财务当前发布批次中的应收事实。
+// 参数：ctx 为上下文；返回值：未清金额、到期日和币种；JSON 损坏时返回错误。
+func (s *GormStore) FindPaymentOverdueCandidates(ctx context.Context) ([]PaymentOverdueCandidate, error) {
+	if err := s.validateTenant(); err != nil {
+		return nil, err
+	}
+	var rows []struct {
+		ExternalID  string
+		PayloadJSON []byte
+	}
+	err := s.db.WithContext(ctx).
+		Table("standard_finance_fact AS f").
+		Joins("JOIN standard_finance_source AS s ON s.tenant_id = f.tenant_id AND s.source_code = f.source_code AND s.batch_id = f.batch_id").
+		Select("f.external_id, f.payload_json").
+		Where("f.tenant_id = ? AND f.source_code = 'standard-finance' AND f.fact_type = 'receivable'", s.tenantID).
+		Order("f.external_id").Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	candidates := make([]PaymentOverdueCandidate, 0, len(rows))
+	for _, row := range rows {
+		var payload struct {
+			ExternalID     string `json:"external_id"`
+			Currency       string `json:"currency"`
+			OriginalMinor  int64  `json:"original_minor"`
+			AllocatedMinor int64  `json:"allocated_minor"`
+			DueDate        string `json:"due_date"`
+		}
+		if err := json.Unmarshal(row.PayloadJSON, &payload); err != nil {
+			return nil, fmt.Errorf("decode receivable %s: %w", row.ExternalID, err)
+		}
+		dueDate, err := time.Parse("2006-01-02", payload.DueDate)
+		if err != nil {
+			return nil, fmt.Errorf("decode receivable %s due date: %w", row.ExternalID, err)
+		}
+		target := strings.TrimSpace(payload.ExternalID)
+		if target == "" {
+			target = row.ExternalID
+		}
+		candidates = append(candidates, PaymentOverdueCandidate{
+			TenantID: s.tenantID, TargetRef: "receivable:" + target, ExternalID: target,
+			Currency: payload.Currency, OpenMinor: payload.OriginalMinor - payload.AllocatedMinor, DueDate: dueDate,
+		})
 	}
 	return candidates, nil
 }

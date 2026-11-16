@@ -225,6 +225,10 @@ func (s *biAlertStore) FindContractExpiryCandidates(context.Context, time.Time, 
 	}
 	return []alertworker.ContractExpiryCandidate{{TenantID: "tenant-1", TargetRef: "contract-1", DueDate: s.expiry}}, nil
 }
+func (s *biAlertStore) FindPaymentOverdueCandidates(context.Context) ([]alertworker.PaymentOverdueCandidate, error) {
+	return nil, nil
+}
+
 func (s *biAlertStore) UpsertAlerts(context.Context, []alertworker.Alert) error {
 	s.writes++
 	return nil
@@ -233,6 +237,9 @@ func (s *biAlertStore) UpsertAlerts(context.Context, []alertworker.Alert) error 
 // CountActiveAlerts 供安全阀使用；该假实现只用于授权门禁测试，AutoResolve 默认关闭不会走到此处。
 func (s *biAlertStore) CountActiveAlerts(context.Context, string) (int64, error) {
 	return 0, nil
+}
+func (s *biAlertStore) RecordRuleExecution(context.Context, alertworker.Rule, string, int, time.Time, time.Time, string) error {
+	return nil
 }
 
 // ReconcileAlerts 保持默认关闭的生命周期策略不触发收敛；该假实现只用于授权门禁测试。

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/unified-identity-auth-platform/data-analysis/internal/alertworker"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/auditoutbox"
 	"strings"
 	"time"
@@ -62,31 +63,37 @@ type syncJobRecord struct {
 func (syncJobRecord) TableName() string { return "sync_job" }
 
 type alertRuleRecord struct {
-	Version       int64     `gorm:"column:version;->"`
-	TenantID      string    `gorm:"column:tenant_id"`
-	ID            string    `gorm:"column:id;primaryKey"`
-	RuleCode      string    `gorm:"column:rule_code"`
-	Name          string    `gorm:"column:name"`
-	SourceFCT     string    `gorm:"column:source_fct"`
-	Severity      string    `gorm:"column:severity"`
-	Enabled       bool      `gorm:"column:enabled"`
-	ThresholdJSON *string   `gorm:"column:threshold_json"`
-	UpdatedBy     *string   `gorm:"column:updated_by"`
-	CreatedAt     time.Time `gorm:"column:created_at"`
-	UpdatedAt     time.Time `gorm:"column:updated_at"`
+	Version          int64     `gorm:"column:version;->"`
+	TenantID         string    `gorm:"column:tenant_id"`
+	ID               string    `gorm:"column:id;primaryKey"`
+	RuleCode         string    `gorm:"column:rule_code"`
+	Name             string    `gorm:"column:name"`
+	SourceFCT        string    `gorm:"column:source_fct"`
+	Severity         string    `gorm:"column:severity"`
+	Enabled          bool      `gorm:"column:enabled"`
+	ThresholdJSON    *string   `gorm:"column:threshold_json"`
+	ScopeJSON        *string   `gorm:"column:scope_json"`
+	NotificationJSON *string   `gorm:"column:notification_json"`
+	EffectiveFrom    *string   `gorm:"column:effective_from"`
+	EffectiveTo      *string   `gorm:"column:effective_to"`
+	UpdatedBy        *string   `gorm:"column:updated_by"`
+	CreatedAt        time.Time `gorm:"column:created_at"`
+	UpdatedAt        time.Time `gorm:"column:updated_at"`
 }
 
 func (alertRuleRecord) TableName() string { return "alert_rule" }
 
 func (record alertRuleRecord) toDomain() domain.AlertRule {
 	return domain.AlertRule{TenantID: record.TenantID, ID: record.ID, RuleCode: record.RuleCode, Name: record.Name, SourceFCT: record.SourceFCT,
-		Severity: record.Severity, Enabled: record.Enabled, ThresholdJSON: record.ThresholdJSON, UpdatedBy: record.UpdatedBy,
+		Severity: record.Severity, Enabled: record.Enabled, ThresholdJSON: record.ThresholdJSON, ScopeJSON: record.ScopeJSON, NotificationJSON: record.NotificationJSON,
+		EffectiveFrom: record.EffectiveFrom, EffectiveTo: record.EffectiveTo, UpdatedBy: record.UpdatedBy,
 		CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, Version: record.Version}
 }
 
 func alertRuleRecordFromDomain(rule domain.AlertRule) alertRuleRecord {
 	return alertRuleRecord{TenantID: rule.TenantID, ID: rule.ID, RuleCode: rule.RuleCode, Name: rule.Name, SourceFCT: rule.SourceFCT,
-		Severity: rule.Severity, Enabled: rule.Enabled, ThresholdJSON: rule.ThresholdJSON, UpdatedBy: rule.UpdatedBy,
+		Severity: rule.Severity, Enabled: rule.Enabled, ThresholdJSON: rule.ThresholdJSON, ScopeJSON: rule.ScopeJSON, NotificationJSON: rule.NotificationJSON,
+		EffectiveFrom: rule.EffectiveFrom, EffectiveTo: rule.EffectiveTo, UpdatedBy: rule.UpdatedBy,
 		CreatedAt: rule.CreatedAt, UpdatedAt: rule.UpdatedAt}
 }
 
@@ -203,7 +210,7 @@ func (repository *GORMRepository) ReplaceAlertRules(ctx context.Context, tenantI
 			record := alertRuleRecordFromDomain(rule)
 			if found {
 				if err := tx.Model(&alertRuleRecord{}).Where("tenant_id = ? AND id = ?", tenantID, rule.ID).
-					Updates(map[string]any{"name": record.Name, "source_fct": record.SourceFCT, "severity": record.Severity, "enabled": record.Enabled, "threshold_json": record.ThresholdJSON, "updated_by": record.UpdatedBy, "updated_at": record.UpdatedAt}).Error; err != nil {
+					Updates(map[string]any{"name": record.Name, "source_fct": record.SourceFCT, "severity": record.Severity, "enabled": record.Enabled, "threshold_json": record.ThresholdJSON, "scope_json": record.ScopeJSON, "notification_json": record.NotificationJSON, "effective_from": record.EffectiveFrom, "effective_to": record.EffectiveTo, "updated_by": record.UpdatedBy, "updated_at": record.UpdatedAt}).Error; err != nil {
 					return err
 				}
 			} else if err := tx.Create(&record).Error; err != nil {
@@ -233,6 +240,102 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		}
 		return nil
 	})
+}
+
+// LatestAlertRuleExecutions 返回每个规则最近一次执行记录。
+// 参数：ctx 为上下文；tenantID 为可信租户。
+// 返回值：按 started_at 倒序读取后每个 rule_id 取第一条；读取失败返回错误。
+func (repository *GORMRepository) LatestAlertRuleExecutions(ctx context.Context, tenantID string) ([]domain.AlertRuleExecution, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return nil, application.ErrRulePayloadInvalid
+	}
+	var rows []domain.AlertRuleExecution
+	if err := repository.db.WithContext(ctx).Table("alert_rule_execution").
+		Where("tenant_id = ?", tenantID).
+		Order("started_at DESC").Limit(1000).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(rows))
+	latest := make([]domain.AlertRuleExecution, 0, len(rows))
+	for _, row := range rows {
+		if _, exists := seen[row.RuleID]; exists {
+			continue
+		}
+		seen[row.RuleID] = struct{}{}
+		latest = append(latest, row)
+	}
+	return latest, nil
+}
+
+// AlertRuleScopeOptions 读取当前租户合同/客户维度的去重范围选项。
+// 参数：ctx 为上下文；tenantID 为可信租户。
+// 返回值：组织、客户类型、币种列表；读取失败返回错误。
+func (repository *GORMRepository) AlertRuleScopeOptions(ctx context.Context, tenantID string) (domain.AlertRuleScopeOptions, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return domain.AlertRuleScopeOptions{}, application.ErrRulePayloadInvalid
+	}
+	options := domain.AlertRuleScopeOptions{
+		OwnerOrgIDs: make([]string, 0), CustomerTypes: make([]string, 0), Currencies: make([]string, 0), Users: make([]domain.AlertRecipientOption, 0),
+	}
+	var orgs []string
+	if err := repository.db.WithContext(ctx).Table("dim_contract").
+		Distinct("owner_org_id").
+		Where("tenant_id = ? AND origin_kind = 'NORMAL' AND owner_org_id <> ''", tenantID).
+		Order("owner_org_id").Pluck("owner_org_id", &orgs).Error; err != nil {
+		return domain.AlertRuleScopeOptions{}, err
+	}
+	var types []string
+	if err := repository.db.WithContext(ctx).Table("dim_customer").
+		Distinct("customer_type").
+		Where("tenant_id = ? AND customer_type <> ''", tenantID).
+		Order("customer_type").Pluck("customer_type", &types).Error; err != nil {
+		return domain.AlertRuleScopeOptions{}, err
+	}
+	var currencies []string
+	if err := repository.db.WithContext(ctx).Table("dim_contract").
+		Distinct("currency").
+		Where("tenant_id = ? AND origin_kind = 'NORMAL' AND currency <> ''", tenantID).
+		Order("currency").Pluck("currency", &currencies).Error; err != nil {
+		return domain.AlertRuleScopeOptions{}, err
+	}
+	if err := repository.db.WithContext(ctx).Table("dim_org_user_snapshot").
+		Select("user_id, MAX(display_name) AS display_name, MAX(org_unit_name) AS org_unit_name").
+		Where("tenant_id = ?", tenantID).
+		Group("user_id").Order("user_id").Limit(500).Scan(&options.Users).Error; err != nil {
+		return domain.AlertRuleScopeOptions{}, err
+	}
+	options.OwnerOrgIDs = orgs
+	options.CustomerTypes = types
+	options.Currencies = currencies
+	return options, nil
+}
+
+// PreviewContractExpiry 只读计算合同到期规则命中数量与样例，不写预警项。
+// 参数：tenantID 为可信租户；days 为到期前后窗口；scope 为可选范围；
+//
+//	evaluatedAt 为窗口基准日；limit 为样例上限（最多 20）。
+//
+// 返回值：命中数量、样例和截断标记；查询失败返回错误。
+func (repository *GORMRepository) PreviewContractExpiry(ctx context.Context, tenantID string, days int, scope domain.AlertRuleScope, evaluatedAt time.Time, limit int) (domain.AlertPreviewResult, error) {
+	if strings.TrimSpace(tenantID) == "" || days < 1 || days > 3650 {
+		return domain.AlertPreviewResult{}, application.ErrRulePayloadInvalid
+	}
+	count, candidates, err := alertworker.PreviewContractExpiry(ctx, repository.db, tenantID, evaluatedAt, days, alertworker.RuleScope{
+		OwnerOrgIDs: scope.OwnerOrgIDs, CustomerTypes: scope.CustomerTypes, Currencies: scope.Currencies,
+		AmountMinMinor: scope.AmountMinMinor, AmountMaxMinor: scope.AmountMaxMinor,
+	}, limit)
+	if err != nil {
+		return domain.AlertPreviewResult{}, err
+	}
+	items := make([]domain.AlertPreviewItem, 0, len(candidates))
+	for _, candidate := range candidates {
+		items = append(items, domain.AlertPreviewItem{
+			ContractID: candidate.TargetRef, Title: candidate.Title, OwnerOrgID: candidate.OwnerOrgID,
+			CustomerType: candidate.CustomerType, Currency: candidate.Currency,
+			AmountMinor: candidate.AmountMinor, DueDate: candidate.DueDate.Format("2006-01-02"),
+		})
+	}
+	return domain.AlertPreviewResult{MatchedCount: count, Sample: items, Limited: count > int64(len(items))}, nil
 }
 
 // DeleteAlertRule 删除无历史告警的租户规则；已有历史告警时返回保护错误。
