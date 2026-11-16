@@ -275,7 +275,8 @@ func (repository *GORMRepository) AlertRuleScopeOptions(ctx context.Context, ten
 		return domain.AlertRuleScopeOptions{}, application.ErrRulePayloadInvalid
 	}
 	options := domain.AlertRuleScopeOptions{
-		OwnerOrgIDs: make([]string, 0), CustomerTypes: make([]string, 0), Currencies: make([]string, 0), Users: make([]domain.AlertRecipientOption, 0),
+		OwnerOrgIDs: make([]string, 0), CustomerTypes: make([]string, 0), Currencies: make([]string, 0),
+		Organizations: make([]domain.AlertOrgOption, 0), Users: make([]domain.AlertRecipientOption, 0),
 	}
 	var orgs []string
 	if err := repository.db.WithContext(ctx).Table("dim_contract").
@@ -303,6 +304,24 @@ func (repository *GORMRepository) AlertRuleScopeOptions(ctx context.Context, ten
 		Where("tenant_id = ?", tenantID).
 		Group("user_id").Order("user_id").Limit(500).Scan(&options.Users).Error; err != nil {
 		return domain.AlertRuleScopeOptions{}, err
+	}
+	var snapshotOrgs []domain.AlertOrgOption
+	if err := repository.db.WithContext(ctx).Table("dim_org_user_snapshot").
+		Select("org_unit_id, MAX(org_unit_name) AS org_unit_name").
+		Where("tenant_id = ? AND org_unit_id <> ''", tenantID).
+		Group("org_unit_id").Order("org_unit_id").Scan(&snapshotOrgs).Error; err != nil {
+		return domain.AlertRuleScopeOptions{}, err
+	}
+	seenOrgs := make(map[string]struct{}, len(snapshotOrgs)+len(orgs))
+	for _, org := range snapshotOrgs {
+		seenOrgs[org.OrgUnitID] = struct{}{}
+		options.Organizations = append(options.Organizations, org)
+	}
+	for _, orgID := range orgs {
+		if _, exists := seenOrgs[orgID]; exists {
+			continue
+		}
+		options.Organizations = append(options.Organizations, domain.AlertOrgOption{OrgUnitID: orgID})
 	}
 	options.OwnerOrgIDs = orgs
 	options.CustomerTypes = types

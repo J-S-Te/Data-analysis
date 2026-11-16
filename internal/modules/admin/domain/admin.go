@@ -95,11 +95,18 @@ type AlertRecipientOption struct {
 	OrgUnitName string `json:"org_unit_name"`
 }
 
+// AlertOrgOption 是规则范围选择器展示的组织单元。
+type AlertOrgOption struct {
+	OrgUnitID   string `json:"org_unit_id"`
+	OrgUnitName string `json:"org_unit_name"`
+}
+
 // AlertRuleScopeOptions 是规则范围选择器可用的聚合维度值。
 type AlertRuleScopeOptions struct {
 	OwnerOrgIDs   []string               `json:"owner_org_ids"`
 	CustomerTypes []string               `json:"customer_types"`
 	Currencies    []string               `json:"currencies"`
+	Organizations []AlertOrgOption       `json:"organizations"`
 	Users         []AlertRecipientOption `json:"users"`
 }
 
