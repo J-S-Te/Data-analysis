@@ -299,11 +299,48 @@ func (repository *GORMRepository) AlertRuleScopeOptions(ctx context.Context, ten
 		Order("currency").Pluck("currency", &currencies).Error; err != nil {
 		return domain.AlertRuleScopeOptions{}, err
 	}
+	var snapshotUsers []domain.AlertRecipientOption
 	if err := repository.db.WithContext(ctx).Table("dim_org_user_snapshot").
 		Select("user_id, MAX(display_name) AS display_name, MAX(org_unit_name) AS org_unit_name").
 		Where("tenant_id = ?", tenantID).
-		Group("user_id").Order("user_id").Limit(500).Scan(&options.Users).Error; err != nil {
+		Group("user_id").Order("user_id").Limit(500).Scan(&snapshotUsers).Error; err != nil {
 		return domain.AlertRuleScopeOptions{}, err
+	}
+	seenUsers := make(map[string]struct{}, len(snapshotUsers))
+	for _, user := range snapshotUsers {
+		seenUsers[user.UserID] = struct{}{}
+		options.Users = append(options.Users, user)
+	}
+	var projectUsers []domain.AlertRecipientOption
+	if err := repository.db.WithContext(ctx).Table("dim_project").
+		Select("manager_identity_id AS user_id, MAX(manager) AS display_name, MAX(team) AS org_unit_name").
+		Where("tenant_id = ? AND manager_identity_id <> ''", tenantID).
+		Group("manager_identity_id").Order("manager_identity_id").Limit(500).Scan(&projectUsers).Error; err != nil {
+		return domain.AlertRuleScopeOptions{}, err
+	}
+	for _, user := range projectUsers {
+		if _, exists := seenUsers[user.UserID]; exists {
+			continue
+		}
+		seenUsers[user.UserID] = struct{}{}
+		options.Users = append(options.Users, user)
+	}
+	var contractUsers []domain.AlertRecipientOption
+	if err := repository.db.WithContext(ctx).Table("dim_contract").
+		Select("owner_user_id AS user_id, '' AS display_name, MAX(owner_org_id) AS org_unit_name").
+		Where("tenant_id = ? AND owner_user_id <> ''", tenantID).
+		Group("owner_user_id").Order("owner_user_id").Limit(500).Scan(&contractUsers).Error; err != nil {
+		return domain.AlertRuleScopeOptions{}, err
+	}
+	for _, user := range contractUsers {
+		if _, exists := seenUsers[user.UserID]; exists {
+			continue
+		}
+		seenUsers[user.UserID] = struct{}{}
+		options.Users = append(options.Users, user)
+	}
+	if len(options.Users) > 500 {
+		options.Users = options.Users[:500]
 	}
 	var snapshotOrgs []domain.AlertOrgOption
 	if err := repository.db.WithContext(ctx).Table("dim_org_user_snapshot").
