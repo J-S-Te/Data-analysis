@@ -182,6 +182,12 @@ services:
       # 告警生命周期收敛（BIZ-DATA-07）默认关闭，保持“只增不关”行为；
       # 置 true 才启用自动 CLOSED/重开，见 docs/alert-lifecycle.md。
       ALERT_AUTO_RESOLVE: ${ALERT_AUTO_RESOLVE:-false}
+      # 平台站内信（notification.ingest）；四项齐全才启用，缺失时只写预警中心。
+      PLATFORM_NOTIFICATION_URL: ${PLATFORM_NOTIFICATION_URL:-}
+      PLATFORM_NOTIFICATION_TOKEN_URL: ${PLATFORM_NOTIFICATION_TOKEN_URL:-}
+      PLATFORM_NOTIFICATION_SCOPE: ${PLATFORM_NOTIFICATION_SCOPE:-notification.ingest}
+      PLATFORM_NOTIFICATION_CLIENT_ID: ${PLATFORM_NOTIFICATION_CLIENT_ID:-}
+      PLATFORM_NOTIFICATION_CLIENT_SECRET: ${PLATFORM_NOTIFICATION_CLIENT_SECRET:-}
       # 收敛策略细项（仅 ALERT_AUTO_RESOLVE=true 时生效，默认值与代码一致）：
       # ALERT_CONFIRM_ROUNDS=连续未命中确认轮数（1..10），
       # ALERT_REOPEN_POLICY=auto|manual，ALERT_CLOSE_GUARD_RATIO=收缩安全阀比例（(0,1]）。

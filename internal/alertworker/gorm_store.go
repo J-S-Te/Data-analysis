@@ -21,6 +21,7 @@ type gormRule struct {
 	ScopeJSON     []byte  `gorm:"column:scope_json"`
 	EffectiveFrom *string `gorm:"column:effective_from"`
 	EffectiveTo   *string `gorm:"column:effective_to"`
+	UpdatedBy     *string `gorm:"column:updated_by"`
 }
 
 // GormStore 使用版本化迁移创建的 alert_rule、alert_item 和 dim_contract 表。
@@ -41,7 +42,7 @@ func (s *GormStore) ListEnabledRules(ctx context.Context) ([]Rule, error) {
 	var rows []gormRule
 	if err := s.db.WithContext(ctx).
 		Table("alert_rule").
-		Select("id, rule_code, severity, threshold_json, scope_json, effective_from, effective_to").
+		Select("id, rule_code, severity, threshold_json, scope_json, effective_from, effective_to, updated_by").
 		Where("tenant_id = ? AND enabled = ?", s.tenantID, true).
 		Order("rule_code").
 		Find(&rows).Error; err != nil {
@@ -57,9 +58,17 @@ func (s *GormStore) ListEnabledRules(ctx context.Context) ([]Rule, error) {
 			ScopeJSON:     row.ScopeJSON,
 			EffectiveFrom: row.EffectiveFrom,
 			EffectiveTo:   row.EffectiveTo,
+			UpdatedBy:     derefString(row.UpdatedBy),
 		})
 	}
 	return rules, nil
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
 }
 
 func (s *GormStore) validateTenant() error {
