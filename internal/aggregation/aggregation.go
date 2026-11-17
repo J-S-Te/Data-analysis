@@ -520,10 +520,14 @@ func (r *Runner) syncContract(ctx context.Context, dsn string) error {
 	})
 }
 
-// syncContractSnapshot 分批写入同一完整合同快照，并暂存本轮主键集合。
+// syncContractSnapshot 用途：分批同步同一有效合同集合，并暂存相同主键用于删除对账。
 // 参数：ctx 为许可/取消上下文，src 为限定租户的只读RR事务，run 为本轮令牌。
 // 返回值：任一批读取、写入或暂存失败返回错误，禁止删除对账。
 func (r *Runner) syncContractSnapshot(ctx context.Context, src *gorm.DB, run string) error {
+	src, err := activeContractSource(src)
+	if err != nil {
+		return err
+	}
 	type sourceRow struct {
 		OriginKind      string
 		TenantID        string

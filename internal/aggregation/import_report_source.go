@@ -99,8 +99,12 @@ func readImportFacts(ctx context.Context, db *gorm.DB, tenant string, snapshot I
 		}
 	}
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		source, err := activeContractSource(tx)
+		if err != nil {
+			return err
+		}
 		var rows []importSourceRow
-		if err := tx.Table("con_contract").Select("id,version,origin_import_item_id,import_source_revision,import_report_release_version,import_report_required_channels,import_mode,import_policy_json,status,start_date,end_date,owner_user_id,owner_org_id,crm_customer_id,opportunity_id,amount_minor,currency,created_at").Where("tenant_id=? AND origin_kind='IMPORTED' AND id IN ?", tenant, ids).Limit(1001).Find(&rows).Error; err != nil {
+		if err := source.Table("con_contract").Select("id,version,origin_import_item_id,import_source_revision,import_report_release_version,import_report_required_channels,import_mode,import_policy_json,status,start_date,end_date,owner_user_id,owner_org_id,crm_customer_id,opportunity_id,amount_minor,currency,created_at").Where("tenant_id=? AND origin_kind='IMPORTED' AND id IN ?", tenant, ids).Limit(1001).Find(&rows).Error; err != nil {
 			return err
 		}
 		for _, row := range rows {
