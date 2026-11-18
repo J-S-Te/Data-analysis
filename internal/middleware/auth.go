@@ -10,21 +10,15 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-
+	"github.com/unified-identity-auth-platform/data-analysis/internal/authorizationrefresh"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/apperror"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/auth"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/response"
 )
 
-// SessionAuth 在业务入口核验服务端会话并保留依赖故障语义。
-//
-//	SessionAuth 只信任 Cookie 对应的服务端会话；请求头中的用户/角色声明不参与认证。
-//
-// 参数：authenticator为本应用服务端会话校验器。
-//
-//	cookieName为当前应用独立Cookie名称。
-//
-// 返回值：执行服务端会话校验并写入可信主体的HTTP中间件。
+// SessionAuth 校验独立会话并解析只读自描述接口的新鲜授权要求。
+// 参数：authenticator 为会话服务，cookieName 为本应用 Cookie 名称。
+// 返回值：认证中间件；认证失效、授权拒绝和依赖故障分别返回 401、403、503。
 func SessionAuth(authenticator auth.Authenticator, cookieName string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		cookie, err := c.Request.Cookie(cookieName)
@@ -33,8 +27,14 @@ func SessionAuth(authenticator auth.Authenticator, cookieName string) gin.Handle
 			c.Abort()
 			return
 		}
-		principal, err := authenticator.Authenticate(c.Request.Context(), cookie.Value)
+		ctx := authorizationrefresh.FromRequest(c.Request.Context(), c.Request)
+		principal, err := authenticator.Authenticate(ctx, cookie.Value)
 		if err != nil {
+			if errors.Is(err, auth.ErrAuthorizationDenied) {
+				response.Error(c, apperror.ErrForbidden)
+				c.Abort()
+				return
+			}
 			if errors.Is(err, auth.ErrSessionUnavailable) {
 				response.Error(c, apperror.New(503, "SESSION_UNAVAILABLE", "会话服务暂不可用，请稍后重试"))
 				c.Abort()

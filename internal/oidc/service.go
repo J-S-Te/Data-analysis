@@ -14,12 +14,12 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
-	"golang.org/x/oauth2"
-	"gorm.io/gorm"
-
+	"github.com/unified-identity-auth-platform/data-analysis/internal/authorizationrefresh"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/platformaudit"
 	central "github.com/unified-identity-auth-platform/data-analysis/internal/sessiongovernance"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/auth"
+	"golang.org/x/oauth2"
+	"gorm.io/gorm"
 )
 
 // 会话双期限默认值与边界，对应 OIDC_SESSION_IDLE_TTL / OIDC_SESSION_ABSOLUTE_TTL。
@@ -412,49 +412,49 @@ func (s *Service) reportAuth(ctx context.Context, event platformaudit.Event) {
 	_ = s.reporter.Report(ctx, event)
 }
 
-// resolveAuthorizationContext 读取并核验基础平台当前应用的权限快照。
-//
-//	resolveAuthorizationContext 调平台授权上下文端点（Bearer Keycloak access token）解析角色/权限。
-//
-// 参数：ctx为调用上下文与取消边界。
-//
-//	accessToken为服务器端访问令牌。
-//
-// 返回值：与该调用匹配的核验或持久化结果；失败保留原有错误语义。
+// resolveAuthorizationContext 在线读取平台授权并传播显式刷新要求。
+// 参数：ctx 为调用上下文，accessToken 为服务端持有的访问令牌。
+// 返回值：当前授权快照；认证拒绝、无权限和依赖故障返回分类错误。
 func (s *Service) resolveAuthorizationContext(ctx context.Context, accessToken string) (AuthorizationContext, error) {
 	if s.authorizationContextURL == "" {
-		return AuthorizationContext{}, errors.New("authorization context endpoint is not configured")
+		return AuthorizationContext{}, ErrSessionUnavailable
 	}
 	if accessToken == "" {
-		return AuthorizationContext{}, errors.New("access token is missing")
+		return AuthorizationContext{}, ErrUnauthenticated
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, s.authorizationContextURL, nil)
 	if err != nil {
-		return AuthorizationContext{}, err
+		return AuthorizationContext{}, fmt.Errorf("%w: %v", ErrSessionUnavailable, err)
 	}
 	request.Header.Set("Authorization", "Bearer "+accessToken)
 	request.Header.Set("Accept", "application/json")
+	if authorizationrefresh.Forced(ctx) {
+		request.Header.Set(authorizationrefresh.Header, "1")
+	}
 	// 注意：不要复用 OIDC 的 hostRewriteTransport（它会重写 host 到 Keycloak）；
 	// authorization-context 是平台 API（platform-api:8080），容器内直连即可。
 	client := &http.Client{Timeout: 5 * time.Second}
 	response, err := client.Do(request)
 	if err != nil {
-		return AuthorizationContext{}, err
+		return AuthorizationContext{}, fmt.Errorf("%w: %v", ErrSessionUnavailable, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		if response.StatusCode == 401 || response.StatusCode == 403 {
+		if response.StatusCode == http.StatusUnauthorized {
 			return AuthorizationContext{}, ErrUnauthenticated
+		}
+		if response.StatusCode == http.StatusForbidden {
+			return AuthorizationContext{}, auth.ErrAuthorizationDenied
 		}
 		return AuthorizationContext{}, ErrSessionUnavailable
 	}
 	var result AuthorizationContext
 	decoder := json.NewDecoder(io.LimitReader(response.Body, 1<<20))
 	if err := decoder.Decode(&result); err != nil {
-		return AuthorizationContext{}, err
+		return AuthorizationContext{}, fmt.Errorf("%w: %v", ErrSessionUnavailable, err)
 	}
 	if result.Subject == "" {
-		return AuthorizationContext{}, errors.New("authorization context missing subject")
+		return AuthorizationContext{}, ErrUnauthenticated
 	}
 	slog.Info("authorization context resolved",
 		"sub", result.Subject, "application_code", result.ApplicationCode,
@@ -462,15 +462,9 @@ func (s *Service) resolveAuthorizationContext(ctx context.Context, accessToken s
 	return result, nil
 }
 
-// Authenticate 校验当前浏览器会话、中央期限与业务授权。
-//
-//	Authenticate 由 cookie token 还原 Principal；必要时执行 UserInfo 在线复核。
-//
-// 参数：ctx为调用上下文与取消边界。
-//
-//	cookieValue为当前浏览器随机会话材料。
-//
-// 返回值：经过核验的主体或会话；明确失效与暂时依赖错误分别返回。
+// Authenticate 校验本地会话并按显式页面刷新重新读取授权。
+// 参数：ctx 为含可选刷新意图的请求上下文，cookieValue 为本应用会话材料。
+// 返回值：当前主体或认证、授权拒绝及依赖故障错误，不延长原截止。
 func (s *Service) Authenticate(ctx context.Context, cookieValue string) (auth.Principal, error) {
 	if s.centralClient != nil {
 		return s.authenticateCentral(ctx, cookieValue)
@@ -479,51 +473,23 @@ func (s *Service) Authenticate(ctx context.Context, cookieValue string) (auth.Pr
 		return auth.Principal{}, errors.New("empty session")
 	}
 	var session Session
-	err := s.db.Where("session_id_hash = ?", tokenHash(cookieValue)).First(&session).Error
+	err := s.db.WithContext(ctx).Where("session_id_hash = ?", tokenHash(cookieValue)).First(&session).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return auth.Principal{}, ErrUnauthenticated
+	}
 	if err != nil {
-		return auth.Principal{}, errors.New("session not found")
+		return auth.Principal{}, ErrSessionUnavailable
 	}
 	now := time.Now().UTC()
 	if !session.ValidAt(now, s.sessionIdleTTL) {
 		// 撤销、空闲到期与绝对到期一律拒绝：不得刷新任何时间字段（不能复活）。
 		return auth.Principal{}, errors.New("session revoked, idle or expired")
 	}
-	if time.Since(session.AuthorizationCheckedAt) > s.checkEvery {
-		// 定期调平台授权上下文在线复核：角色/权限变更后旧会话自动刷新（接入手册 §3.3）。
-		// 复核失败必须 失败时安全拒绝，否则已撤销的权限会在旧会话中继续生效。
-		refreshAt := time.Now().UTC()
-		accessToken, decryptErr := s.codec.decrypt(session.AccessTokenCipher)
-		if decryptErr != nil {
-			return auth.Principal{}, errors.New("session access token is invalid")
+	if authorizationrefresh.Forced(ctx) || time.Since(session.AuthorizationCheckedAt) > s.checkEvery {
+		session, err = s.refreshLegacySession(ctx, session.SessionIDHash)
+		if err != nil {
+			return auth.Principal{}, err
 		}
-		authz, resolveErr := s.resolveAuthorizationContext(ctx, accessToken)
-		if resolveErr != nil {
-			return auth.Principal{}, fmt.Errorf("refresh authorization context: %w", resolveErr)
-		}
-		if _, bindErr := validateAuthorizationBinding(authz, "", session.PlatformUserID, session.TenantID, s.clientID, s.applicationCode, s.environmentCode); bindErr != nil {
-			return auth.Principal{}, bindErr
-		}
-		if windowErr := validateCatalogWindow(authz, s.catalogVersion, s.roleConfigHash); windowErr != nil {
-			return auth.Principal{}, windowErr
-		}
-		rolesJSON, _ := json.Marshal(authz.Roles)
-		permissionsJSON, _ := json.Marshal(authz.Permissions)
-		dataScopesJSON, _ := json.Marshal(authz.DataScopes)
-		if updateErr := s.db.Model(&Session{}).Where("session_id_hash = ?", session.SessionIDHash).
-			Updates(map[string]interface{}{
-				"roles_json": string(rolesJSON), "permissions_json": string(permissionsJSON),
-				"data_scopes_json":         string(dataScopesJSON),
-				"authz_revision":           authz.AuthorizationRevision,
-				"authorization_checked_at": refreshAt, "last_seen_at": refreshAt,
-			}).Error; updateErr != nil {
-			return auth.Principal{}, fmt.Errorf("persist refreshed authorization: %w", updateErr)
-		}
-		session.RolesJSON = string(rolesJSON)
-		session.PermissionsJSON = string(permissionsJSON)
-		session.DataScopesJSON = string(dataScopesJSON)
-		session.AuthzRevision = authz.AuthorizationRevision
-		session.AuthorizationCheckedAt = refreshAt
-		session.LastSeenAt = refreshAt
 	} else {
 		// 普通已认证请求只刷新 last_seen_at（在线状态与审计辅助），绝不续期空闲计时；
 		// 写失败不阻断业务请求，本次会话有效性以刚完成的读取与判定为准。
