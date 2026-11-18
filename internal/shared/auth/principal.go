@@ -9,6 +9,9 @@ import (
 // ErrSessionUnavailable 保留会话依赖故障，供中间件区分确定登出。
 var ErrSessionUnavailable = errors.New("session service is temporarily unavailable")
 
+// ErrAuthorizationDenied 表示当前应用授权已撤销或角色配置冲突。
+var ErrAuthorizationDenied = errors.New("application authorization denied")
+
 // Principal 只有在平台令牌验签与服务端会话复核后才可写入；业务层不得从客户端字段重建。
 type Principal struct {
 	UserID                 string

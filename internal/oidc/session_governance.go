@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/unified-identity-auth-platform/data-analysis/internal/authorizationrefresh"
 	central "github.com/unified-identity-auth-platform/data-analysis/internal/sessiongovernance"
 	"github.com/unified-identity-auth-platform/data-analysis/internal/shared/auth"
 	"gorm.io/gorm"
@@ -80,7 +81,7 @@ func (s *Service) authenticateCentral(ctx context.Context, cookie string) (auth.
 		}
 		return auth.Principal{}, err
 	}
-	if !session.AccessTokenExpiresAt.After(now.Add(time.Minute)) || now.Sub(session.AuthorizationCheckedAt) >= s.checkEvery {
+	if authorizationrefresh.Forced(ctx) || !session.AccessTokenExpiresAt.After(now.Add(time.Minute)) || now.Sub(session.AuthorizationCheckedAt) >= s.checkEvery {
 		session, err = s.refreshCentralSession(ctx, session.SessionIDHash, now)
 		if err != nil {
 			return auth.Principal{}, err
@@ -104,7 +105,7 @@ func (s *Service) refreshCentralSession(ctx context.Context, hash string, now ti
 
 // withCentralSessionLock 重读并串行执行一个认证阶段，绝不让普通读覆盖新凭据。
 // 参数：ctx为该阶段上下文，hash为Cookie摘要，now为起始时间，operation为内部认证阶段。
-// 返回值：该阶段已提交记录；明确失效提交当前行撤销，其他故障回滚。
+// 返回值：该阶段已提交记录；认证或授权拒绝提交本地撤销，依赖故障回滚。
 func (s *Service) withCentralSessionLock(ctx context.Context, hash string, now time.Time, operation func(context.Context, *Session, time.Time) error) (Session, error) {
 	var session Session
 	var rejection error
@@ -123,11 +124,13 @@ func (s *Service) withCentralSessionLock(ctx context.Context, hash string, now t
 			return err
 		}
 		lockedNow := time.Now().UTC()
-		if session.AccessTokenExpiresAt.After(lockedNow.Add(time.Minute)) && lockedNow.Sub(session.AuthorizationCheckedAt) < s.checkEvery {
+		if !authorizationrefresh.Forced(ctx) &&
+			session.AccessTokenExpiresAt.After(lockedNow.Add(time.Minute)) &&
+			lockedNow.Sub(session.AuthorizationCheckedAt) < s.checkEvery {
 			return nil
 		}
 		if err := operation(ctx, &session, lockedNow); err != nil {
-			if errors.Is(err, ErrUnauthenticated) {
+			if errors.Is(err, ErrUnauthenticated) || errors.Is(err, auth.ErrAuthorizationDenied) {
 				rejection = err
 				return tx.Model(&Session{}).Where("session_id_hash = ?", hash).Update("revoked_at", lockedNow).Error
 			}
@@ -141,8 +144,14 @@ func (s *Service) withCentralSessionLock(ctx context.Context, hash string, now t
 			"last_seen_at": lockedNow,
 		}).Error
 	})
-	if errors.Is(err, ErrUnauthenticated) || rejection != nil {
+	if err == nil && rejection != nil {
+		return Session{}, rejection
+	}
+	if errors.Is(err, ErrUnauthenticated) {
 		return Session{}, ErrUnauthenticated
+	}
+	if errors.Is(err, auth.ErrAuthorizationDenied) {
+		return Session{}, auth.ErrAuthorizationDenied
 	}
 	if err != nil {
 		return Session{}, ErrSessionUnavailable
