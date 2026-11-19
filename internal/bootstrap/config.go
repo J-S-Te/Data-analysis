@@ -37,8 +37,12 @@ type Config struct {
 	// 只由显式活动接口（/auth/activity）续期空闲计时；绝对期限不受活动影响。
 	OIDCSessionIdleTTL     time.Duration
 	OIDCSessionAbsoluteTTL time.Duration
-	CodecKey               []byte
-	SecureCookie           bool
+	// OIDCAuthorizationRefresh 是子系统会话回源平台授权快照的最大间隔。
+	// 权限变更不需要等 Keycloak 令牌过期；默认 10 秒，可由
+	// OIDC_AUTHORIZATION_REFRESH_INTERVAL 覆盖，且必须小于会话绝对期限。
+	OIDCAuthorizationRefresh time.Duration
+	CodecKey                 []byte
+	SecureCookie             bool
 
 	PlatformBaseURL      string
 	CatalogSyncEnabled   bool
@@ -77,6 +81,10 @@ type Config struct {
 
 // DefaultDashboardTimezone 是看板业务日时区的默认值，与 dashboard 仓储默认一致。
 const DefaultDashboardTimezone = "Asia/Shanghai"
+
+// DefaultAuthorizationRefresh 是子系统会话回源平台授权快照的默认间隔。
+// 权限变更不应等到 Keycloak access token 过期；10 秒是一次查询成本与生效延迟的折中。
+const DefaultAuthorizationRefresh = 10 * time.Second
 
 // LoadDashboardLocation 解析并校验看板业务日时区。
 // 参数：name 为 IANA 时区名，空值取默认值。
@@ -151,6 +159,10 @@ func LoadConfig() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	authorizationRefresh, err := loadAuthorizationRefreshTTL(sessionAbsoluteTTL)
+	if err != nil {
+		return Config{}, err
+	}
 	return Config{
 		CentralSessionEnabled: centralEnabled, CentralSessionPublicBaseURL: envOr("CENTRAL_SESSION_PUBLIC_BASE_URL", publicOrigin),
 		ContractImportStatus: importreport.VerifierOptions{
@@ -162,22 +174,23 @@ func LoadConfig() (Config, error) {
 			// 因此应用/环境绑定始终要求存在，不提供关闭开关。
 			RequireApplicationID: true, RequireEnvironmentID: true,
 		},
-		ListenAddr:             envOr("LISTEN_ADDR", ":8080"),
-		MySQLDSN:               os.Getenv("DASHBOARD_MYSQL_DSN"),
-		PathPrefix:             pathPrefix,
-		PublicOrigin:           strings.TrimRight(publicOrigin, "/"),
-		OIDCIssuer:             envOr("OIDC_ISSUER", "http://localhost:18090/realms/basic-platform"),
-		OIDCBackchannel:        os.Getenv("OIDC_BACKCHANNEL_BASE_URL"),
-		OIDCClientID:           os.Getenv("OIDC_CLIENT_ID"),
-		OIDCClientSecret:       os.Getenv("OIDC_CLIENT_SECRET"),
-		OIDCRedirectURI:        os.Getenv("OIDC_REDIRECT_URI"),
-		OIDCTenantID:           os.Getenv("OIDC_TENANT_ID"),
-		OIDCRoleConfigHash:     os.Getenv("OIDC_ROLE_CONFIG_HASH"),
-		OIDCMaxRoles:           maxRoles,
-		OIDCSessionIdleTTL:     sessionIdleTTL,
-		OIDCSessionAbsoluteTTL: sessionAbsoluteTTL,
-		CodecKey:               codecKey,
-		SecureCookie:           secure,
+		ListenAddr:               envOr("LISTEN_ADDR", ":8080"),
+		MySQLDSN:                 os.Getenv("DASHBOARD_MYSQL_DSN"),
+		PathPrefix:               pathPrefix,
+		PublicOrigin:             strings.TrimRight(publicOrigin, "/"),
+		OIDCIssuer:               envOr("OIDC_ISSUER", "http://localhost:18090/realms/basic-platform"),
+		OIDCBackchannel:          os.Getenv("OIDC_BACKCHANNEL_BASE_URL"),
+		OIDCClientID:             os.Getenv("OIDC_CLIENT_ID"),
+		OIDCClientSecret:         os.Getenv("OIDC_CLIENT_SECRET"),
+		OIDCRedirectURI:          os.Getenv("OIDC_REDIRECT_URI"),
+		OIDCTenantID:             os.Getenv("OIDC_TENANT_ID"),
+		OIDCRoleConfigHash:       os.Getenv("OIDC_ROLE_CONFIG_HASH"),
+		OIDCMaxRoles:             maxRoles,
+		OIDCSessionIdleTTL:       sessionIdleTTL,
+		OIDCSessionAbsoluteTTL:   sessionAbsoluteTTL,
+		OIDCAuthorizationRefresh: authorizationRefresh,
+		CodecKey:                 codecKey,
+		SecureCookie:             secure,
 
 		PlatformBaseURL:      strings.TrimRight(envOr("PLATFORM_BASE_URL", publicOrigin), "/"),
 		CatalogSyncEnabled:   envBool("PLATFORM_AUTHORIZATION_CATALOG_SYNC_ENABLED", false),
@@ -256,6 +269,24 @@ func loadSessionTTLs() (time.Duration, time.Duration, error) {
 		return 0, 0, err
 	}
 	return idle, absolute, nil
+}
+
+// loadAuthorizationRefreshTTL 解析授权快照回源间隔并失败关闭。
+// 参数：absoluteTTL 为已校验的会话绝对期限。
+// 返回值：正的刷新间隔；非法值或大于等于绝对期限时返回错误。
+func loadAuthorizationRefreshTTL(absoluteTTL time.Duration) (time.Duration, error) {
+	refresh := DefaultAuthorizationRefresh
+	if raw := strings.TrimSpace(os.Getenv("OIDC_AUTHORIZATION_REFRESH_INTERVAL")); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return 0, fmt.Errorf("OIDC_AUTHORIZATION_REFRESH_INTERVAL: %w", err)
+		}
+		refresh = parsed
+	}
+	if refresh <= 0 || refresh >= absoluteTTL {
+		return 0, errors.New("OIDC_AUTHORIZATION_REFRESH_INTERVAL must be positive and less than OIDC_SESSION_ABSOLUTE_TTL")
+	}
+	return refresh, nil
 }
 
 func firstNonEmpty(values ...string) string {

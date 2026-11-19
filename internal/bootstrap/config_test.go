@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	dashboardinfrastructure "github.com/unified-identity-auth-platform/data-analysis/internal/modules/dashboard/infrastructure"
 )
@@ -73,6 +74,38 @@ func TestLoadDashboardLocationRejectsInvalidZone(t *testing.T) {
 	}
 	if _, err := LoadDashboardLocation("Not/AZone"); err == nil {
 		t.Fatal("LoadDashboardLocation(Not/AZone) error = nil, want rejection")
+	}
+}
+
+// TestLoadConfigAuthorizationRefresh 验证授权快照回源间隔的默认值、显式覆盖与失败关闭。
+// 参数：t 测试上下文。
+// 返回值：无。
+func TestLoadConfigAuthorizationRefresh(t *testing.T) {
+	t.Setenv("OIDC_CODEC_KEY", testCodecKeyHex)
+
+	t.Setenv("OIDC_AUTHORIZATION_REFRESH_INTERVAL", "")
+	config, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if config.OIDCAuthorizationRefresh != 10*time.Second {
+		t.Fatalf("OIDCAuthorizationRefresh = %v, want 10s", config.OIDCAuthorizationRefresh)
+	}
+
+	t.Setenv("OIDC_AUTHORIZATION_REFRESH_INTERVAL", "3s")
+	config, err = LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if config.OIDCAuthorizationRefresh != 3*time.Second {
+		t.Fatalf("OIDCAuthorizationRefresh = %v, want 3s", config.OIDCAuthorizationRefresh)
+	}
+
+	for _, raw := range []string{"0s", "nonsense", "8h"} {
+		t.Setenv("OIDC_AUTHORIZATION_REFRESH_INTERVAL", raw)
+		if _, err := LoadConfig(); err == nil {
+			t.Fatalf("LoadConfig() error = nil for OIDC_AUTHORIZATION_REFRESH_INTERVAL=%q, want rejection", raw)
+		}
 	}
 }
 
