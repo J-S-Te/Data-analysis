@@ -51,6 +51,8 @@ type contractCurrencyTotal struct {
 	Contracts   int64  `json:"contracts"`
 }
 
+const maxContractDashboardResponseBytes = 16 << 20
+
 type apiContractDashboard struct {
 	TenantID          string                  `json:"tenant_id"`
 	TotalAmountMinor  int64                   `json:"total_amount_minor"`
@@ -258,10 +260,9 @@ func (r *APISyncRunner) SyncContractDashboard(ctx context.Context) error {
 	return r.syncContractDashboard(ctx, r.persistContractDashboard)
 }
 
-// syncContractDashboard 拉取合同系统 /internal/dashboard 并通过 sink 落库。
-// 预期返回：
-// - 只在合同接口、租户校验、快照写入都通过时返回 nil；
-// - 任一环节失败均返回错误，调用方可根据错误原因决定是否重试。
+// syncContractDashboard 用有界响应读取合同摘要并发布本租户快照。
+// 参数：ctx 为本轮同步上下文，sink 为已校验摘要的快照写入入口。
+// 返回值：响应、租户、许可校验或写入失败时返回错误。
 func (r *APISyncRunner) syncContractDashboard(ctx context.Context, sink contractSnapshotSink) error {
 	if err := r.checkLicense(ctx); err != nil {
 		return err
@@ -293,12 +294,20 @@ func (r *APISyncRunner) syncContractDashboard(ctx context.Context, sink contract
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("contract internal/dashboard returned HTTP %d: %s", response.StatusCode, errorResponseBody(response.Body))
 	}
+	// 合同响应附带明细，消费者只使用摘要，但须核验完整响应及其大小。
+	raw, err := io.ReadAll(io.LimitReader(response.Body, maxContractDashboardResponseBytes+1))
+	if err != nil {
+		return fmt.Errorf("read contract dashboard response: %w", err)
+	}
+	if len(raw) > maxContractDashboardResponseBytes {
+		return fmt.Errorf("contract dashboard response exceeds %d bytes", maxContractDashboardResponseBytes)
+	}
 	var envelope struct {
 		Code string               `json:"code"`
 		Data apiContractDashboard `json:"data"`
 	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&envelope); err != nil {
-		return err
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return fmt.Errorf("decode contract dashboard response: %w", err)
 	}
 	if envelope.Code != "OK" {
 		return fmt.Errorf("contract dashboard envelope code %s", envelope.Code)

@@ -69,6 +69,52 @@ func TestSyncContractDashboardMapsVerifiedTenantSnapshot(t *testing.T) {
 	}
 }
 
+// TestSyncContractDashboardResponseLimits 核对大型合同响应可发布且非法响应不进入快照。
+// 参数：t 为仅连接本机测试 HTTP 服务的测试上下文。
+// 返回值：无。
+func TestSyncContractDashboardResponseLimits(t *testing.T) {
+	const prefix = `{"code":"OK","data":{"tenant_id":"tenant-1","contracts":[`
+	const suffix = `],"contract_detail_limited":true,"total_contracts":205}}`
+	detail := `{"description":"` + strings.Repeat("a", 13_000) + `"}`
+	large := prefix + strings.Repeat(detail+",", 199) + detail + suffix
+	for _, test := range []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{name: "large", body: large},
+		{name: "oversized_after_valid_json", body: large + strings.Repeat(" ", 16<<20), wantErr: "exceeds"},
+		{name: "truncated", body: large[:len(large)-1], wantErr: "decode"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprint(w, test.body)
+			}))
+			defer server.Close()
+			runner := NewAPISyncRunner(nil, APISyncOptions{
+				ContractInternalURL: server.URL,
+				ContractCredential:  MachineCredential{ClientID: "contract-reader"},
+				TenantID:            "tenant-1",
+			})
+			runner.tokens["contract-reader"] = cachedMachineToken{
+				value: "machine-token", expiresAt: time.Now().Add(time.Hour),
+			}
+			var captured contractDashboardSnapshot
+			err := runner.syncContractDashboard(context.Background(), func(_ context.Context, snapshot contractDashboardSnapshot) error {
+				captured = snapshot
+				return nil
+			})
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) || captured.TenantID != "" {
+					t.Fatalf("expected %q without publishing; snapshot=%+v err=%v", test.wantErr, captured, err)
+				}
+			} else if err != nil || captured.TenantID != "tenant-1" || captured.TotalContracts != 205 {
+				t.Fatalf("complete aggregate not published: snapshot=%+v err=%v", captured, err)
+			}
+		})
+	}
+}
+
 func TestSyncContractDashboardRejectsCrossTenantResponse(t *testing.T) {
 	t.Parallel()
 
