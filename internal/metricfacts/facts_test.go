@@ -1,10 +1,55 @@
 package metricfacts
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestDecodeProjectAutoConfirmedFacts 核对项目自动确认字段兼容旧快照且保留严格校验。
+// 参数：t 为包含合成项目来源响应的测试上下文。
+// 返回值：无。
+func TestDecodeProjectAutoConfirmedFacts(t *testing.T) {
+	const legacy = `{"code":"OK","data":{"schema_version":1,"tenant_id":"tenant-a",
+	"source_code":"project_management","snapshot_at":"2026-11-11T12:00:00Z",
+	"complete":true,"basis":"确认时长和排班容量","rows":[
+	{"kind":"person_utilization","record_id":"p1","organization_id":"org-a",
+	"identity_id":"u1","project_id":"","period":"2026-11","status":"CONFIRMED",
+	"actual_minutes":60,"capacity_minutes":240,"pending_count":0,"unknown_count":0}]}}`
+	const fields = `"auto_confirmed_minutes":30,"auto_confirmed_count":1`
+	now := time.Date(2026, 11, 11, 12, 1, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name, addedFields string
+		wantErr           bool
+	}{
+		{name: "legacy"},
+		{name: "auto_confirmed", addedFields: "," + fields},
+		{name: "unknown_field", addedFields: "," + fields + `,"unexpected_metric":1`, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw := strings.Replace(legacy, `"unknown_count":0`, `"unknown_count":0`+test.addedFields, 1)
+			bundle, err := Decode(strings.NewReader(raw), "tenant-a", "project_management", now)
+			if test.wantErr {
+				if err != ErrInvalid {
+					t.Fatalf("unknown metric should fail strict decoding: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := json.Marshal(bundle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.addedFields != "" && (!strings.Contains(string(snapshot), `"auto_confirmed_minutes":30`) ||
+				!strings.Contains(string(snapshot), `"auto_confirmed_count":1`)) {
+				t.Fatal("project snapshot dropped auto-confirmed facts")
+			}
+		})
+	}
+}
 
 // metricTestBundle 创建与当前时间无关的完整合同来源样本。
 // 参数：无。
